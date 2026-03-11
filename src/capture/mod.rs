@@ -11,15 +11,25 @@ use tokio::sync::mpsc;
 pub struct HyprDisplay {
     width: u16,
     height: u16,
+    resolution: (u32, u32),
+    output_name: String,
     update_tx: mpsc::Sender<DisplayUpdate>,
     update_rx: Option<mpsc::Receiver<DisplayUpdate>>,
 }
 
 impl HyprDisplay {
-    pub async fn new() -> Result<Self> {
-        let (tx, rx) = mpsc::channel(4);
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.width, self.height)
+    }
 
-        let capture_info = wayland::start_capture(tx.clone()).await?;
+    pub fn output_name(&self) -> &str {
+        &self.output_name
+    }
+
+    pub async fn new(resolution: (u32, u32)) -> Result<Self> {
+        let (tx, rx) = mpsc::channel(128);
+
+        let capture_info = wayland::start_capture(tx.clone(), resolution).await?;
 
         tracing::info!(
             width = capture_info.width,
@@ -30,6 +40,8 @@ impl HyprDisplay {
         Ok(Self {
             width: capture_info.width as u16,
             height: capture_info.height as u16,
+            resolution,
+            output_name: capture_info.output_name,
             update_tx: tx,
             update_rx: Some(rx),
         })
@@ -49,12 +61,12 @@ impl RdpServerDisplay for HyprDisplay {
         let rx = match self.update_rx.take() {
             Some(rx) => rx,
             None => {
-                let (tx, rx) = mpsc::channel(4);
+                let (tx, rx) = mpsc::channel(128);
                 self.update_tx = tx.clone();
                 let width = self.width;
                 let height = self.height;
                 // Restart capture
-                wayland::start_capture(tx).await?;
+                wayland::start_capture(tx, self.resolution).await?;
                 tracing::info!(width, height, "Restarted display capture");
                 rx
             }

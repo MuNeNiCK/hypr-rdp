@@ -28,6 +28,10 @@ struct Args {
     /// Password for RDP authentication
     #[arg(short, long, default_value = "")]
     password: String,
+
+    /// RDP session resolution (WxH), e.g. 1920x1080
+    #[arg(short, long, default_value = "1920x1080")]
+    resolution: String,
 }
 
 #[tokio::main]
@@ -38,6 +42,8 @@ async fn main() -> Result<()> {
 
     let args = Args::parse();
 
+    let resolution = parse_resolution(&args.resolution)?;
+
     tracing::info!("Starting hypr-rdp on {}", args.bind);
 
     server::run(
@@ -46,6 +52,17 @@ async fn main() -> Result<()> {
         args.key.as_deref(),
         &args.username,
         &args.password,
+        resolution,
     )
     .await
+}
+
+fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
+    let parts: Vec<&str> = s.split('x').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("invalid resolution format, expected WxH (e.g. 1920x1080)");
+    }
+    let w: u32 = parts[0].parse().map_err(|_| anyhow::anyhow!("invalid width"))?;
+    let h: u32 = parts[1].parse().map_err(|_| anyhow::anyhow!("invalid height"))?;
+    Ok((w, h))
 }

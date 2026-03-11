@@ -13,11 +13,14 @@ pub async fn run(
     key: Option<&str>,
     username: &str,
     password: &str,
+    resolution: (u32, u32),
 ) -> Result<()> {
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
-    let display = HyprDisplay::new().await.context("failed to initialize display capture")?;
-    let input_handler = HyprInputHandler::new().context("failed to initialize input handler")?;
+    let display = HyprDisplay::new(resolution).await.context("failed to initialize display capture")?;
+    let (rdp_width, rdp_height) = display.dimensions();
+    let output_name = display.output_name().to_string();
+    let input_handler = HyprInputHandler::new(rdp_width, rdp_height, &output_name).context("failed to initialize input handler")?;
 
     let builder = RdpServer::builder().with_addr(addr);
 
