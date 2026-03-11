@@ -20,6 +20,14 @@ struct Args {
     /// TLS private key file (PEM)
     #[arg(long)]
     key: Option<String>,
+
+    /// Username for RDP authentication
+    #[arg(short, long, default_value = "")]
+    username: String,
+
+    /// Password for RDP authentication
+    #[arg(short, long, default_value = "")]
+    password: String,
 }
 
 #[tokio::main]
@@ -32,5 +40,12 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting hypr-rdp on {}", args.bind);
 
-    server::run(&args.bind, args.cert.as_deref(), args.key.as_deref()).await
+    server::run(
+        &args.bind,
+        args.cert.as_deref(),
+        args.key.as_deref(),
+        &args.username,
+        &args.password,
+    )
+    .await
 }

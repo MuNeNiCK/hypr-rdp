@@ -2,12 +2,18 @@ use std::net::SocketAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use ironrdp_server::RdpServer;
+use ironrdp_server::{Credentials, RdpServer};
 
 use crate::capture::HyprDisplay;
 use crate::input::HyprInputHandler;
 
-pub async fn run(bind: &str, cert: Option<&str>, key: Option<&str>) -> Result<()> {
+pub async fn run(
+    bind: &str,
+    cert: Option<&str>,
+    key: Option<&str>,
+    username: &str,
+    password: &str,
+) -> Result<()> {
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
     let display = HyprDisplay::new().await.context("failed to initialize display capture")?;
@@ -36,6 +42,12 @@ pub async fn run(bind: &str, cert: Option<&str>, key: Option<&str>) -> Result<()
                 .build()
         }
     };
+
+    server.set_credentials(Some(Credentials {
+        username: username.to_string(),
+        password: password.to_string(),
+        domain: None,
+    }));
 
     tracing::info!("RDP server listening on {}", addr);
     server.run().await.context("RDP server error")?;

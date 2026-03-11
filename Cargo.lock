@@ -1343,6 +1343,7 @@ dependencies = [
  "clap",
  "ironrdp-pdu",
  "ironrdp-server",
+ "libc",
  "tokio",
  "tokio-rustls",
  "tracing",
@@ -1350,6 +1351,7 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
+ "wayland-scanner",
 ]
 
 [[package]]
