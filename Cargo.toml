@@ -1,0 +1,27 @@
+[package]
+name = "hypr-rdp"
+version = "0.1.0"
+edition = "2021"
+description = "Native RDP server for Hyprland"
+
+[dependencies]
+# RDP server
+ironrdp-server = { version = "0.10", features = ["helper"] }
+ironrdp-pdu = "0.7"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = "0.26"
+async-trait = "0.1"
+
+# Wayland client
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "unstable"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+# Utilities
+anyhow = "1"
+bytes = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
