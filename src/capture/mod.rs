@@ -1,5 +1,7 @@
 mod wayland;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use async_trait::async_trait;
 use ironrdp_server::{
@@ -7,12 +9,15 @@ use ironrdp_server::{
 };
 use tokio::sync::mpsc;
 
+use crate::egfx::EgfxShared;
+
 /// Captures frames from Hyprland via ext-image-copy-capture-v1 protocol.
 pub struct HyprDisplay {
     width: u16,
     height: u16,
     resolution: (u32, u32),
     output_name: String,
+    egfx_shared: Option<Arc<EgfxShared>>,
     update_tx: mpsc::Sender<DisplayUpdate>,
     update_rx: Option<mpsc::Receiver<DisplayUpdate>>,
 }
@@ -26,10 +31,10 @@ impl HyprDisplay {
         &self.output_name
     }
 
-    pub async fn new(resolution: (u32, u32)) -> Result<Self> {
+    pub async fn new(resolution: (u32, u32), egfx_shared: Arc<EgfxShared>) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
 
-        let capture_info = wayland::start_capture(tx.clone(), resolution).await?;
+        let capture_info = wayland::start_capture(tx.clone(), resolution, Some(Arc::clone(&egfx_shared))).await?;
 
         tracing::info!(
             width = capture_info.width,
@@ -42,6 +47,7 @@ impl HyprDisplay {
             height: capture_info.height as u16,
             resolution,
             output_name: capture_info.output_name,
+            egfx_shared: Some(egfx_shared),
             update_tx: tx,
             update_rx: Some(rx),
         })
@@ -66,7 +72,7 @@ impl RdpServerDisplay for HyprDisplay {
                 let width = self.width;
                 let height = self.height;
                 // Restart capture
-                wayland::start_capture(tx, self.resolution).await?;
+                wayland::start_capture(tx, self.resolution, self.egfx_shared.clone()).await?;
                 tracing::info!(width, height, "Restarted display capture");
                 rx
             }

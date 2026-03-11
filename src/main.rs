@@ -1,4 +1,5 @@
 mod capture;
+mod egfx;
 mod input;
 mod server;
 
@@ -45,6 +46,22 @@ async fn main() -> Result<()> {
     let resolution = parse_resolution(&args.resolution)?;
 
     tracing::info!("Starting hypr-rdp on {}", args.bind);
+
+    // Spawn shutdown signal handler.
+    // NOTE: Do NOT call cleanup_all_outputs() here — `hyprctl output remove`
+    // sends Wayland events that crash Ghostty's GTK4 backend (SEGV in
+    // wl_display_dispatch_queue_pending). The capture thread handles its own
+    // output cleanup when the channel closes and the loop exits naturally.
+    tokio::spawn(async {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to register SIGTERM handler");
+        let ctrl_c = tokio::signal::ctrl_c();
+        tokio::select! {
+            _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+            _ = ctrl_c => tracing::info!("Received SIGINT"),
+        }
+        std::process::exit(0);
+    });
 
     server::run(
         &args.bind,

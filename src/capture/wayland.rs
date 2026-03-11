@@ -2,12 +2,16 @@ use std::num::{NonZeroU16, NonZeroUsize};
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+use std::sync::Arc;
 use std::os::unix::io::OwnedFd;
 use std::process::Command;
+
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
 use ironrdp_server::{BitmapUpdate, DisplayUpdate, PixelFormat};
 use tokio::sync::mpsc;
+
+use crate::egfx::EgfxShared;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1;
@@ -27,7 +31,6 @@ pub struct CaptureInfo {
 /// Create a headless output in Hyprland at the given resolution.
 /// Returns the output name (e.g. "HEADLESS-1").
 fn create_headless_output(width: u32, height: u32) -> Result<String> {
-    // Create headless output
     let output = Command::new("hyprctl")
         .args(["output", "create", "headless"])
         .output()
@@ -36,7 +39,6 @@ fn create_headless_output(width: u32, height: u32) -> Result<String> {
         bail!("hyprctl output create failed: {}", String::from_utf8_lossy(&output.stderr));
     }
 
-    // Find the newly created headless output name
     let monitors_output = Command::new("hyprctl")
         .args(["monitors", "-j"])
         .output()
@@ -94,13 +96,17 @@ pub fn remove_headless_output(name: &str) {
 
 /// Start screen capture on a background thread.
 /// Creates a headless output at the target resolution and captures it.
-pub async fn start_capture(tx: mpsc::Sender<DisplayUpdate>, target_resolution: (u32, u32)) -> Result<CaptureInfo> {
+pub async fn start_capture(
+    tx: mpsc::Sender<DisplayUpdate>,
+    target_resolution: (u32, u32),
+    egfx_shared: Option<Arc<EgfxShared>>,
+) -> Result<CaptureInfo> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
 
     std::thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
-            if let Err(e) = capture_thread(tx, info_tx, target_resolution) {
+            if let Err(e) = capture_thread(tx, info_tx, target_resolution, egfx_shared) {
                 tracing::error!("Capture thread error: {:#}", e);
             }
         })?;
@@ -112,6 +118,7 @@ fn capture_thread(
     tx: mpsc::Sender<DisplayUpdate>,
     info_tx: tokio::sync::oneshot::Sender<Result<CaptureInfo>>,
     target_resolution: (u32, u32),
+    egfx_shared: Option<Arc<EgfxShared>>,
 ) -> Result<()> {
     let (target_w, target_h) = target_resolution;
 
@@ -252,6 +259,28 @@ fn capture_thread(
         "Starting capture loop on headless output"
     );
 
+    // Initialize H.264 encoder if EGFX is available (VAAPI hardware → OpenH264 software fallback)
+    let mut h264_encoder = if egfx_shared.is_some() {
+        match crate::egfx::FrameEncoder::new(width, height) {
+            Ok(enc) => {
+                tracing::info!(width, height, backend = enc.backend_name(), "H.264 encoder initialized");
+                Some(enc)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize H.264 encoder, falling back to bitmap: {:#}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // EGFX state cached from shared (to avoid repeated mutex locking)
+    let mut egfx_handle: Option<ironrdp_server::GfxServerHandle> = None;
+    let mut egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> = None;
+    let mut egfx_surface_id: Option<u16> = None;
+    let mut egfx_active = false;
+
     // Frame rate limiting
     let target_interval = std::time::Duration::from_millis(33); // ~30fps
     let mut last_frame = std::time::Instant::now();
@@ -296,19 +325,81 @@ fn capture_thread(
         // Read pixels directly — no scaling needed
         let data = unsafe { std::slice::from_raw_parts(mmap as *const u8, buf_size) };
 
-        let update = DisplayUpdate::Bitmap(BitmapUpdate {
-            x: 0,
-            y: 0,
-            width: NonZeroU16::new(width as u16).unwrap(),
-            height: NonZeroU16::new(height as u16).unwrap(),
-            format: pixel_format,
-            data: Bytes::copy_from_slice(data),
-            stride: NonZeroUsize::new(stride as usize).unwrap(),
-        });
+        // Try EGFX H.264 path
+        let mut sent_via_egfx = false;
+        if let (Some(shared), Some(encoder)) = (&egfx_shared, &mut h264_encoder) {
+            // Phase 1: Cache handle/sender once EGFX becomes ready
+            if !egfx_active && shared.is_ready() {
+                egfx_handle = shared.get_handle();
+                egfx_sender = shared.get_event_sender();
+                if egfx_handle.is_some() && egfx_sender.is_some() {
+                    egfx_active = true;
+                    tracing::info!("EGFX ready, switching to H.264 encoding");
+                }
+            }
 
-        if state.tx.blocking_send(update).is_err() {
-            tracing::info!("Display update channel closed");
-            break;
+            if egfx_active {
+                if let (Some(handle), Some(sender)) = (&egfx_handle, &egfx_sender) {
+                    // Phase 2: Initialize surface (once, separate from frame sending)
+                    if egfx_surface_id.is_none() {
+                        if let Some(sid) = EgfxShared::init_surface(
+                            handle,
+                            sender,
+                            width as u16,
+                            height as u16,
+                        ) {
+                            egfx_surface_id = Some(sid);
+                        }
+                        // Don't send a frame on the same iteration as surface init.
+                        // The setup PDUs need to reach the client first.
+                        // Next loop iteration will send the first frame (IDR).
+                    } else {
+                        // Phase 3: Send frames
+                        let sid = egfx_surface_id.unwrap();
+                        match encoder.encode(data) {
+                            Ok(h264_data) if h264_data.len() > 32 => {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u32;
+
+                                sent_via_egfx = EgfxShared::send_frame(
+                                    handle,
+                                    sender,
+                                    sid,
+                                    width as u16,
+                                    height as u16,
+                                    &h264_data,
+                                    timestamp,
+                                );
+                            }
+                            Ok(_) => {} // Tiny frame, skip
+                            Err(e) => {
+                                tracing::warn!("H.264 encode failed: {:#}", e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fallback to raw bitmap ONLY before EGFX is active.
+        // Once EGFX is active, never send 8MB raw bitmaps.
+        if !sent_via_egfx && !egfx_active {
+            let update = DisplayUpdate::Bitmap(BitmapUpdate {
+                x: 0,
+                y: 0,
+                width: NonZeroU16::new(width as u16).unwrap(),
+                height: NonZeroU16::new(height as u16).unwrap(),
+                format: pixel_format,
+                data: Bytes::copy_from_slice(data),
+                stride: NonZeroUsize::new(stride as usize).unwrap(),
+            });
+
+            if state.tx.blocking_send(update).is_err() {
+                tracing::info!("Display update channel closed");
+                break;
+            }
         }
 
         let elapsed = last_frame.elapsed();

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::net::SocketAddr;
 use std::path::Path;
 
@@ -5,6 +6,7 @@ use anyhow::{Context, Result};
 use ironrdp_server::{Credentials, RdpServer};
 
 use crate::capture::HyprDisplay;
+use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::HyprInputHandler;
 
 pub async fn run(
@@ -17,10 +19,15 @@ pub async fn run(
 ) -> Result<()> {
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
-    let display = HyprDisplay::new(resolution).await.context("failed to initialize display capture")?;
+    // Create shared EGFX state before display so capture thread has it from the start
+    let egfx_shared = Arc::new(EgfxShared::new());
+
+    let display = HyprDisplay::new(resolution, Arc::clone(&egfx_shared)).await.context("failed to initialize display capture")?;
     let (rdp_width, rdp_height) = display.dimensions();
     let output_name = display.output_name().to_string();
     let input_handler = HyprInputHandler::new(rdp_width, rdp_height, &output_name).context("failed to initialize input handler")?;
+
+    let gfx_factory = HyprGfxFactory::new(egfx_shared);
 
     let builder = RdpServer::builder().with_addr(addr);
 
@@ -34,6 +41,7 @@ pub async fn run(
                 .with_tls(acceptor)
                 .with_input_handler(input_handler)
                 .with_display_handler(display)
+                .with_gfx_factory(Some(Box::new(gfx_factory)))
                 .build()
         }
         _ => {
@@ -42,6 +50,7 @@ pub async fn run(
                 .with_no_security()
                 .with_input_handler(input_handler)
                 .with_display_handler(display)
+                .with_gfx_factory(Some(Box::new(gfx_factory)))
                 .build()
         }
     };
