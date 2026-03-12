@@ -10,11 +10,20 @@ use tokio::sync::mpsc;
 use crate::egfx::EgfxShared;
 use crate::input::SharedOutputLayout;
 
-/// Captures frames from Hyprland via ext-image-copy-capture-v1 protocol.
+#[derive(Clone, Copy, Debug)]
+pub enum CaptureMode {
+    /// ext-image-copy-capture-v1
+    Ext,
+    /// wlr-screencopy-v1
+    Wlr,
+}
+
+/// Captures frames from Hyprland via Wayland capture protocols.
 pub struct HyprDisplay {
     width: u16,
     height: u16,
     resolution: (u32, u32),
+    capture_mode: CaptureMode,
     output_name: String,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
@@ -29,6 +38,7 @@ impl HyprDisplay {
 
     pub async fn new(
         resolution: (u32, u32),
+        capture_mode: CaptureMode,
         egfx_shared: Arc<EgfxShared>,
         output_layout: Arc<SharedOutputLayout>,
     ) -> Result<Self> {
@@ -37,21 +47,27 @@ impl HyprDisplay {
         let capture_info = wayland::start_capture(
             tx.clone(),
             resolution,
+            capture_mode,
             Some(Arc::clone(&egfx_shared)),
             Arc::clone(&output_layout),
         )
         .await?;
 
+        let protocol_name = match capture_mode {
+            CaptureMode::Ext => "ext-image-copy-capture-v1",
+            CaptureMode::Wlr => "wlr-screencopy-v1",
+        };
         tracing::info!(
             width = capture_info.width,
             height = capture_info.height,
-            "Display capture initialized via ext-image-copy-capture-v1"
+            "Display capture initialized via {}", protocol_name
         );
 
         Ok(Self {
             width: capture_info.width as u16,
             height: capture_info.height as u16,
             resolution,
+            capture_mode,
             output_name: capture_info.output_name,
             egfx_shared: Some(egfx_shared),
             output_layout,
@@ -79,6 +95,7 @@ impl RdpServerDisplay for HyprDisplay {
                 let capture_info = wayland::start_capture(
                     tx,
                     self.resolution,
+                    self.capture_mode,
                     self.egfx_shared.clone(),
                     Arc::clone(&self.output_layout),
                 )

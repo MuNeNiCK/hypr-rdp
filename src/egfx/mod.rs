@@ -350,7 +350,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
     }
 
     fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
-        tracing::trace!(frame_id, queue_depth, "EGFX: frame ack");
+        tracing::debug!(frame_id, queue_depth, "EGFX: frame ack");
     }
 
     fn on_close(&mut self) {

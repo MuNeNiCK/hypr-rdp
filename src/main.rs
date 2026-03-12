@@ -33,6 +33,10 @@ struct Args {
     /// RDP session resolution (WxH), e.g. 1920x1080
     #[arg(short, long, default_value = "1920x1080")]
     resolution: String,
+
+    /// Screen capture protocol: "wlr" (wlr-screencopy-v1) or "ext" (ext-image-copy-capture-v1)
+    #[arg(long, default_value = "wlr")]
+    capture_mode: String,
 }
 
 #[tokio::main]
@@ -44,6 +48,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     let resolution = parse_resolution(&args.resolution)?;
+    let capture_mode = match args.capture_mode.as_str() {
+        "ext" => capture::CaptureMode::Ext,
+        "wlr" => capture::CaptureMode::Wlr,
+        other => anyhow::bail!("unknown capture mode '{}', expected 'ext' or 'wlr'", other),
+    };
 
     tracing::info!("Starting hypr-rdp on {}", args.bind);
 
@@ -55,6 +64,7 @@ async fn main() -> Result<()> {
             &args.username,
             &args.password,
             resolution,
+            capture_mode,
         ) => result,
         result = shutdown_signal() => {
             result?;

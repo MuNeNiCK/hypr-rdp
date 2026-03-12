@@ -366,7 +366,6 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
 
 impl RdpServerInputHandler for HyprInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        tracing::debug!(?event, "RDP keyboard event received");
         let mut state = self.state.lock().unwrap();
         let time = timestamp_ms();
 

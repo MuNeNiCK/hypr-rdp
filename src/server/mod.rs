@@ -5,7 +5,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ironrdp_server::{Credentials, RdpServer};
 
-use crate::capture::HyprDisplay;
+use crate::capture::{CaptureMode, HyprDisplay};
 use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::{HyprInputHandler, SharedOutputLayout};
 
@@ -16,6 +16,7 @@ pub async fn run(
     username: &str,
     password: &str,
     resolution: (u32, u32),
+    capture_mode: CaptureMode,
 ) -> Result<()> {
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
@@ -25,6 +26,7 @@ pub async fn run(
 
     let display = HyprDisplay::new(
         resolution,
+        capture_mode,
         Arc::clone(&egfx_shared),
         Arc::clone(&output_layout),
     )

@@ -12,6 +12,7 @@ use bytes::Bytes;
 use ironrdp_server::{BitmapUpdate, DisplayUpdate, PixelFormat};
 use tokio::sync::mpsc;
 
+use super::CaptureMode;
 use crate::egfx::EgfxShared;
 use crate::input::SharedOutputLayout;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
@@ -21,6 +22,9 @@ use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_c
 use wayland_protocols::ext::image_copy_capture::v1::client::{
     ext_image_copy_capture_frame_v1, ext_image_copy_capture_manager_v1,
     ext_image_copy_capture_session_v1,
+};
+use wayland_protocols_wlr::screencopy::v1::client::{
+    zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
 
 pub struct CaptureInfo {
@@ -147,6 +151,7 @@ pub fn remove_headless_output(name: &str) {
 pub async fn start_capture(
     tx: mpsc::Sender<DisplayUpdate>,
     target_resolution: (u32, u32),
+    capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
 ) -> Result<CaptureInfo> {
@@ -155,9 +160,14 @@ pub async fn start_capture(
     std::thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
-            if let Err(e) =
-                capture_thread(tx, info_tx, target_resolution, egfx_shared, output_layout)
-            {
+            if let Err(e) = capture_thread(
+                tx,
+                info_tx,
+                target_resolution,
+                capture_mode,
+                egfx_shared,
+                output_layout,
+            ) {
                 tracing::error!("Capture thread error: {:#}", e);
             }
         })?;
@@ -169,6 +179,7 @@ fn capture_thread(
     tx: mpsc::Sender<DisplayUpdate>,
     info_tx: tokio::sync::oneshot::Sender<Result<CaptureInfo>>,
     target_resolution: (u32, u32),
+    capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
 ) -> Result<()> {
@@ -177,6 +188,7 @@ fn capture_thread(
         tx,
         &mut info_tx,
         target_resolution,
+        capture_mode,
         egfx_shared,
         output_layout,
     );
@@ -206,6 +218,7 @@ fn capture_thread_inner(
     tx: mpsc::Sender<DisplayUpdate>,
     info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
     target_resolution: (u32, u32),
+    capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
 ) -> Result<()> {
@@ -245,17 +258,6 @@ fn capture_thread_inner(
         .roundtrip(&mut state)
         .context("Wayland roundtrip (2nd) failed")?;
 
-    // Verify required globals are present
-    let capture_mgr = state
-        .capture_manager
-        .as_ref()
-        .context("ext_image_copy_capture_manager_v1 not available")?
-        .clone();
-    let source_mgr = state
-        .source_manager
-        .as_ref()
-        .context("ext_output_image_capture_source_manager_v1 not available")?
-        .clone();
     let output = state
         .target_output
         .as_ref()
@@ -266,31 +268,187 @@ fn capture_thread_inner(
         .clone();
     let shm = state.shm.as_ref().context("wl_shm not available")?.clone();
 
-    // Create capture source from the headless output
-    let source = source_mgr.create_source(&output, &qh, ());
+    match capture_mode {
+        CaptureMode::Ext => capture_loop_ext(
+            &conn, &mut event_queue, &mut state, &qh, &output, &shm,
+            &output_name, egfx_shared, info_tx,
+        ),
+        CaptureMode::Wlr => {
+            let screencopy_mgr = state
+                .screencopy_manager
+                .as_ref()
+                .context("zwlr_screencopy_manager_v1 not available")?
+                .clone();
+            capture_loop_wlr(
+                &conn, &mut event_queue, &mut state, &qh, &output, &shm,
+                &screencopy_mgr, &output_name, egfx_shared, info_tx,
+            )
+        }
+    }
+}
 
-    // Create capture session (without cursor painting to avoid Hyprland SEGV in
-    // CExtImageCopyCaptureFrameV1::sendPresentationTime when cursor changes between
-    // frame.destroy() and next create_frame())
+/// Common frame processing: EGFX H.264 encoding or bitmap fallback.
+struct FrameProcessor {
+    egfx_shared: Option<Arc<EgfxShared>>,
+    h264_encoder: Option<crate::egfx::FrameEncoder>,
+    egfx_handle: Option<ironrdp_server::GfxServerHandle>,
+    egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>>,
+    egfx_surface_id: Option<u16>,
+    egfx_active: bool,
+    egfx_ready: bool,
+    egfx_generation: u32,
+    width: u32,
+    height: u32,
+    pixel_format: PixelFormat,
+    stride: u32,
+}
+
+impl FrameProcessor {
+    fn new(
+        egfx_shared: Option<Arc<EgfxShared>>,
+        width: u32, height: u32,
+        pixel_format: PixelFormat, stride: u32,
+    ) -> Self {
+        Self {
+            egfx_shared, h264_encoder: None, egfx_handle: None,
+            egfx_sender: None, egfx_surface_id: None,
+            egfx_active: false, egfx_ready: false, egfx_generation: 0,
+            width, height, pixel_format, stride,
+        }
+    }
+
+    /// Process a captured frame. Returns true if the capture loop should continue.
+    fn process(&mut self, data: &[u8], tx: &mpsc::Sender<DisplayUpdate>) -> bool {
+        let mut sent_via_egfx = false;
+        if let Some(shared) = &self.egfx_shared {
+            let ready = shared.is_ready();
+            let gen = shared.generation();
+
+            if ready != self.egfx_ready {
+                self.egfx_ready = ready;
+                if !ready {
+                    self.egfx_active = false;
+                    self.egfx_handle = None;
+                    self.egfx_sender = None;
+                    self.egfx_surface_id = None;
+                    self.h264_encoder = None;
+                    tracing::info!("EGFX channel unavailable, falling back to bitmap");
+                }
+            }
+
+            if gen != self.egfx_generation {
+                self.egfx_generation = gen;
+                self.egfx_surface_id = None;
+                self.h264_encoder = None;
+                if ready {
+                    match crate::egfx::FrameEncoder::new(self.width, self.height) {
+                        Ok(enc) => {
+                            tracing::info!(
+                                width = self.width, height = self.height,
+                                backend = enc.backend_name(), gen,
+                                "H.264 encoder initialized"
+                            );
+                            self.h264_encoder = Some(enc);
+                        }
+                        Err(e) => tracing::warn!("Failed to initialize H.264 encoder: {:#}", e),
+                    }
+                }
+            }
+
+            if ready && !self.egfx_active {
+                self.egfx_handle = shared.get_handle();
+                self.egfx_sender = shared.get_event_sender();
+                if self.h264_encoder.is_some() && self.egfx_handle.is_some() && self.egfx_sender.is_some() {
+                    self.egfx_active = true;
+                    tracing::info!("EGFX transport ready, switching to H.264 encoding");
+                }
+            }
+
+            if self.egfx_active {
+                if let (Some(handle), Some(sender), Some(encoder)) =
+                    (&self.egfx_handle, &self.egfx_sender, &mut self.h264_encoder)
+                {
+                    if self.egfx_surface_id.is_none() {
+                        if let Some(sid) =
+                            EgfxShared::init_surface(handle, sender, self.width as u16, self.height as u16)
+                        {
+                            self.egfx_surface_id = Some(sid);
+                        }
+                    } else if let Some(sid) = self.egfx_surface_id {
+                        match encoder.encode(data) {
+                            Ok(ref h264_data) if h264_data.len() > 32 => {
+                                let timestamp = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis() as u32;
+                                sent_via_egfx = EgfxShared::send_frame(
+                                    handle, sender, sid,
+                                    self.width as u16, self.height as u16,
+                                    h264_data, timestamp,
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!("H.264 encode failed: {:#}", e),
+                        }
+                    }
+                }
+            }
+        }
+
+        if !sent_via_egfx && !self.egfx_active {
+            let update = DisplayUpdate::Bitmap(BitmapUpdate {
+                x: 0, y: 0,
+                width: NonZeroU16::new(self.width as u16).unwrap(),
+                height: NonZeroU16::new(self.height as u16).unwrap(),
+                format: self.pixel_format,
+                data: Bytes::copy_from_slice(data),
+                stride: NonZeroUsize::new(self.stride as usize).unwrap(),
+            });
+            if tx.blocking_send(update).is_err() {
+                tracing::info!("Display update channel closed");
+                return false;
+            }
+        }
+        true
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_loop_ext(
+    conn: &Connection,
+    event_queue: &mut wayland_client::EventQueue<AppState>,
+    state: &mut AppState,
+    qh: &QueueHandle<AppState>,
+    output: &wl_output::WlOutput,
+    shm: &wl_shm::WlShm,
+    output_name: &str,
+    egfx_shared: Option<Arc<EgfxShared>>,
+    info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
+) -> Result<()> {
+    let capture_mgr = state
+        .capture_manager
+        .as_ref()
+        .context("ext_image_copy_capture_manager_v1 not available")?
+        .clone();
+    let source_mgr = state
+        .source_manager
+        .as_ref()
+        .context("ext_output_image_capture_source_manager_v1 not available")?
+        .clone();
+
+    let source = source_mgr.create_source(output, qh, ());
     let session = capture_mgr.create_session(
         &source,
         ext_image_copy_capture_manager_v1::Options::empty(),
-        &qh,
-        (),
+        qh, (),
     );
     state.session = Some(session.clone());
 
-    // Roundtrip to get buffer constraints
-    event_queue
-        .roundtrip(&mut state)
-        .context("failed to get buffer constraints")?;
-    event_queue
-        .roundtrip(&mut state)
-        .context("failed to get buffer constraints (2nd)")?;
+    event_queue.roundtrip(state).context("failed to get buffer constraints")?;
+    event_queue.roundtrip(state).context("failed to get buffer constraints (2nd)")?;
 
     let width = state.buffer_width;
     let height = state.buffer_height;
-
     if width == 0 || height == 0 {
         bail!("invalid buffer dimensions: {}x{}", width, height);
     }
@@ -299,41 +457,18 @@ fn capture_thread_inner(
     let stride = width * 4;
     let buf_size = (stride * height) as usize;
 
-    // Create shared memory buffer
     let shm_fd = create_shm_fd(buf_size)?;
-    let pool = shm.create_pool(shm_fd.as_fd(), buf_size as i32, &qh, ());
-    let buffer = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        stride as i32,
-        shm_format,
-        &qh,
-        (),
-    );
+    let pool = shm.create_pool(shm_fd.as_fd(), buf_size as i32, qh, ());
+    let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, shm_format, qh, ());
 
-    // Memory-map the buffer for reading
     let mmap = unsafe {
-        libc::mmap(
-            std::ptr::null_mut(),
-            buf_size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            shm_fd.as_fd().as_raw_fd(),
-            0,
-        )
+        libc::mmap(std::ptr::null_mut(), buf_size, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED, shm_fd.as_fd().as_raw_fd(), 0)
     };
-    if mmap == libc::MAP_FAILED {
-        bail!("mmap failed");
-    }
+    if mmap == libc::MAP_FAILED { bail!("mmap failed"); }
 
-    // Send capture info back — no scaling needed, headless output is at target resolution
     if let Some(tx) = info_tx.take() {
-        let _ = tx.send(Ok(CaptureInfo {
-            width,
-            height,
-            output_name: output_name.clone(),
-        }));
+        let _ = tx.send(Ok(CaptureInfo { width, height, output_name: output_name.to_string() }));
     }
 
     let pixel_format = match shm_format {
@@ -344,38 +479,15 @@ fn capture_thread_inner(
         _ => PixelFormat::BgrA32,
     };
 
-    tracing::info!(
-        width, height, ?shm_format,
-        output = %output_name,
-        "Starting capture loop on headless output"
-    );
+    tracing::info!(width, height, ?shm_format, output = %output_name, mode = "ext", "Starting capture loop");
 
-    let mut h264_encoder: Option<crate::egfx::FrameEncoder> = None;
-    let mut egfx_handle: Option<ironrdp_server::GfxServerHandle> = None;
-    let mut egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> =
-        None;
-    let mut egfx_surface_id: Option<u16> = None;
-    let mut egfx_active = false;
-    let mut egfx_ready = false;
-    let mut egfx_generation: u32 = 0;
+    let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride);
 
-    // Frame rate limiting
-    let target_interval = std::time::Duration::from_millis(33); // ~30fps
-    let mut last_frame = std::time::Instant::now();
-
-    // Capture loop
     loop {
-        if state.tx.is_closed() {
-            tracing::info!("Display update channel closed, stopping capture");
-            break;
-        }
+        if state.tx.is_closed() { break; }
+        if state.stopped { tracing::warn!("Capture session stopped by compositor"); break; }
 
-        if state.stopped {
-            tracing::warn!("Capture session stopped by compositor");
-            break;
-        }
-
-        let frame = session.create_frame(&qh, ());
+        let frame = session.create_frame(qh, ());
         state.frame_ready = false;
         state.frame_failed = false;
         state.damage_regions.clear();
@@ -383,11 +495,106 @@ fn capture_thread_inner(
         frame.attach_buffer(&buffer);
         frame.damage_buffer(0, 0, width as i32, height as i32);
         frame.capture();
+        conn.flush().context("Wayland flush failed")?;
 
         loop {
-            event_queue
-                .blocking_dispatch(&mut state)
-                .context("Wayland dispatch failed")?;
+            event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
+            if state.frame_ready || state.frame_failed { break; }
+        }
+
+        frame.destroy();
+
+        if state.frame_failed { continue; }
+
+        let data = unsafe { std::slice::from_raw_parts(mmap as *const u8, buf_size) };
+        if !proc.process(data, &state.tx) { break; }
+    }
+
+    unsafe { libc::munmap(mmap, buf_size); }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_loop_wlr(
+    conn: &Connection,
+    event_queue: &mut wayland_client::EventQueue<AppState>,
+    state: &mut AppState,
+    qh: &QueueHandle<AppState>,
+    output: &wl_output::WlOutput,
+    shm: &wl_shm::WlShm,
+    screencopy_mgr: &zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
+    output_name: &str,
+    egfx_shared: Option<Arc<EgfxShared>>,
+    info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
+) -> Result<()> {
+    // First capture to get buffer dimensions
+    let probe = screencopy_mgr.capture_output(0, output, qh, ());
+    state.buffer_width = 0;
+    state.buffer_height = 0;
+    state.frame_ready = false;
+    state.frame_failed = false;
+
+    // Wait for buffer info events
+    loop {
+        event_queue.blocking_dispatch(state).context("Wayland dispatch (wlr probe) failed")?;
+        // buffer events arrive before buffer_done; we get ready/failed only after copy()
+        // Just wait until we have dimensions
+        if state.buffer_width > 0 && state.buffer_height > 0 {
+            break;
+        }
+    }
+    probe.destroy();
+
+    let width = state.buffer_width;
+    let height = state.buffer_height;
+    let shm_format = state.shm_format.unwrap_or(wl_shm::Format::Xrgb8888);
+    let stride = if state.wlr_stride > 0 { state.wlr_stride } else { width * 4 };
+    let buf_size = (stride * height) as usize;
+
+    let shm_fd = create_shm_fd(buf_size)?;
+    let pool = shm.create_pool(shm_fd.as_fd(), buf_size as i32, qh, ());
+    let buffer = pool.create_buffer(0, width as i32, height as i32, stride as i32, shm_format, qh, ());
+
+    let mmap = unsafe {
+        libc::mmap(std::ptr::null_mut(), buf_size, libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED, shm_fd.as_fd().as_raw_fd(), 0)
+    };
+    if mmap == libc::MAP_FAILED { bail!("mmap failed"); }
+
+    if let Some(tx) = info_tx.take() {
+        let _ = tx.send(Ok(CaptureInfo { width, height, output_name: output_name.to_string() }));
+    }
+
+    let pixel_format = match shm_format {
+        wl_shm::Format::Argb8888 => PixelFormat::BgrA32,
+        wl_shm::Format::Xrgb8888 => PixelFormat::BgrX32,
+        wl_shm::Format::Xbgr8888 => PixelFormat::RgbX32,
+        wl_shm::Format::Abgr8888 => PixelFormat::RgbA32,
+        _ => PixelFormat::BgrA32,
+    };
+
+    tracing::info!(width, height, ?shm_format, stride, output = %output_name, mode = "wlr", "Starting capture loop");
+
+    let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride);
+
+    loop {
+        if state.tx.is_closed() { break; }
+
+        let frame = screencopy_mgr.capture_output(0, output, qh, ());
+        state.frame_ready = false;
+        state.frame_failed = false;
+        state.damage_regions.clear();
+
+        let mut buffer_sent = false;
+        loop {
+            event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
+
+            if !buffer_sent && state.buffer_width > 0 {
+                frame.copy(&buffer);
+                conn.flush().context("Wayland flush failed")?;
+                buffer_sent = true;
+            }
+
             if state.frame_ready || state.frame_failed {
                 break;
             }
@@ -395,139 +602,13 @@ fn capture_thread_inner(
 
         frame.destroy();
 
-        if state.frame_failed {
-            tracing::debug!("Frame capture failed, retrying");
-            continue;
-        }
+        if state.frame_failed { continue; }
 
-        // Read pixels directly — no scaling needed
         let data = unsafe { std::slice::from_raw_parts(mmap as *const u8, buf_size) };
-
-        // Try EGFX H.264 path
-        let mut sent_via_egfx = false;
-        if let Some(shared) = &egfx_shared {
-            let ready = shared.is_ready();
-            let gen = shared.generation();
-
-            // Detect EGFX becoming available or unavailable
-            if ready != egfx_ready {
-                egfx_ready = ready;
-                if !ready {
-                    egfx_active = false;
-                    egfx_handle = None;
-                    egfx_sender = None;
-                    egfx_surface_id = None;
-                    h264_encoder = None;
-                    tracing::info!("EGFX channel unavailable, falling back to bitmap");
-                }
-            }
-
-            // Detect re-negotiation (on_ready fired again) — invalidate surface and encoder
-            if gen != egfx_generation {
-                egfx_generation = gen;
-                egfx_surface_id = None;
-                h264_encoder = None;
-                if ready {
-                    match crate::egfx::FrameEncoder::new(width, height) {
-                        Ok(enc) => {
-                            tracing::info!(
-                                width, height,
-                                backend = enc.backend_name(),
-                                gen,
-                                "H.264 encoder initialized"
-                            );
-                            h264_encoder = Some(enc);
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "Failed to initialize H.264 encoder: {:#}", e
-                            );
-                        }
-                    }
-                }
-            }
-
-            if ready && !egfx_active {
-                egfx_handle = shared.get_handle();
-                egfx_sender = shared.get_event_sender();
-                if h264_encoder.is_some() && egfx_handle.is_some() && egfx_sender.is_some() {
-                    egfx_active = true;
-                    tracing::info!("EGFX transport ready, switching to H.264 encoding");
-                }
-            }
-
-            if egfx_active {
-                if let (Some(handle), Some(sender), Some(encoder)) =
-                    (&egfx_handle, &egfx_sender, &mut h264_encoder)
-                {
-                    if egfx_surface_id.is_none() {
-                        if let Some(sid) =
-                            EgfxShared::init_surface(handle, sender, width as u16, height as u16)
-                        {
-                            egfx_surface_id = Some(sid);
-                        }
-                        // Don't send a frame on the same iteration as surface init.
-                        // Setup PDUs must reach the client first; batching causes mstsc to reject.
-                    } else if let Some(sid) = egfx_surface_id {
-                        match encoder.encode(data) {
-                            Ok(ref h264_data) if h264_data.len() > 32 => {
-                                tracing::debug!(sid, h264_len = h264_data.len(), "Encoding frame for surface");
-                                let timestamp = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis()
-                                    as u32;
-
-                                sent_via_egfx = EgfxShared::send_frame(
-                                    handle,
-                                    sender,
-                                    sid,
-                                    width as u16,
-                                    height as u16,
-                                    &h264_data,
-                                    timestamp,
-                                );
-                            }
-                            Ok(ref h264_data) => {
-                                tracing::debug!(sid, h264_len = h264_data.len(), "Encoded frame too small, skipping");
-                            }
-                            Err(e) => {
-                                tracing::warn!("H.264 encode failed: {:#}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if !sent_via_egfx && !egfx_active {
-            let update = DisplayUpdate::Bitmap(BitmapUpdate {
-                x: 0,
-                y: 0,
-                width: NonZeroU16::new(width as u16).unwrap(),
-                height: NonZeroU16::new(height as u16).unwrap(),
-                format: pixel_format,
-                data: Bytes::copy_from_slice(data),
-                stride: NonZeroUsize::new(stride as usize).unwrap(),
-            });
-
-            if state.tx.blocking_send(update).is_err() {
-                tracing::info!("Display update channel closed");
-                break;
-            }
-        }
-
-        let elapsed = last_frame.elapsed();
-        if elapsed < target_interval {
-            std::thread::sleep(target_interval - elapsed);
-        }
-        last_frame = std::time::Instant::now();
+        if !proc.process(data, &state.tx) { break; }
     }
 
-    unsafe {
-        libc::munmap(mmap, buf_size);
-    }
-
+    unsafe { libc::munmap(mmap, buf_size); }
     Ok(())
 }
 
@@ -544,10 +625,12 @@ struct AppState {
     capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
     source_manager:
         Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
+    screencopy_manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
     // Session state
     session: Option<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1>,
     buffer_width: u32,
     buffer_height: u32,
+    wlr_stride: u32,
     shm_format: Option<wl_shm::Format>,
     // Frame state
     frame_ready: bool,
@@ -567,9 +650,11 @@ impl AppState {
             output_names: Vec::new(),
             capture_manager: None,
             source_manager: None,
+            screencopy_manager: None,
             session: None,
             buffer_width: 0,
             buffer_height: 0,
+            wlr_stride: 0,
             shm_format: None,
             frame_ready: false,
             frame_failed: false,
@@ -609,6 +694,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                 }
                 "ext_output_image_capture_source_manager_v1" => {
                     state.source_manager = Some(registry.bind(name, version.min(1), qh, ()));
+                }
+                "zwlr_screencopy_manager_v1" => {
+                    state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));
                 }
                 _ => {}
             }
@@ -730,6 +818,54 @@ delegate_noop!(AppState: ignore wl_buffer::WlBuffer);
 delegate_noop!(AppState: ignore ext_image_capture_source_v1::ExtImageCaptureSourceV1);
 delegate_noop!(AppState: ignore ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(AppState: ignore ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1);
+delegate_noop!(AppState: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
+
+// --- wlr-screencopy frame dispatch ---
+
+impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for AppState {
+    fn event(
+        state: &mut Self,
+        _proxy: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        event: zwlr_screencopy_frame_v1::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwlr_screencopy_frame_v1::Event::Buffer {
+                format: WEnum::Value(format),
+                width,
+                height,
+                stride,
+            } => {
+                // Use the first suitable format
+                if state.buffer_width == 0 {
+                    state.buffer_width = width;
+                    state.buffer_height = height;
+                    state.wlr_stride = stride;
+                    state.shm_format = Some(format);
+                }
+                // Prefer Xrgb8888
+                if format == wl_shm::Format::Xrgb8888 || format == wl_shm::Format::Argb8888 {
+                    state.buffer_width = width;
+                    state.buffer_height = height;
+                    state.wlr_stride = stride;
+                    state.shm_format = Some(format);
+                }
+            }
+            zwlr_screencopy_frame_v1::Event::Ready { .. } => {
+                state.frame_ready = true;
+            }
+            zwlr_screencopy_frame_v1::Event::Failed => {
+                state.frame_failed = true;
+            }
+            zwlr_screencopy_frame_v1::Event::Damage { x, y, width, height } => {
+                state.damage_regions.push((x as i32, y as i32, width as i32, height as i32));
+            }
+            _ => {}
+        }
+    }
+}
 
 impl Dispatch<wayland_client::protocol::wl_display::WlDisplay, ()> for AppState {
     fn event(
