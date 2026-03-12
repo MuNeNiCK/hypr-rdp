@@ -1,20 +1,68 @@
 mod keymap;
 mod virtual_keyboard;
 
+use std::fs::File;
+use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
-use wayland_client::protocol::{wl_registry, wl_seat};
-use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle};
+use wayland_client::protocol::{wl_keyboard, wl_registry, wl_seat};
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
 use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
 use self::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1};
+
+#[derive(Clone, Debug)]
+struct OutputLayoutSnapshot {
+    output_name: String,
+    layout_extent_w: u32,
+    layout_extent_h: u32,
+    output_offset_x: u32,
+    output_offset_y: u32,
+}
+
+#[derive(Debug, Default)]
+pub struct SharedOutputLayout {
+    inner: Mutex<Option<OutputLayoutSnapshot>>,
+}
+
+impl SharedOutputLayout {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn update_from_output(&self, output_name: &str) -> Result<()> {
+        let (layout_extent_w, layout_extent_h, output_offset_x, output_offset_y) =
+            query_layout(output_name)?;
+        let snapshot = OutputLayoutSnapshot {
+            output_name: output_name.to_string(),
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+        };
+        tracing::info!(
+            output = %snapshot.output_name,
+            layout_extent_w = snapshot.layout_extent_w,
+            layout_extent_h = snapshot.layout_extent_h,
+            output_offset_x = snapshot.output_offset_x,
+            output_offset_y = snapshot.output_offset_y,
+            "Updated input layout mapping"
+        );
+        *self.inner.lock().unwrap() = Some(snapshot);
+        Ok(())
+    }
+
+    fn snapshot(&self) -> Option<OutputLayoutSnapshot> {
+        self.inner.lock().unwrap().clone()
+    }
+}
 
 /// Shared state for sending input commands to the Wayland thread
 struct InputState {
@@ -23,12 +71,7 @@ struct InputState {
     wl_state: WlState,
     vk: ZwpVirtualKeyboardV1,
     vp: ZwlrVirtualPointerV1,
-    // Layout mapping for motion_absolute
-    // motion_absolute normalizes (x/extent, y/extent) and maps to full layout
-    layout_extent_w: u32,
-    layout_extent_h: u32,
-    output_offset_x: u32, // headless output X offset within layout (relative to min)
-    output_offset_y: u32,
+    output_layout: Arc<SharedOutputLayout>,
 }
 
 impl InputState {
@@ -50,13 +93,16 @@ pub struct HyprInputHandler {
 }
 
 impl HyprInputHandler {
-    pub fn new(rdp_width: u16, rdp_height: u16, output_name: &str) -> Result<Self> {
-        // Query layout from hyprctl to compute mouse coordinate mapping
-        let (layout_extent_w, layout_extent_h, output_offset_x, output_offset_y) =
-            query_layout(output_name)?;
+    pub fn new(
+        rdp_width: u16,
+        rdp_height: u16,
+        output_layout: Arc<SharedOutputLayout>,
+    ) -> Result<Self> {
+        let layout = output_layout
+            .snapshot()
+            .context("output layout not initialized")?;
 
-        let conn =
-            Connection::connect_to_env().context("failed to connect to Wayland display")?;
+        let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
         let mut event_queue = conn.new_event_queue::<WlState>();
         let qh = event_queue.handle();
 
@@ -86,18 +132,29 @@ impl HyprInputHandler {
         // Create virtual pointer
         let vp = vp_mgr.create_virtual_pointer(Some(&seat), &qh, ());
 
-        // Generate XKB keymap using xkbcommon (same as compositor uses)
-        let keymap_str = generate_xkb_keymap()?;
-        let keymap_fd = create_keymap_fd(&keymap_str)?;
-        vk.keymap(1, keymap_fd.as_fd(), keymap_str.len() as u32); // 1 = XKB_V1
+        let (keymap_data, keymap_source) = load_keymap(&mut event_queue, &mut wl_state, &seat, &qh)
+            .or_else(|err| {
+                tracing::warn!(
+                    "Failed to get compositor keymap, falling back to default: {:#}",
+                    err
+                );
+                generate_xkb_keymap().map(|data| (data, "fallback"))
+            })?;
+        let keymap_fd = create_keymap_fd(&keymap_data)?;
+        vk.keymap(1, keymap_fd.as_fd(), keymap_data.len() as u32); // 1 = XKB_V1
 
         // Flush to send all pending requests
-        conn.flush().context("Wayland flush after input setup failed")?;
+        conn.flush()
+            .context("Wayland flush after input setup failed")?;
 
         tracing::info!(
             rdp_width, rdp_height,
-            layout_extent_w, layout_extent_h,
-            output_offset_x, output_offset_y,
+            layout_extent_w = layout.layout_extent_w,
+            layout_extent_h = layout.layout_extent_h,
+            output_offset_x = layout.output_offset_x,
+            output_offset_y = layout.output_offset_y,
+            output = %layout.output_name,
+            keymap_source,
             "Input handler initialized (virtual keyboard + pointer)"
         );
 
@@ -107,10 +164,7 @@ impl HyprInputHandler {
             wl_state,
             vk,
             vp,
-            layout_extent_w,
-            layout_extent_h,
-            output_offset_x,
-            output_offset_y,
+            output_layout,
         }));
 
         Ok(Self { state })
@@ -125,18 +179,26 @@ fn query_layout(output_name: &str) -> Result<(u32, u32, u32, u32)> {
         .args(["monitors", "-j"])
         .output()
         .context("failed to run hyprctl monitors")?;
-    let monitors: serde_json::Value = serde_json::from_slice(&output.stdout)
-        .context("failed to parse hyprctl monitors")?;
+    if !output.status.success() {
+        bail!(
+            "hyprctl monitors failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let monitors: serde_json::Value =
+        serde_json::from_slice(&output.stdout).context("failed to parse hyprctl monitors")?;
 
     let monitors = monitors.as_array().context("expected monitors array")?;
+    if monitors.is_empty() {
+        bail!("hyprctl monitors returned no outputs");
+    }
 
     // Find layout bounds
     let mut min_x = i64::MAX;
     let mut min_y = i64::MAX;
     let mut max_x = i64::MIN;
     let mut max_y = i64::MIN;
-    let mut target_x = 0i64;
-    let mut target_y = 0i64;
+    let mut target = None;
 
     for m in monitors {
         let x = m["x"].as_i64().unwrap_or(0);
@@ -149,17 +211,61 @@ fn query_layout(output_name: &str) -> Result<(u32, u32, u32, u32)> {
         max_y = max_y.max(y + h);
 
         if m["name"].as_str() == Some(output_name) {
-            target_x = x;
-            target_y = y;
+            target = Some((x, y));
         }
     }
 
+    let (target_x, target_y) = target.context(format!("output '{}' not found", output_name))?;
     let layout_w = (max_x - min_x) as u32;
     let layout_h = (max_y - min_y) as u32;
+    if layout_w == 0 || layout_h == 0 {
+        bail!("invalid layout bounds: {}x{}", layout_w, layout_h);
+    }
     let offset_x = (target_x - min_x) as u32;
     let offset_y = (target_y - min_y) as u32;
 
     Ok((layout_w, layout_h, offset_x, offset_y))
+}
+
+fn load_keymap(
+    event_queue: &mut EventQueue<WlState>,
+    wl_state: &mut WlState,
+    seat: &wl_seat::WlSeat,
+    qh: &QueueHandle<WlState>,
+) -> Result<(Vec<u8>, &'static str)> {
+    if wl_state.seat_has_keyboard {
+        if wl_state.keyboard.is_none() {
+            wl_state.keyboard = Some(seat.get_keyboard(qh, ()));
+        }
+
+        event_queue
+            .roundtrip(wl_state)
+            .context("Wayland roundtrip for keyboard keymap failed")?;
+
+        if let Some(keymap_data) = wl_state.keymap.take() {
+            tracing::info!(len = keymap_data.len(), "Loaded compositor keyboard keymap");
+            return Ok((keymap_data, "compositor"));
+        }
+    } else {
+        tracing::warn!("Wayland seat has no keyboard capability, using fallback keymap");
+    }
+
+    let fallback = generate_xkb_keymap()?;
+    tracing::info!(len = fallback.len(), "Generated fallback keyboard keymap");
+    Ok((fallback, "fallback"))
+}
+
+fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
+    let size = usize::try_from(size).context("keyboard keymap too large")?;
+    if size == 0 {
+        bail!("keyboard keymap is empty");
+    }
+
+    let mut file = File::from(fd);
+    let mut data = vec![0u8; size];
+    file.read_exact(&mut data)
+        .context("failed to read Wayland keyboard keymap")?;
+    Ok(data)
 }
 
 impl RdpServerInputHandler for HyprInputHandler {
@@ -194,66 +300,90 @@ impl RdpServerInputHandler for HyprInputHandler {
 
         match event {
             MouseEvent::Move { x, y } => {
+                let Some(layout) = state.output_layout.snapshot() else {
+                    tracing::warn!("Skipping mouse move: output layout not initialized");
+                    return;
+                };
                 // Map RDP coordinates to global layout coordinates
-                let abs_x = state.output_offset_x + x as u32;
-                let abs_y = state.output_offset_y + y as u32;
+                let abs_x = layout.output_offset_x + x as u32;
+                let abs_y = layout.output_offset_y + y as u32;
                 state.vp.motion_absolute(
                     time,
                     abs_x,
                     abs_y,
-                    state.layout_extent_w,
-                    state.layout_extent_h,
+                    layout.layout_extent_w,
+                    layout.layout_extent_h,
                 );
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::LeftPressed => {
-                state.vp.button(time, keymap::BTN_LEFT, ButtonState::Pressed);
+                state
+                    .vp
+                    .button(time, keymap::BTN_LEFT, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::LeftReleased => {
-                state.vp.button(time, keymap::BTN_LEFT, ButtonState::Released);
+                state
+                    .vp
+                    .button(time, keymap::BTN_LEFT, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::RightPressed => {
-                state.vp.button(time, keymap::BTN_RIGHT, ButtonState::Pressed);
+                state
+                    .vp
+                    .button(time, keymap::BTN_RIGHT, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::RightReleased => {
-                state.vp.button(time, keymap::BTN_RIGHT, ButtonState::Released);
+                state
+                    .vp
+                    .button(time, keymap::BTN_RIGHT, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::MiddlePressed => {
-                state.vp.button(time, keymap::BTN_MIDDLE, ButtonState::Pressed);
+                state
+                    .vp
+                    .button(time, keymap::BTN_MIDDLE, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::MiddleReleased => {
-                state.vp.button(time, keymap::BTN_MIDDLE, ButtonState::Released);
+                state
+                    .vp
+                    .button(time, keymap::BTN_MIDDLE, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button4Pressed => {
-                state.vp.button(time, keymap::BTN_SIDE, ButtonState::Pressed);
+                state
+                    .vp
+                    .button(time, keymap::BTN_SIDE, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button4Released => {
-                state.vp.button(time, keymap::BTN_SIDE, ButtonState::Released);
+                state
+                    .vp
+                    .button(time, keymap::BTN_SIDE, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button5Pressed => {
-                state.vp.button(time, keymap::BTN_EXTRA, ButtonState::Pressed);
+                state
+                    .vp
+                    .button(time, keymap::BTN_EXTRA, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button5Released => {
-                state.vp.button(time, keymap::BTN_EXTRA, ButtonState::Released);
+                state
+                    .vp
+                    .button(time, keymap::BTN_EXTRA, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
@@ -264,12 +394,26 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.vp.frame();
                 state.flush();
             }
+            MouseEvent::Scroll { x, y } => {
+                state.vp.axis_source(AxisSource::Wheel);
+                if y != 0 {
+                    state
+                        .vp
+                        .axis(time, Axis::VerticalScroll, (y as f64 / 120.0) * 15.0);
+                }
+                if x != 0 {
+                    state
+                        .vp
+                        .axis(time, Axis::HorizontalScroll, (x as f64 / 120.0) * 15.0);
+                }
+                state.vp.frame();
+                state.flush();
+            }
             MouseEvent::RelMove { x, y } => {
                 state.vp.motion(time, x as f64, y as f64);
                 state.vp.frame();
                 state.flush();
             }
-            _ => {}
         }
     }
 }
@@ -283,38 +427,42 @@ fn timestamp_ms() -> u32 {
 }
 
 /// Generate XKB keymap using xkbcommon (matching compositor's format)
-fn generate_xkb_keymap() -> Result<String> {
+fn generate_xkb_keymap() -> Result<Vec<u8>> {
     use xkbcommon::xkb;
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = xkb::Keymap::new_from_names(
         &context,
-        "", // rules: system default
-        "", // model: system default
-        "", // layout: system default
-        "", // variant: system default
+        "",   // rules: system default
+        "",   // model: system default
+        "",   // layout: system default
+        "",   // variant: system default
         None, // options
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
     .context("Failed to compile XKB keymap from system defaults")?;
-    let keymap_string = keymap.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-    if keymap_string.is_empty() {
+    let keymap_data = keymap
+        .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+        .into_bytes();
+    if keymap_data.is_empty() {
         bail!("XKB keymap generation returned empty string");
     }
-    tracing::debug!(len = keymap_string.len(), "Generated XKB keymap");
-    Ok(keymap_string)
+    tracing::debug!(len = keymap_data.len(), "Generated XKB keymap");
+    Ok(keymap_data)
 }
 
-fn create_keymap_fd(keymap: &str) -> Result<OwnedFd> {
-    use std::ffi::CStr;
-    let name = CStr::from_bytes_with_nul(b"hypr-rdp-keymap\0").unwrap();
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
+fn create_keymap_fd(keymap: &[u8]) -> Result<OwnedFd> {
+    let fd = unsafe {
+        libc::memfd_create(
+            c"hypr-rdp-keymap".as_ptr(),
+            libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+        )
+    };
     if fd < 0 {
         bail!("memfd_create failed");
     }
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let data = keymap.as_bytes();
-    let written = unsafe { libc::write(fd.as_raw_fd(), data.as_ptr() as *const _, data.len()) };
-    if written != data.len() as isize {
+    let written = unsafe { libc::write(fd.as_raw_fd(), keymap.as_ptr() as *const _, keymap.len()) };
+    if written != keymap.len() as isize {
         bail!("failed to write keymap");
     }
     // Seek back to beginning so compositor can read from start
@@ -327,6 +475,9 @@ fn create_keymap_fd(keymap: &str) -> Result<OwnedFd> {
 #[derive(Default)]
 struct WlState {
     seat: Option<wl_seat::WlSeat>,
+    seat_has_keyboard: bool,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    keymap: Option<Vec<u8>>,
     vk_manager: Option<ZwpVirtualKeyboardManagerV1>,
     vp_manager: Option<ZwlrVirtualPointerManagerV1>,
 }
@@ -364,16 +515,75 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WlState {
     }
 }
 
-// No-op dispatchers
-delegate_noop!(WlState: ignore wl_seat::WlSeat);
+impl Dispatch<wl_seat::WlSeat, ()> for WlState {
+    fn event(
+        state: &mut Self,
+        _: &wl_seat::WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(capabilities),
+        } = event
+        {
+            state.seat_has_keyboard = capabilities.contains(wl_seat::Capability::Keyboard);
+        }
+    }
+}
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for WlState {
+    fn event(
+        state: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Keymap {
+            format: WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+            fd,
+            size,
+        } = event
+        {
+            match read_keymap(fd, size) {
+                Ok(keymap) => {
+                    state.keymap = Some(keymap);
+                }
+                Err(err) => {
+                    tracing::warn!("Failed to read compositor keymap: {:#}", err);
+                }
+            }
+        }
+    }
+}
+
 delegate_noop!(WlState: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(WlState: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(WlState: ignore ZwlrVirtualPointerManagerV1);
 delegate_noop!(WlState: ignore ZwlrVirtualPointerV1);
 
 impl Dispatch<wayland_client::protocol::wl_display::WlDisplay, ()> for WlState {
-    fn event(_: &mut Self, _: &wayland_client::protocol::wl_display::WlDisplay, _: wayland_client::protocol::wl_display::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wayland_client::protocol::wl_display::WlDisplay,
+        _: wayland_client::protocol::wl_display::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for WlState {
-    fn event(_: &mut Self, _: &wayland_client::protocol::wl_callback::WlCallback, _: wayland_client::protocol::wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wayland_client::protocol::wl_callback::WlCallback,
+        _: wayland_client::protocol::wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }

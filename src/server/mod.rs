@@ -1,13 +1,13 @@
-use std::sync::Arc;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use ironrdp_server::{Credentials, RdpServer};
 
 use crate::capture::HyprDisplay;
 use crate::egfx::{EgfxShared, HyprGfxFactory};
-use crate::input::HyprInputHandler;
+use crate::input::{HyprInputHandler, SharedOutputLayout};
 
 pub async fn run(
     bind: &str,
@@ -21,11 +21,18 @@ pub async fn run(
 
     // Create shared EGFX state before display so capture thread has it from the start
     let egfx_shared = Arc::new(EgfxShared::new());
+    let output_layout = Arc::new(SharedOutputLayout::new());
 
-    let display = HyprDisplay::new(resolution, Arc::clone(&egfx_shared)).await.context("failed to initialize display capture")?;
+    let display = HyprDisplay::new(
+        resolution,
+        Arc::clone(&egfx_shared),
+        Arc::clone(&output_layout),
+    )
+    .await
+    .context("failed to initialize display capture")?;
     let (rdp_width, rdp_height) = display.dimensions();
-    let output_name = display.output_name().to_string();
-    let input_handler = HyprInputHandler::new(rdp_width, rdp_height, &output_name).context("failed to initialize input handler")?;
+    let input_handler = HyprInputHandler::new(rdp_width, rdp_height, output_layout)
+        .context("failed to initialize input handler")?;
 
     let gfx_factory = HyprGfxFactory::new(egfx_shared);
 
@@ -34,9 +41,12 @@ pub async fn run(
     let mut server = match (cert, key) {
         (Some(cert_path), Some(key_path)) => {
             use ironrdp_server::TlsIdentityCtx;
-            let tls_ctx = TlsIdentityCtx::init_from_paths(Path::new(cert_path), Path::new(key_path))
-                .context("failed to load TLS certificates")?;
-            let acceptor = tls_ctx.make_acceptor().context("failed to create TLS acceptor")?;
+            let tls_ctx =
+                TlsIdentityCtx::init_from_paths(Path::new(cert_path), Path::new(key_path))
+                    .context("failed to load TLS certificates")?;
+            let acceptor = tls_ctx
+                .make_acceptor()
+                .context("failed to create TLS acceptor")?;
             builder
                 .with_tls(acceptor)
                 .with_input_handler(input_handler)

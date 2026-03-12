@@ -10,8 +10,8 @@ use anyhow::Result;
 /// Encoder backend: VAAPI hardware or OpenH264 software.
 pub enum FrameEncoder {
     #[cfg(feature = "vaapi")]
-    Vaapi(vaapi::VaapiEncoder),
-    Software(encoder::H264Encoder),
+    Vaapi(Box<vaapi::VaapiEncoder>),
+    Software(Box<encoder::H264Encoder>),
 }
 
 impl FrameEncoder {
@@ -22,7 +22,7 @@ impl FrameEncoder {
             match vaapi::VaapiEncoder::new(width, height) {
                 Ok(enc) => {
                     tracing::info!("Using VA-API hardware encoder");
-                    return Ok(Self::Vaapi(enc));
+                    return Ok(Self::Vaapi(Box::new(enc)));
                 }
                 Err(e) => {
                     tracing::warn!("VA-API init failed, falling back to software: {:#}", e);
@@ -32,7 +32,7 @@ impl FrameEncoder {
 
         let enc = encoder::H264Encoder::new(width, height)?;
         tracing::info!("Using OpenH264 software encoder");
-        Ok(Self::Software(enc))
+        Ok(Self::Software(Box::new(enc)))
     }
 
     pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
@@ -59,15 +59,14 @@ pub fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
     let mut i = 0;
 
     while i < data.len() {
-        let start_code_len =
-            if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
-                4
-            } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
-                3
-            } else {
-                i += 1;
-                continue;
-            };
+        let start_code_len = if i + 4 <= data.len() && data[i..i + 4] == [0x00, 0x00, 0x00, 0x01] {
+            4
+        } else if i + 3 <= data.len() && data[i..i + 3] == [0x00, 0x00, 0x01] {
+            3
+        } else {
+            i += 1;
+            continue;
+        };
 
         let nal_start = i + start_code_len;
         if nal_start >= data.len() {
@@ -238,10 +237,11 @@ impl EgfxShared {
             };
 
             let regions = [Avc420Region::full_frame(width, height, 22)];
-            let frame_id = match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
-                Some(id) => id,
-                None => return false,
-            };
+            let frame_id =
+                match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
+                    Some(id) => id,
+                    None => return false,
+                };
 
             let dvc_messages = server.drain_output();
             (frame_id, dvc_messages, channel_id)
@@ -325,20 +325,16 @@ struct HyprGraphicsHandler {
 }
 
 impl GraphicsPipelineHandler for HyprGraphicsHandler {
-    fn capabilities_advertise(
-        &mut self,
-        pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu,
-    ) {
-        tracing::info!(
-            count = pdu.0.len(),
-            "EGFX: client advertised capabilities"
-        );
+    fn capabilities_advertise(&mut self, pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {
+        tracing::info!(count = pdu.0.len(), "EGFX: client advertised capabilities");
     }
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
         tracing::info!(?cap, "EGFX: channel ready");
         // Reset surface state for new/reconnecting client
-        self.shared.surface_initialized.store(false, Ordering::Release);
+        self.shared
+            .surface_initialized
+            .store(false, Ordering::Release);
         self.shared.ready.store(true, Ordering::Release);
     }
 
@@ -349,6 +345,8 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
     fn on_close(&mut self) {
         tracing::info!("EGFX: channel closed");
         self.shared.ready.store(false, Ordering::Release);
-        self.shared.surface_initialized.store(false, Ordering::Release);
+        self.shared
+            .surface_initialized
+            .store(false, Ordering::Release);
     }
 }

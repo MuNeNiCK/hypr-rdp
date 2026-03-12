@@ -149,7 +149,6 @@ impl H264Encoder {
             }
         }
     }
-
 }
 
 /// Reference to pre-allocated YUV planes implementing OpenH264's YUVSource.

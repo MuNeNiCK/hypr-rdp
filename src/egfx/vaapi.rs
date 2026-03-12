@@ -15,9 +15,9 @@ use cros_libva::{
     self as libva, BufferType, Context as VaContext, Display, EncCodedBuffer, EncMiscParameter,
     EncMiscParameterFrameRate, EncMiscParameterHRD, EncMiscParameterRateControl,
     EncPictureParameter, EncSequenceParameter, EncSliceParameter, MappedCodedBuffer, Picture,
-    RcFlags, Surface, UsageHint, VA_INVALID_ID, VA_INVALID_SURFACE, VA_PICTURE_H264_INVALID,
-    VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420, VAEntrypoint, VAImageFormat,
-    VAProfile,
+    RcFlags, Surface, UsageHint, VAEntrypoint, VAImageFormat, VAProfile, VA_INVALID_ID,
+    VA_INVALID_SURFACE, VA_PICTURE_H264_INVALID, VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+    VA_RT_FORMAT_YUV420,
 };
 
 const INPUT_SURFACE_POOL_SIZE: usize = 3;
@@ -70,7 +70,9 @@ impl VaapiEncoder {
 
         tracing::info!(
             "Initializing VA-API encoder: {}x{}, device={}",
-            width, height, DEVICE_PATH
+            width,
+            height,
+            DEVICE_PATH
         );
 
         let display = Display::open_drm_display(Path::new(DEVICE_PATH))
@@ -102,11 +104,7 @@ impl VaapiEncoder {
         }
 
         let config = display
-            .create_config(
-                vec![],
-                h264_profile,
-                VAEntrypoint::VAEntrypointEncSlice,
-            )
+            .create_config(vec![], h264_profile, VAEntrypoint::VAEntrypointEncSlice)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
         let input_surfaces = display
@@ -190,8 +188,7 @@ impl VaapiEncoder {
         self.current_input_surface = (self.current_input_surface + 1) % self.input_surfaces.len();
 
         let recon_idx = self.current_recon_surface;
-        self.current_recon_surface =
-            (self.current_recon_surface + 1) % self.recon_surfaces.len();
+        self.current_recon_surface = (self.current_recon_surface + 1) % self.recon_surfaces.len();
 
         let coded_idx = self.current_coded_buffer;
         self.current_coded_buffer = (self.current_coded_buffer + 1) % self.coded_buffers.len();
@@ -256,9 +253,9 @@ impl VaapiEncoder {
         );
         let pic_buffer = self
             .context
-            .create_buffer(BufferType::EncPictureParameter(
-                EncPictureParameter::H264(pic_param),
-            ))
+            .create_buffer(BufferType::EncPictureParameter(EncPictureParameter::H264(
+                pic_param,
+            )))
             .context("Failed to create pic buffer")?;
         picture.add_buffer(pic_buffer);
 
@@ -431,13 +428,13 @@ impl VaapiEncoder {
             mb_width,
             mb_height,
             &seq_fields,
-            0,                // bit_depth_luma_minus8
-            0,                // bit_depth_chroma_minus8
-            0,                // num_ref_frames_in_pic_order_cnt_cycle
-            0,                // offset_for_non_ref_pic
-            0,                // offset_for_top_to_bottom_field
-            [0; 256],         // offset_for_ref_frame
-            None,             // frame_crop
+            0,        // bit_depth_luma_minus8
+            0,        // bit_depth_chroma_minus8
+            0,        // num_ref_frames_in_pic_order_cnt_cycle
+            0,        // offset_for_non_ref_pic
+            0,        // offset_for_top_to_bottom_field
+            [0; 256], // offset_for_ref_frame
+            None,     // frame_crop
             Some(vui_fields),
             0,  // aspect_ratio_idc
             1,  // sar_width
@@ -488,31 +485,31 @@ impl VaapiEncoder {
 
         let pic_fields = H264EncPicFields::new(
             if is_idr { 1 } else { 0 }, // idr_pic_flag
-            1,                           // reference_pic_flag
-            1,                           // entropy_coding_mode_flag (CABAC)
-            0,                           // weighted_pred_flag
-            0,                           // weighted_bipred_idc
-            0,                           // constrained_intra_pred_flag
-            1,                           // transform_8x8_mode_flag
-            1,                           // deblocking_filter_control_present_flag
-            0,                           // redundant_pic_cnt_present_flag
-            0,                           // pic_order_present_flag
-            0,                           // pic_scaling_matrix_present_flag
+            1,                          // reference_pic_flag
+            1,                          // entropy_coding_mode_flag (CABAC)
+            0,                          // weighted_pred_flag
+            0,                          // weighted_bipred_idc
+            0,                          // constrained_intra_pred_flag
+            1,                          // transform_8x8_mode_flag
+            1,                          // deblocking_filter_control_present_flag
+            0,                          // redundant_pic_cnt_present_flag
+            0,                          // pic_order_present_flag
+            0,                          // pic_scaling_matrix_present_flag
         );
 
         EncPictureParameterBufferH264::new(
             curr_pic,
             reference_frames,
             coded_buf_id,
-            0,                                                // pic_parameter_set_id
-            0,                                                // seq_parameter_set_id
-            0,                                                // last_picture
+            0, // pic_parameter_set_id
+            0, // seq_parameter_set_id
+            0, // last_picture
             frame_num,
-            23,                                               // pic_init_qp
+            23,                                              // pic_init_qp
             if num_ref_l0 > 0 { num_ref_l0 - 1 } else { 0 }, // num_ref_idx_l0_active_minus1
-            0,                                                // num_ref_idx_l1_active_minus1
-            0,                                                // chroma_qp_index_offset
-            0,                                                // second_chroma_qp_index_offset
+            0,                                               // num_ref_idx_l1_active_minus1
+            0,                                               // chroma_qp_index_offset
+            0,                                               // second_chroma_qp_index_offset
             &pic_fields,
         )
     }
@@ -553,9 +550,9 @@ impl VaapiEncoder {
         };
 
         EncSliceParameterBufferH264::new(
-            0,                 // macroblock_address
+            0, // macroblock_address
             num_macroblocks,
-            VA_INVALID_ID,     // macroblock_info
+            VA_INVALID_ID, // macroblock_info
             slice_type,
             0,                 // pic_parameter_set_id
             frame_num,         // idr_pic_id
@@ -564,29 +561,29 @@ impl VaapiEncoder {
             [0, 0],            // delta_pic_order_cnt
             0,                 // direct_spatial_mv_pred_flag
             num_ref_override,
-            num_ref_l0,        // num_ref_idx_l0_active_minus1
-            0,                 // num_ref_idx_l1_active_minus1
+            num_ref_l0, // num_ref_idx_l0_active_minus1
+            0,          // num_ref_idx_l1_active_minus1
             ref_pic_list_0,
             ref_pic_list_1,
-            0,                 // luma_log2_weight_denom
-            0,                 // chroma_log2_weight_denom
-            0,                 // luma_weight_l0_flag
+            0, // luma_log2_weight_denom
+            0, // chroma_log2_weight_denom
+            0, // luma_weight_l0_flag
             [0; 32],
             [0; 32],
-            0,                 // chroma_weight_l0_flag
+            0, // chroma_weight_l0_flag
             [[0; 2]; 32],
             [[0; 2]; 32],
-            0,                 // luma_weight_l1_flag
+            0, // luma_weight_l1_flag
             [0; 32],
             [0; 32],
-            0,                 // chroma_weight_l1_flag
+            0, // chroma_weight_l1_flag
             [[0; 2]; 32],
             [[0; 2]; 32],
-            0,                 // cabac_init_idc
-            0,                 // slice_qp_delta
-            0,                 // disable_deblocking_filter_idc
-            0,                 // slice_alpha_c0_offset_div2
-            0,                 // slice_beta_offset_div2
+            0, // cabac_init_idc
+            0, // slice_qp_delta
+            0, // disable_deblocking_filter_idc
+            0, // slice_alpha_c0_offset_div2
+            0, // slice_beta_offset_div2
         )
     }
 
@@ -595,24 +592,28 @@ impl VaapiEncoder {
 
         let rc = EncMiscParameterRateControl::new(
             BITRATE_BPS,
-            100,   // target_percentage (CBR)
-            1000,  // window_size
-            0,     // initial_qp
-            18,    // min_qp
-            0,     // basic_unit_size
+            100,                                     // target_percentage (CBR)
+            1000,                                    // window_size
+            0,                                       // initial_qp
+            18,                                      // min_qp
+            0,                                       // basic_unit_size
             RcFlags::new(0, 1, 0, 0, 0, 0, 0, 0, 0), // disable_frame_skip=1
-            0,     // icq_quality_factor
-            40,    // max_qp
-            0,     // quality_factor
-            0,     // target_frame_size
+            0,                                       // icq_quality_factor
+            40,                                      // max_qp
+            0,                                       // quality_factor
+            0,                                       // target_frame_size
         );
-        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::RateControl(rc)));
+        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::RateControl(
+            rc,
+        )));
 
         let hrd = EncMiscParameterHRD::new(BITRATE_BPS / 2, BITRATE_BPS);
         buffers.push(BufferType::EncMiscParameter(EncMiscParameter::HRD(hrd)));
 
         let fr = EncMiscParameterFrameRate::new(30, 0);
-        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(fr)));
+        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(
+            fr,
+        )));
 
         buffers
     }

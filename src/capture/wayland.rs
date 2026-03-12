@@ -1,10 +1,11 @@
+use std::collections::BTreeSet;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
-use std::sync::Arc;
 use std::os::unix::io::OwnedFd;
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -12,6 +13,7 @@ use ironrdp_server::{BitmapUpdate, DisplayUpdate, PixelFormat};
 use tokio::sync::mpsc;
 
 use crate::egfx::EgfxShared;
+use crate::input::SharedOutputLayout;
 use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
 use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1;
@@ -28,38 +30,81 @@ pub struct CaptureInfo {
     pub output_name: String,
 }
 
+struct HeadlessOutputGuard {
+    name: Option<String>,
+}
+
+impl HeadlessOutputGuard {
+    fn new(name: String) -> Self {
+        Self { name: Some(name) }
+    }
+}
+
+impl Drop for HeadlessOutputGuard {
+    fn drop(&mut self) {
+        if let Some(name) = self.name.take() {
+            remove_headless_output(&name);
+        }
+    }
+}
+
+fn parse_headless_outputs(monitors_json: &[u8]) -> Result<Vec<String>> {
+    let monitors: serde_json::Value =
+        serde_json::from_slice(monitors_json).context("failed to parse hyprctl monitors output")?;
+
+    let monitors = monitors.as_array().context("expected monitors array")?;
+
+    Ok(monitors
+        .iter()
+        .filter_map(|m| {
+            let name = m["name"].as_str()?;
+            name.starts_with("HEADLESS-").then(|| name.to_string())
+        })
+        .collect())
+}
+
+fn list_headless_outputs() -> Result<Vec<String>> {
+    let output = Command::new("hyprctl")
+        .args(["monitors", "-j"])
+        .output()
+        .context("failed to run hyprctl monitors")?;
+    if !output.status.success() {
+        bail!(
+            "hyprctl monitors failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    parse_headless_outputs(&output.stdout)
+}
+
 /// Create a headless output in Hyprland at the given resolution.
 /// Returns the output name (e.g. "HEADLESS-1").
 fn create_headless_output(width: u32, height: u32) -> Result<String> {
+    let existing: BTreeSet<_> = list_headless_outputs()?.into_iter().collect();
+
     let output = Command::new("hyprctl")
         .args(["output", "create", "headless"])
         .output()
         .context("failed to run hyprctl output create")?;
     if !output.status.success() {
-        bail!("hyprctl output create failed: {}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "hyprctl output create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
-    let monitors_output = Command::new("hyprctl")
-        .args(["monitors", "-j"])
-        .output()
-        .context("failed to run hyprctl monitors")?;
-    let monitors: serde_json::Value = serde_json::from_slice(&monitors_output.stdout)
-        .context("failed to parse hyprctl monitors output")?;
-
-    let name = monitors
-        .as_array()
-        .context("expected monitors array")?
-        .iter()
-        .filter_map(|m| {
-            let n = m["name"].as_str()?;
-            if n.starts_with("HEADLESS-") {
-                Some(n.to_string())
-            } else {
-                None
-            }
-        })
-        .last()
-        .context("no HEADLESS output found after creation")?;
+    let mut created = list_headless_outputs()?
+        .into_iter()
+        .filter(|name| !existing.contains(name));
+    let name = match (created.next(), created.next()) {
+        (Some(name), None) => name,
+        (None, _) => bail!("no new HEADLESS output found after creation"),
+        (Some(first), Some(second)) => bail!(
+            "multiple new HEADLESS outputs found after creation: {}, {}",
+            first,
+            second
+        ),
+    };
 
     // Set resolution
     let mode = format!("{}x{}@60", width, height);
@@ -69,7 +114,10 @@ fn create_headless_output(width: u32, height: u32) -> Result<String> {
         .output()
         .context("failed to set headless output resolution")?;
     if !result.status.success() {
-        bail!("hyprctl keyword monitor failed: {}", String::from_utf8_lossy(&result.stderr));
+        bail!(
+            "hyprctl keyword monitor failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
     }
 
     tracing::info!(name = %name, width, height, "Created headless output");
@@ -100,13 +148,16 @@ pub async fn start_capture(
     tx: mpsc::Sender<DisplayUpdate>,
     target_resolution: (u32, u32),
     egfx_shared: Option<Arc<EgfxShared>>,
+    output_layout: Arc<SharedOutputLayout>,
 ) -> Result<CaptureInfo> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
 
     std::thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
-            if let Err(e) = capture_thread(tx, info_tx, target_resolution, egfx_shared) {
+            if let Err(e) =
+                capture_thread(tx, info_tx, target_resolution, egfx_shared, output_layout)
+            {
                 tracing::error!("Capture thread error: {:#}", e);
             }
         })?;
@@ -119,20 +170,55 @@ fn capture_thread(
     info_tx: tokio::sync::oneshot::Sender<Result<CaptureInfo>>,
     target_resolution: (u32, u32),
     egfx_shared: Option<Arc<EgfxShared>>,
+    output_layout: Arc<SharedOutputLayout>,
+) -> Result<()> {
+    let mut info_tx = Some(info_tx);
+    let result = capture_thread_inner(
+        tx,
+        &mut info_tx,
+        target_resolution,
+        egfx_shared,
+        output_layout,
+    );
+    if let Err(err) = result {
+        if let Some(tx) = info_tx.take() {
+            let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn create_shm_fd(size: usize) -> Result<OwnedFd> {
+    let fd = unsafe { libc::memfd_create(c"hypr-rdp-shm".as_ptr(), libc::MFD_CLOEXEC) };
+    if fd < 0 {
+        bail!("memfd_create failed");
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) };
+    if ret < 0 {
+        bail!("ftruncate failed");
+    }
+    Ok(fd)
+}
+
+fn capture_thread_inner(
+    tx: mpsc::Sender<DisplayUpdate>,
+    info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
+    target_resolution: (u32, u32),
+    egfx_shared: Option<Arc<EgfxShared>>,
+    output_layout: Arc<SharedOutputLayout>,
 ) -> Result<()> {
     let (target_w, target_h) = target_resolution;
 
-    // Create headless output at the target resolution
-    let output_name = match create_headless_output(target_w, target_h) {
-        Ok(name) => name,
-        Err(e) => {
-            let _ = info_tx.send(Err(e));
-            return Ok(());
-        }
-    };
+    let output_name = create_headless_output(target_w, target_h)?;
+    let _output_guard = HeadlessOutputGuard::new(output_name.clone());
 
     // Small delay to let Hyprland set up the output
     std::thread::sleep(std::time::Duration::from_millis(500));
+    output_layout
+        .update_from_output(&output_name)
+        .context("failed to refresh input layout for headless output")?;
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let mut event_queue = conn.new_event_queue::<AppState>();
@@ -167,13 +253,12 @@ fn capture_thread(
     let output = state
         .target_output
         .as_ref()
-        .context(format!("headless output '{}' not found in Wayland globals", state.target_output_name))?
+        .context(format!(
+            "headless output '{}' not found in Wayland globals",
+            state.target_output_name
+        ))?
         .clone();
-    let shm = state
-        .shm
-        .as_ref()
-        .context("wl_shm not available")?
-        .clone();
+    let shm = state.shm.as_ref().context("wl_shm not available")?.clone();
 
     // Create capture source from the headless output
     let source = source_mgr.create_source(&output, &qh, ());
@@ -199,10 +284,7 @@ fn capture_thread(
     let height = state.buffer_height;
 
     if width == 0 || height == 0 {
-        let err = anyhow::anyhow!("invalid buffer dimensions: {}x{}", width, height);
-        remove_headless_output(&output_name);
-        let _ = info_tx.send(Err(err));
-        return Ok(());
+        bail!("invalid buffer dimensions: {}x{}", width, height);
     }
 
     let shm_format = state.shm_format.unwrap_or(wl_shm::Format::Xrgb8888);
@@ -234,16 +316,17 @@ fn capture_thread(
         )
     };
     if mmap == libc::MAP_FAILED {
-        remove_headless_output(&output_name);
         bail!("mmap failed");
     }
 
     // Send capture info back — no scaling needed, headless output is at target resolution
-    let _ = info_tx.send(Ok(CaptureInfo {
-        width,
-        height,
-        output_name: output_name.clone(),
-    }));
+    if let Some(tx) = info_tx.take() {
+        let _ = tx.send(Ok(CaptureInfo {
+            width,
+            height,
+            output_name: output_name.clone(),
+        }));
+    }
 
     let pixel_format = match shm_format {
         wl_shm::Format::Argb8888 => PixelFormat::BgrA32,
@@ -259,27 +342,13 @@ fn capture_thread(
         "Starting capture loop on headless output"
     );
 
-    // Initialize H.264 encoder if EGFX is available (VAAPI hardware → OpenH264 software fallback)
-    let mut h264_encoder = if egfx_shared.is_some() {
-        match crate::egfx::FrameEncoder::new(width, height) {
-            Ok(enc) => {
-                tracing::info!(width, height, backend = enc.backend_name(), "H.264 encoder initialized");
-                Some(enc)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to initialize H.264 encoder, falling back to bitmap: {:#}", e);
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // EGFX state cached from shared (to avoid repeated mutex locking)
+    let mut h264_encoder: Option<crate::egfx::FrameEncoder> = None;
     let mut egfx_handle: Option<ironrdp_server::GfxServerHandle> = None;
-    let mut egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> = None;
+    let mut egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> =
+        None;
     let mut egfx_surface_id: Option<u16> = None;
     let mut egfx_active = false;
+    let mut egfx_ready = false;
 
     // Frame rate limiting
     let target_interval = std::time::Duration::from_millis(33); // ~30fps
@@ -327,41 +396,68 @@ fn capture_thread(
 
         // Try EGFX H.264 path
         let mut sent_via_egfx = false;
-        if let (Some(shared), Some(encoder)) = (&egfx_shared, &mut h264_encoder) {
-            // Phase 1: Cache handle/sender once EGFX becomes ready
-            if !egfx_active && shared.is_ready() {
+        if let Some(shared) = &egfx_shared {
+            let ready = shared.is_ready();
+            if ready != egfx_ready {
+                egfx_ready = ready;
+                egfx_active = false;
+                egfx_handle = None;
+                egfx_sender = None;
+                egfx_surface_id = None;
+                h264_encoder = None;
+
+                if ready {
+                    match crate::egfx::FrameEncoder::new(width, height) {
+                        Ok(enc) => {
+                            tracing::info!(
+                                width,
+                                height,
+                                backend = enc.backend_name(),
+                                "EGFX ready, initialized H.264 encoder"
+                            );
+                            h264_encoder = Some(enc);
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "Failed to initialize H.264 encoder, falling back to bitmap: {:#}",
+                                e
+                            );
+                        }
+                    }
+                } else {
+                    tracing::info!("EGFX channel unavailable, falling back to bitmap");
+                }
+            }
+
+            if ready && !egfx_active {
                 egfx_handle = shared.get_handle();
                 egfx_sender = shared.get_event_sender();
-                if egfx_handle.is_some() && egfx_sender.is_some() {
+                if h264_encoder.is_some() && egfx_handle.is_some() && egfx_sender.is_some() {
                     egfx_active = true;
-                    tracing::info!("EGFX ready, switching to H.264 encoding");
+                    tracing::info!("EGFX transport ready, switching to H.264 encoding");
                 }
             }
 
             if egfx_active {
-                if let (Some(handle), Some(sender)) = (&egfx_handle, &egfx_sender) {
-                    // Phase 2: Initialize surface (once, separate from frame sending)
+                if let (Some(handle), Some(sender), Some(encoder)) =
+                    (&egfx_handle, &egfx_sender, &mut h264_encoder)
+                {
                     if egfx_surface_id.is_none() {
-                        if let Some(sid) = EgfxShared::init_surface(
-                            handle,
-                            sender,
-                            width as u16,
-                            height as u16,
-                        ) {
+                        if let Some(sid) =
+                            EgfxShared::init_surface(handle, sender, width as u16, height as u16)
+                        {
                             egfx_surface_id = Some(sid);
                         }
                         // Don't send a frame on the same iteration as surface init.
                         // The setup PDUs need to reach the client first.
-                        // Next loop iteration will send the first frame (IDR).
-                    } else {
-                        // Phase 3: Send frames
-                        let sid = egfx_surface_id.unwrap();
+                    } else if let Some(sid) = egfx_surface_id {
                         match encoder.encode(data) {
                             Ok(h264_data) if h264_data.len() > 32 => {
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
-                                    .as_millis() as u32;
+                                    .as_millis()
+                                    as u32;
 
                                 sent_via_egfx = EgfxShared::send_frame(
                                     handle,
@@ -373,7 +469,7 @@ fn capture_thread(
                                     timestamp,
                                 );
                             }
-                            Ok(_) => {} // Tiny frame, skip
+                            Ok(_) => {}
                             Err(e) => {
                                 tracing::warn!("H.264 encode failed: {:#}", e);
                             }
@@ -383,8 +479,6 @@ fn capture_thread(
             }
         }
 
-        // Fallback to raw bitmap ONLY before EGFX is active.
-        // Once EGFX is active, never send 8MB raw bitmaps.
         if !sent_via_egfx && !egfx_active {
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0,
@@ -409,28 +503,11 @@ fn capture_thread(
         last_frame = std::time::Instant::now();
     }
 
-    // Cleanup
     unsafe {
         libc::munmap(mmap, buf_size);
     }
-    remove_headless_output(&output_name);
 
     Ok(())
-}
-
-fn create_shm_fd(size: usize) -> Result<OwnedFd> {
-    use std::ffi::CStr;
-    let name = CStr::from_bytes_with_nul(b"hypr-rdp-shm\0").unwrap();
-    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        bail!("memfd_create failed");
-    }
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    let ret = unsafe { libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) };
-    if ret < 0 {
-        bail!("ftruncate failed");
-    }
-    Ok(fd)
 }
 
 // --- Wayland state ---
@@ -442,7 +519,7 @@ struct AppState {
     shm: Option<wl_shm::WlShm>,
     target_output: Option<wl_output::WlOutput>,
     outputs: Vec<(u32, wl_output::WlOutput)>, // (name_id, output)
-    output_names: Vec<(u32, String)>,           // (wl_output id, name)
+    output_names: Vec<(u32, String)>,         // (wl_output id, name)
     capture_manager: Option<ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1>,
     source_manager:
         Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
@@ -507,12 +584,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                     state.outputs.push((name, output));
                 }
                 "ext_image_copy_capture_manager_v1" => {
-                    state.capture_manager =
-                        Some(registry.bind(name, version.min(1), qh, ()));
+                    state.capture_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "ext_output_image_capture_source_manager_v1" => {
-                    state.source_manager =
-                        Some(registry.bind(name, version.min(1), qh, ()));
+                    state.source_manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
@@ -567,17 +642,17 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
                 state.buffer_width = width;
                 state.buffer_height = height;
             }
-            ext_image_copy_capture_session_v1::Event::ShmFormat { format } => {
-                if let WEnum::Value(fmt) = format {
-                    tracing::debug!(?fmt, "SHM format");
-                    match fmt {
-                        wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {
+            ext_image_copy_capture_session_v1::Event::ShmFormat {
+                format: WEnum::Value(fmt),
+            } => {
+                tracing::debug!(?fmt, "SHM format");
+                match fmt {
+                    wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888 => {
+                        state.shm_format = Some(fmt);
+                    }
+                    _ => {
+                        if state.shm_format.is_none() {
                             state.shm_format = Some(fmt);
-                        }
-                        _ => {
-                            if state.shm_format.is_none() {
-                                state.shm_format = Some(fmt);
-                            }
                         }
                     }
                 }
@@ -614,7 +689,10 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
                 state.frame_failed = true;
             }
             ext_image_copy_capture_frame_v1::Event::Damage {
-                x, y, width, height,
+                x,
+                y,
+                width,
+                height,
             } => {
                 state.damage_regions.push((x, y, width, height));
             }
@@ -633,8 +711,58 @@ delegate_noop!(AppState: ignore ext_output_image_capture_source_manager_v1::ExtO
 delegate_noop!(AppState: ignore ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1);
 
 impl Dispatch<wayland_client::protocol::wl_display::WlDisplay, ()> for AppState {
-    fn event(_: &mut Self, _: &wayland_client::protocol::wl_display::WlDisplay, _: wayland_client::protocol::wl_display::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wayland_client::protocol::wl_display::WlDisplay,
+        _: wayland_client::protocol::wl_display::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
 }
 impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for AppState {
-    fn event(_: &mut Self, _: &wayland_client::protocol::wl_callback::WlCallback, _: wayland_client::protocol::wl_callback::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    fn event(
+        _: &mut Self,
+        _: &wayland_client::protocol::wl_callback::WlCallback,
+        _: wayland_client::protocol::wl_callback::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_headless_outputs;
+
+    #[test]
+    fn parses_headless_output_names() {
+        let json = br#"
+            [
+                {"name":"DP-1"},
+                {"name":"HEADLESS-2"},
+                {"name":"HEADLESS-3"}
+            ]
+        "#;
+
+        let names = parse_headless_outputs(json).unwrap();
+
+        assert_eq!(names, vec!["HEADLESS-2", "HEADLESS-3"]);
+    }
+
+    #[test]
+    fn ignores_non_headless_outputs() {
+        let json = br#"
+            [
+                {"name":"DP-1"},
+                {"name":"HDMI-A-1"}
+            ]
+        "#;
+
+        let names = parse_headless_outputs(json).unwrap();
+
+        assert!(names.is_empty());
+    }
 }

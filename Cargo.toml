@@ -11,12 +11,12 @@ vaapi = ["dep:cros-libva"]
 [dependencies]
 # VA-API hardware encoding (Intel/AMD)
 cros-libva = { version = "0.0.13", optional = true }
-# RDP server (lamco fork with EGFX/H.264 support)
-ironrdp-server = { git = "https://github.com/glamberson/IronRDP", branch = "feat/combined-auth-patches", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/glamberson/IronRDP", branch = "feat/combined-auth-patches" }
-ironrdp-egfx = { git = "https://github.com/glamberson/IronRDP", branch = "feat/combined-auth-patches" }
-ironrdp-dvc = { git = "https://github.com/glamberson/IronRDP", branch = "feat/combined-auth-patches" }
-ironrdp-svc = { git = "https://github.com/glamberson/IronRDP", branch = "feat/combined-auth-patches" }
+# RDP server (official upstream with EGFX/H.264 support)
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "9a1ac3092ee3eac3e81823349d8e027065f5b8f8", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git", rev = "9a1ac3092ee3eac3e81823349d8e027065f5b8f8" }
+ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP.git", rev = "9a1ac3092ee3eac3e81823349d8e027065f5b8f8" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "9a1ac3092ee3eac3e81823349d8e027065f5b8f8" }
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "9a1ac3092ee3eac3e81823349d8e027065f5b8f8" }
 
 # H.264 encoding (OpenH264 software encoder)
 openh264 = { version = "0.9", features = ["libloading"] }
