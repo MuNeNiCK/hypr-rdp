@@ -1,12 +1,14 @@
 mod keymap;
 mod virtual_keyboard;
 
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Read;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
+use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::{wl_keyboard, wl_registry, wl_seat};
@@ -15,8 +17,15 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_manager_v1::ZwlrVirtualPointerManagerV1,
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
+use xkbcommon::xkb;
 
 use self::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1};
+
+const XKB_KEYCODE_OFFSET: u32 = 8;
+const KEY_CAPSLOCK: u32 = 58;
+const KEY_NUMLOCK: u32 = 69;
+const KEY_SCROLLLOCK: u32 = 70;
+const KEY_KATAKANAHIRAGANA: u32 = 93;
 
 #[derive(Clone, Debug)]
 struct OutputLayoutSnapshot {
@@ -71,6 +80,7 @@ struct InputState {
     wl_state: WlState,
     vk: ZwpVirtualKeyboardV1,
     vp: ZwlrVirtualPointerV1,
+    keyboard_state: KeyboardStateTracker,
     output_layout: Arc<SharedOutputLayout>,
 }
 
@@ -84,6 +94,89 @@ impl InputState {
         let _ = self.event_queue.dispatch_pending(&mut self.wl_state);
         if let Err(e) = self.conn.flush() {
             tracing::error!("Wayland flush failed: {}", e);
+        }
+    }
+}
+
+struct KeyboardStateTracker {
+    modifier_masks_by_key: HashMap<u32, u32>,
+    pressed_keys: HashSet<u32>,
+    depressed_mods: u32,
+    locked_mods: u32,
+    caps_lock_mask: u32,
+    num_lock_mask: u32,
+    scroll_lock_mask: u32,
+    kana_lock_mask: u32,
+}
+
+impl KeyboardStateTracker {
+    fn new(keymap_data: &[u8]) -> Result<Self> {
+        let keymap = compile_xkb_keymap(keymap_data)?;
+
+        Ok(Self {
+            modifier_masks_by_key: build_modifier_masks_by_key(&keymap),
+            pressed_keys: HashSet::new(),
+            depressed_mods: 0,
+            locked_mods: 0,
+            caps_lock_mask: locked_mask_for_key(&keymap, KEY_CAPSLOCK),
+            num_lock_mask: locked_mask_for_key(&keymap, KEY_NUMLOCK),
+            scroll_lock_mask: locked_mask_for_key(&keymap, KEY_SCROLLLOCK),
+            kana_lock_mask: locked_mask_for_key(&keymap, KEY_KATAKANAHIRAGANA),
+        })
+    }
+
+    fn key(&mut self, evdev_key: u32, pressed: bool) {
+        if pressed {
+            self.pressed_keys.insert(evdev_key);
+            let lock_mask = self.lock_mask_for_key(evdev_key);
+            if lock_mask != 0 {
+                self.locked_mods ^= lock_mask;
+            }
+        } else {
+            self.pressed_keys.remove(&evdev_key);
+        }
+
+        self.depressed_mods = self
+            .pressed_keys
+            .iter()
+            .filter_map(|key| self.modifier_masks_by_key.get(key))
+            .fold(0, |mods, mask| mods | *mask);
+    }
+
+    fn synchronize_locks(&mut self, flags: SynchronizeFlags) {
+        self.locked_mods = self.locked_mods_from_flags(flags);
+    }
+
+    fn send_modifiers(&self, vk: &ZwpVirtualKeyboardV1) {
+        vk.modifiers(self.depressed_mods, 0, self.locked_mods, 0);
+    }
+
+    fn locked_mods_from_flags(&self, flags: SynchronizeFlags) -> u32 {
+        let mut locked_mods = 0;
+
+        if flags.contains(SynchronizeFlags::CAPS_LOCK) {
+            locked_mods |= self.caps_lock_mask;
+        }
+        if flags.contains(SynchronizeFlags::NUM_LOCK) {
+            locked_mods |= self.num_lock_mask;
+        }
+        if flags.contains(SynchronizeFlags::SCROLL_LOCK) {
+            locked_mods |= self.scroll_lock_mask;
+        }
+        if flags.contains(SynchronizeFlags::KANA_LOCK) {
+            locked_mods |= self.kana_lock_mask;
+        }
+
+        locked_mods
+    }
+
+    fn lock_mask_for_key(&self, evdev_key: u32) -> u32 {
+        match evdev_key {
+            KEY_CAPSLOCK => self.caps_lock_mask,
+            KEY_NUMLOCK => self.num_lock_mask,
+            KEY_SCROLLLOCK => self.scroll_lock_mask,
+            KEY_KATAKANAHIRAGANA => self.kana_lock_mask,
+            _ => 0,
         }
     }
 }
@@ -140,8 +233,10 @@ impl HyprInputHandler {
                 );
                 generate_xkb_keymap().map(|data| (data, "fallback"))
             })?;
+        let keyboard_state = KeyboardStateTracker::new(&keymap_data)?;
         let keymap_fd = create_keymap_fd(&keymap_data)?;
         vk.keymap(1, keymap_fd.as_fd(), keymap_data.len() as u32); // 1 = XKB_V1
+        keyboard_state.send_modifiers(&vk);
 
         // Flush to send all pending requests
         conn.flush()
@@ -164,6 +259,7 @@ impl HyprInputHandler {
             wl_state,
             vk,
             vp,
+            keyboard_state,
             output_layout,
         }));
 
@@ -278,6 +374,8 @@ impl RdpServerInputHandler for HyprInputHandler {
             KeyboardEvent::Pressed { code, extended } => {
                 if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
                     state.vk.key(time, evdev_key, 1); // 1 = pressed
+                    state.keyboard_state.key(evdev_key, true);
+                    state.keyboard_state.send_modifiers(&state.vk);
                     state.flush();
                 } else {
                     tracing::warn!(code, extended, "No evdev mapping for scancode");
@@ -286,8 +384,15 @@ impl RdpServerInputHandler for HyprInputHandler {
             KeyboardEvent::Released { code, extended } => {
                 if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
                     state.vk.key(time, evdev_key, 0); // 0 = released
+                    state.keyboard_state.key(evdev_key, false);
+                    state.keyboard_state.send_modifiers(&state.vk);
                     state.flush();
                 }
+            }
+            KeyboardEvent::Synchronize(flags) => {
+                state.keyboard_state.synchronize_locks(flags);
+                state.keyboard_state.send_modifiers(&state.vk);
+                state.flush();
             }
             _ => {}
         }
@@ -426,9 +531,48 @@ fn timestamp_ms() -> u32 {
         .as_millis() as u32
 }
 
+fn compile_xkb_keymap(keymap_data: &[u8]) -> Result<xkb::Keymap> {
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let keymap_text =
+        String::from_utf8(keymap_data.to_vec()).context("Wayland keymap is not valid UTF-8")?;
+    xkb::Keymap::new_from_string(
+        &context,
+        keymap_text,
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .context("failed to compile XKB keymap from Wayland keymap data")
+}
+
+fn build_modifier_masks_by_key(keymap: &xkb::Keymap) -> HashMap<u32, u32> {
+    let mut masks = HashMap::new();
+
+    for evdev_key in [29, 42, 54, 56, 97, 100, 125, 126] {
+        let mask = depressed_mask_for_key(keymap, evdev_key);
+        if mask != 0 {
+            masks.insert(evdev_key, mask);
+        }
+    }
+
+    masks
+}
+
+fn depressed_mask_for_key(keymap: &xkb::Keymap, evdev_key: u32) -> u32 {
+    let mut state = xkb::State::new(keymap);
+    let keycode = xkb::Keycode::new(evdev_key + XKB_KEYCODE_OFFSET);
+    state.update_key(keycode, xkb::KeyDirection::Down);
+    state.serialize_mods(xkb::STATE_MODS_DEPRESSED)
+}
+
+fn locked_mask_for_key(keymap: &xkb::Keymap, evdev_key: u32) -> u32 {
+    let mut state = xkb::State::new(keymap);
+    let keycode = xkb::Keycode::new(evdev_key + XKB_KEYCODE_OFFSET);
+    state.update_key(keycode, xkb::KeyDirection::Down);
+    state.serialize_mods(xkb::STATE_MODS_LOCKED)
+}
+
 /// Generate XKB keymap using xkbcommon (matching compositor's format)
 fn generate_xkb_keymap() -> Result<Vec<u8>> {
-    use xkbcommon::xkb;
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = xkb::Keymap::new_from_names(
         &context,

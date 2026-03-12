@@ -211,6 +211,12 @@ fn capture_thread_inner(
 ) -> Result<()> {
     let (target_w, target_h) = target_resolution;
 
+    // Clean up stale headless outputs from previous crashed sessions
+    for stale in list_headless_outputs().unwrap_or_default() {
+        tracing::warn!(name = %stale, "Removing stale headless output from previous session");
+        remove_headless_output(&stale);
+    }
+
     let output_name = create_headless_output(target_w, target_h)?;
     let _output_guard = HeadlessOutputGuard::new(output_name.clone());
 
@@ -263,10 +269,12 @@ fn capture_thread_inner(
     // Create capture source from the headless output
     let source = source_mgr.create_source(&output, &qh, ());
 
-    // Create capture session (with cursors painted)
+    // Create capture session (without cursor painting to avoid Hyprland SEGV in
+    // CExtImageCopyCaptureFrameV1::sendPresentationTime when cursor changes between
+    // frame.destroy() and next create_frame())
     let session = capture_mgr.create_session(
         &source,
-        ext_image_copy_capture_manager_v1::Options::PaintCursors,
+        ext_image_copy_capture_manager_v1::Options::empty(),
         &qh,
         (),
     );
@@ -349,6 +357,7 @@ fn capture_thread_inner(
     let mut egfx_surface_id: Option<u16> = None;
     let mut egfx_active = false;
     let mut egfx_ready = false;
+    let mut egfx_generation: u32 = 0;
 
     // Frame rate limiting
     let target_interval = std::time::Duration::from_millis(33); // ~30fps
@@ -398,34 +407,43 @@ fn capture_thread_inner(
         let mut sent_via_egfx = false;
         if let Some(shared) = &egfx_shared {
             let ready = shared.is_ready();
+            let gen = shared.generation();
+
+            // Detect EGFX becoming available or unavailable
             if ready != egfx_ready {
                 egfx_ready = ready;
-                egfx_active = false;
-                egfx_handle = None;
-                egfx_sender = None;
+                if !ready {
+                    egfx_active = false;
+                    egfx_handle = None;
+                    egfx_sender = None;
+                    egfx_surface_id = None;
+                    h264_encoder = None;
+                    tracing::info!("EGFX channel unavailable, falling back to bitmap");
+                }
+            }
+
+            // Detect re-negotiation (on_ready fired again) — invalidate surface and encoder
+            if gen != egfx_generation {
+                egfx_generation = gen;
                 egfx_surface_id = None;
                 h264_encoder = None;
-
                 if ready {
                     match crate::egfx::FrameEncoder::new(width, height) {
                         Ok(enc) => {
                             tracing::info!(
-                                width,
-                                height,
+                                width, height,
                                 backend = enc.backend_name(),
-                                "EGFX ready, initialized H.264 encoder"
+                                gen,
+                                "H.264 encoder initialized"
                             );
                             h264_encoder = Some(enc);
                         }
                         Err(e) => {
                             tracing::warn!(
-                                "Failed to initialize H.264 encoder, falling back to bitmap: {:#}",
-                                e
+                                "Failed to initialize H.264 encoder: {:#}", e
                             );
                         }
                     }
-                } else {
-                    tracing::info!("EGFX channel unavailable, falling back to bitmap");
                 }
             }
 
@@ -449,10 +467,11 @@ fn capture_thread_inner(
                             egfx_surface_id = Some(sid);
                         }
                         // Don't send a frame on the same iteration as surface init.
-                        // The setup PDUs need to reach the client first.
+                        // Setup PDUs must reach the client first; batching causes mstsc to reject.
                     } else if let Some(sid) = egfx_surface_id {
                         match encoder.encode(data) {
-                            Ok(h264_data) if h264_data.len() > 32 => {
+                            Ok(ref h264_data) if h264_data.len() > 32 => {
+                                tracing::debug!(sid, h264_len = h264_data.len(), "Encoding frame for surface");
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -469,7 +488,9 @@ fn capture_thread_inner(
                                     timestamp,
                                 );
                             }
-                            Ok(_) => {}
+                            Ok(ref h264_data) => {
+                                tracing::debug!(sid, h264_len = h264_data.len(), "Encoded frame too small, skipping");
+                            }
                             Err(e) => {
                                 tracing::warn!("H.264 encode failed: {:#}", e);
                             }

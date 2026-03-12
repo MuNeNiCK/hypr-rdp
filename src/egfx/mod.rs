@@ -2,7 +2,7 @@ pub mod encoder;
 #[cfg(feature = "vaapi")]
 pub mod vaapi;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -107,7 +107,6 @@ pub fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
 
 use ironrdp_egfx::pdu::Avc420Region;
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
-use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
     ServerEventSender,
@@ -120,8 +119,8 @@ pub struct EgfxShared {
     handle: Mutex<Option<GfxServerHandle>>,
     /// Whether EGFX capability negotiation is complete
     ready: AtomicBool,
-    /// Whether the EGFX surface has been created and setup PDUs sent
-    surface_initialized: AtomicBool,
+    /// Incremented each time on_ready fires; lets capture thread detect re-negotiation
+    ready_generation: AtomicU32,
     /// Event sender for routing encoded frames to the RDP wire
     event_sender: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
 }
@@ -131,13 +130,17 @@ impl EgfxShared {
         Self {
             handle: Mutex::new(None),
             ready: AtomicBool::new(false),
-            surface_initialized: AtomicBool::new(false),
+            ready_generation: AtomicU32::new(0),
             event_sender: Mutex::new(None),
         }
     }
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    pub fn generation(&self) -> u32 {
+        self.ready_generation.load(Ordering::Acquire)
     }
 
     pub fn get_handle(&self) -> Option<GfxServerHandle> {
@@ -171,17 +174,11 @@ impl EgfxShared {
             }
         };
 
-        server.resize_with_monitors(
-            width,
-            height,
-            vec![Monitor {
-                left: 0,
-                top: 0,
-                right: (width as i32) - 1,
-                bottom: (height as i32) - 1,
-                flags: MonitorFlags::PRIMARY,
-            }],
-        );
+        // Set desktop dimensions; create_surface will auto-send ResetGraphics
+        // (without monitor layout) on first call. Using resize_with_monitors
+        // sends ResetGraphics WITH monitors, which causes Windows clients to
+        // re-negotiate capabilities and invalidate the surface.
+        server.set_output_dimensions(width, height);
 
         let sid = server.create_surface(width, height)?;
         server.map_surface_to_output(sid, 0, 0);
@@ -227,20 +224,31 @@ impl EgfxShared {
         let (frame_id, dvc_messages, channel_id) = {
             let mut server = handle.lock().unwrap();
 
-            if !server.is_ready() || server.should_backpressure() {
+            if !server.is_ready() {
+                tracing::debug!("send_frame: server not ready");
+                return false;
+            }
+            if server.should_backpressure() {
+                tracing::debug!("send_frame: backpressure");
                 return false;
             }
 
             let channel_id = match server.channel_id() {
                 Some(id) => id,
-                None => return false,
+                None => {
+                    tracing::debug!("send_frame: no channel_id");
+                    return false;
+                }
             };
 
             let regions = [Avc420Region::full_frame(width, height, 22)];
             let frame_id =
                 match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
                     Some(id) => id,
-                    None => return false,
+                    None => {
+                        tracing::debug!("send_frame: send_avc420_frame returned None");
+                        return false;
+                    }
                 };
 
             let dvc_messages = server.drain_output();
@@ -259,6 +267,7 @@ impl EgfxShared {
             ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
         ) {
             Ok(svc_messages) => {
+                tracing::debug!(frame_id, surface_id, msgs = svc_messages.len(), "EGFX frame sent");
                 let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
                     messages: svc_messages,
                 }));
@@ -330,11 +339,13 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
     }
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
-        tracing::info!(?cap, "EGFX: channel ready");
-        // Reset surface state for new/reconnecting client
-        self.shared
-            .surface_initialized
-            .store(false, Ordering::Release);
+        let was_ready = self.shared.ready.load(Ordering::Acquire);
+        if was_ready {
+            tracing::info!(?cap, "EGFX: client re-negotiated (keeping surface)");
+        } else {
+            tracing::info!(?cap, "EGFX: channel ready (first time)");
+            self.shared.ready_generation.fetch_add(1, Ordering::Release);
+        }
         self.shared.ready.store(true, Ordering::Release);
     }
 
@@ -345,8 +356,5 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
     fn on_close(&mut self) {
         tracing::info!("EGFX: channel closed");
         self.shared.ready.store(false, Ordering::Release);
-        self.shared
-            .surface_initialized
-            .store(false, Ordering::Release);
     }
 }

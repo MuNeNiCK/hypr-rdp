@@ -152,8 +152,10 @@ impl VaapiEncoder {
             coded_buffers.push(buf);
         }
 
-        let y_size = (width * height) as usize;
-        let uv_size = (width as usize / 2) * (height as usize / 2) * 2;
+        // Align to 16 for macroblock padding — extra rows filled with black
+        let aligned_height = height.div_ceil(16) * 16;
+        let y_size = (width * aligned_height) as usize;
+        let uv_size = (width as usize / 2) * (aligned_height as usize / 2) * 2;
 
         tracing::info!(
             profile = ?h264_profile,
@@ -177,7 +179,11 @@ impl VaapiEncoder {
             frame_count: 0,
             force_idr: true,
             nv12_format,
-            nv12_buf: vec![0u8; y_size + uv_size],
+            nv12_buf: {
+                let mut buf = vec![16u8; y_size + uv_size]; // Y=16 (black in limited range)
+                buf[y_size..].fill(128); // U=128, V=128 (neutral chroma)
+                buf
+            },
         })
     }
 
@@ -298,9 +304,19 @@ impl VaapiEncoder {
             data.extend_from_slice(segment.buf);
         }
 
-        // SPS/PPS: cache from IDR, prepend to P-frames
+        // SPS/PPS handling: extract from IDR output or generate if missing
         if is_idr {
             if let Some(sps_pps) = super::extract_sps_pps(&data) {
+                self.cached_sps_pps = Some(sps_pps);
+            } else {
+                // VA-API driver didn't include SPS/PPS — generate manually
+                tracing::warn!("VA-API IDR missing SPS/PPS, generating manually");
+                let sps_pps = self.generate_sps_pps();
+                // Prepend to IDR frame
+                let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
+                combined.extend_from_slice(&sps_pps);
+                combined.extend_from_slice(&data);
+                data = combined;
                 self.cached_sps_pps = Some(sps_pps);
             }
         } else if let Some(ref sps_pps) = self.cached_sps_pps {
@@ -319,12 +335,14 @@ impl VaapiEncoder {
     }
 
     /// Convert BGRA to NV12 (BT.601 limited range, integer math).
+    /// Buffer is sized for 16-aligned height; extra rows stay black.
     fn bgra_to_nv12(&mut self, bgra: &[u8]) {
         let w = self.width as usize;
         let h = self.height as usize;
-        let y_size = w * h;
+        let aligned_h = (self.height.div_ceil(16) * 16) as usize;
+        let y_size = w * aligned_h;
 
-        // Y plane (full resolution)
+        // Y plane (full resolution, only actual height)
         for row in 0..h {
             for col in 0..w {
                 let idx = (row * w + col) * 4;
@@ -336,7 +354,7 @@ impl VaapiEncoder {
             }
         }
 
-        // UV plane (half resolution, interleaved U-V pairs)
+        // UV plane (half resolution, interleaved U-V pairs, only actual height)
         let half_w = w / 2;
         for row in 0..(h / 2) {
             for col in 0..half_w {
@@ -616,5 +634,206 @@ impl VaapiEncoder {
         )));
 
         buffers
+    }
+
+    /// Generate SPS and PPS NAL units matching our encoder configuration.
+    /// Used when the VA-API driver doesn't include them in the coded output.
+    fn generate_sps_pps(&self) -> Vec<u8> {
+        let mb_width = self.width.div_ceil(16);
+        let mb_height = self.height.div_ceil(16);
+        let coded_height = mb_height * 16;
+        let need_crop = coded_height != self.height;
+        let crop_bottom = if need_crop {
+            (coded_height - self.height) / 2 // CropUnitY=2 for frame_mbs_only + 4:2:0
+        } else {
+            0
+        };
+
+        let mut buf = Vec::with_capacity(64);
+
+        // === SPS (NAL type 7) ===
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+        let mut bs = BitWriter::new();
+        // NAL header: forbidden=0, nal_ref_idc=3, nal_unit_type=7
+        bs.write_bits(0, 1); // forbidden_zero_bit
+        bs.write_bits(3, 2); // nal_ref_idc
+        bs.write_bits(7, 5); // nal_unit_type = SPS
+
+        // profile_idc = 100 (High)
+        bs.write_bits(100, 8);
+        // constraint_set0..5_flags + reserved_zero_2bits
+        bs.write_bits(0, 8);
+        // level_idc
+        bs.write_bits(self.get_h264_level() as u32, 8);
+        // seq_parameter_set_id = 0
+        bs.write_ue(0);
+
+        // High profile extensions
+        bs.write_ue(1); // chroma_format_idc = 1 (4:2:0)
+        bs.write_ue(0); // bit_depth_luma_minus8
+        bs.write_ue(0); // bit_depth_chroma_minus8
+        bs.write_bits(0, 1); // qpprime_y_zero_transform_bypass_flag
+        bs.write_bits(0, 1); // seq_scaling_matrix_present_flag
+
+        bs.write_ue(4); // log2_max_frame_num_minus4
+        bs.write_ue(0); // pic_order_cnt_type
+        bs.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        bs.write_ue(1); // max_num_ref_frames
+        bs.write_bits(0, 1); // gaps_in_frame_num_value_allowed_flag
+        bs.write_ue(mb_width - 1); // pic_width_in_mbs_minus1
+        bs.write_ue(mb_height - 1); // pic_height_in_map_units_minus1
+        bs.write_bits(1, 1); // frame_mbs_only_flag
+        // (no mb_adaptive_frame_field_flag since frame_mbs_only=1)
+        bs.write_bits(1, 1); // direct_8x8_inference_flag
+
+        if need_crop {
+            bs.write_bits(1, 1); // frame_cropping_flag
+            bs.write_ue(0); // frame_crop_left_offset
+            bs.write_ue(0); // frame_crop_right_offset
+            bs.write_ue(0); // frame_crop_top_offset
+            bs.write_ue(crop_bottom); // frame_crop_bottom_offset
+        } else {
+            bs.write_bits(0, 1); // frame_cropping_flag
+        }
+
+        // VUI parameters
+        bs.write_bits(1, 1); // vui_parameters_present_flag
+        bs.write_bits(0, 1); // aspect_ratio_info_present_flag
+        bs.write_bits(0, 1); // overscan_info_present_flag
+        bs.write_bits(0, 1); // video_signal_type_present_flag
+        bs.write_bits(0, 1); // chroma_loc_info_present_flag
+        bs.write_bits(1, 1); // timing_info_present_flag
+        bs.write_bits(1, 32); // num_units_in_tick
+        bs.write_bits(60, 32); // time_scale (2 * fps for progressive)
+        bs.write_bits(0, 1); // fixed_frame_rate_flag
+        bs.write_bits(0, 1); // nal_hrd_parameters_present_flag
+        bs.write_bits(0, 1); // vcl_hrd_parameters_present_flag
+        bs.write_bits(0, 1); // pic_struct_present_flag
+        bs.write_bits(0, 1); // bitstream_restriction_flag
+
+        bs.write_rbsp_trailing_bits();
+        buf.extend_from_slice(&bs.finish_with_emulation_prevention());
+
+        // === PPS (NAL type 8) ===
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+        let mut bs = BitWriter::new();
+        // NAL header
+        bs.write_bits(0, 1); // forbidden_zero_bit
+        bs.write_bits(3, 2); // nal_ref_idc
+        bs.write_bits(8, 5); // nal_unit_type = PPS
+
+        bs.write_ue(0); // pic_parameter_set_id
+        bs.write_ue(0); // seq_parameter_set_id
+        bs.write_bits(1, 1); // entropy_coding_mode_flag (CABAC)
+        bs.write_bits(0, 1); // bottom_field_pic_order_in_frame_present_flag
+        bs.write_ue(0); // num_slice_groups_minus1
+        bs.write_ue(0); // num_ref_idx_l0_default_active_minus1
+        bs.write_ue(0); // num_ref_idx_l1_default_active_minus1
+        bs.write_bits(0, 1); // weighted_pred_flag
+        bs.write_bits(0, 2); // weighted_bipred_idc
+        bs.write_se(-3); // pic_init_qp_minus26 (23 - 26 = -3)
+        bs.write_se(0); // pic_init_qs_minus26
+        bs.write_se(0); // chroma_qp_index_offset
+        bs.write_bits(1, 1); // deblocking_filter_control_present_flag
+        bs.write_bits(0, 1); // constrained_intra_pred_flag
+        bs.write_bits(0, 1); // redundant_pic_cnt_present_flag
+
+        // High profile PPS extension
+        bs.write_bits(1, 1); // transform_8x8_mode_flag
+        bs.write_bits(0, 1); // pic_scaling_matrix_present_flag
+        bs.write_se(0); // second_chroma_qp_index_offset
+
+        bs.write_rbsp_trailing_bits();
+        buf.extend_from_slice(&bs.finish_with_emulation_prevention());
+
+        buf
+    }
+}
+
+/// Bitstream writer for H.264 NAL unit construction.
+struct BitWriter {
+    data: Vec<u8>,
+    current_byte: u8,
+    bits_in_byte: u8,
+}
+
+impl BitWriter {
+    fn new() -> Self {
+        Self {
+            data: Vec::with_capacity(32),
+            current_byte: 0,
+            bits_in_byte: 0,
+        }
+    }
+
+    fn write_bits(&mut self, value: u32, num_bits: u8) {
+        for i in (0..num_bits).rev() {
+            let bit = (value >> i) & 1;
+            self.current_byte = (self.current_byte << 1) | bit as u8;
+            self.bits_in_byte += 1;
+            if self.bits_in_byte == 8 {
+                self.data.push(self.current_byte);
+                self.current_byte = 0;
+                self.bits_in_byte = 0;
+            }
+        }
+    }
+
+    /// Exp-Golomb unsigned encoding
+    fn write_ue(&mut self, value: u32) {
+        let value = value + 1;
+        let bits = 32 - value.leading_zeros(); // number of significant bits
+        // Write (bits-1) leading zeros, then the value in `bits` bits
+        for _ in 0..(bits - 1) {
+            self.write_bits(0, 1);
+        }
+        self.write_bits(value, bits as u8);
+    }
+
+    /// Exp-Golomb signed encoding
+    fn write_se(&mut self, value: i32) {
+        let mapped = if value > 0 {
+            (value * 2 - 1) as u32
+        } else if value < 0 {
+            (-value * 2) as u32
+        } else {
+            0
+        };
+        self.write_ue(mapped);
+    }
+
+    fn write_rbsp_trailing_bits(&mut self) {
+        self.write_bits(1, 1); // rbsp_stop_one_bit
+        // Pad to byte boundary with zeros
+        if self.bits_in_byte > 0 {
+            let padding = 8 - self.bits_in_byte;
+            self.write_bits(0, padding);
+        }
+    }
+
+    /// Flush remaining bits and apply emulation prevention (0x03 stuffing).
+    fn finish_with_emulation_prevention(mut self) -> Vec<u8> {
+        // Flush partial byte
+        if self.bits_in_byte > 0 {
+            self.current_byte <<= 8 - self.bits_in_byte;
+            self.data.push(self.current_byte);
+        }
+
+        // Insert emulation prevention bytes: 00 00 {00,01,02,03} → 00 00 03 {00,01,02,03}
+        let mut result = Vec::with_capacity(self.data.len() + 4);
+        let mut zero_count = 0u32;
+        for &byte in &self.data {
+            if zero_count >= 2 && byte <= 0x03 {
+                result.push(0x03); // emulation prevention byte
+                zero_count = 0;
+            }
+            result.push(byte);
+            if byte == 0x00 {
+                zero_count += 1;
+            } else {
+                zero_count = 0;
+            }
+        }
+        result
     }
 }
