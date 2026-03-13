@@ -66,23 +66,19 @@ fn list_headless_outputs() -> Result<Vec<String>> {
 /// Create a headless output in Hyprland at the given resolution.
 /// Returns the output name (e.g. "HEADLESS-1").
 fn create_headless_output(width: u32, height: u32) -> Result<String> {
-    let existing = list_headless_outputs()?.into_iter().collect::<std::collections::BTreeSet<_>>();
+    // Subscribe to events BEFORE creating the output to catch monitoradded.
+    // The ensure_registered() roundtrip guarantees Hyprland has accept()'ed
+    // our socket2 connection before we trigger the creation.
+    let mut events = crate::hyprland::EventStream::connect()?;
+    events.ensure_registered()?;
 
     crate::hyprland::output_create_headless()
         .context("failed to create headless output")?;
 
-    let mut created = list_headless_outputs()?
-        .into_iter()
-        .filter(|name| !existing.contains(name));
-    let name = match (created.next(), created.next()) {
-        (Some(name), None) => name,
-        (None, _) => bail!("no new HEADLESS output found after creation"),
-        (Some(first), Some(second)) => bail!(
-            "multiple new HEADLESS outputs found after creation: {}, {}",
-            first,
-            second
-        ),
-    };
+    // Wait for monitoradded event — data is the output name
+    let name = events
+        .wait_for("monitoradded", Duration::from_secs(5))
+        .context("failed to detect new headless output")?;
 
     // Set resolution
     let mode = format!("{}x{}@60", width, height);

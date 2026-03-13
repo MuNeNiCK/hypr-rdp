@@ -4,7 +4,7 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
@@ -13,6 +13,13 @@ fn socket_path() -> Result<String> {
         std::env::var("HYPRLAND_INSTANCE_SIGNATURE").context("HYPRLAND_INSTANCE_SIGNATURE not set")?;
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?;
     Ok(format!("{}/hypr/{}/.socket.sock", runtime_dir, sig))
+}
+
+fn socket2_path() -> Result<String> {
+    let sig =
+        std::env::var("HYPRLAND_INSTANCE_SIGNATURE").context("HYPRLAND_INSTANCE_SIGNATURE not set")?;
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?;
+    Ok(format!("{}/hypr/{}/.socket2.sock", runtime_dir, sig))
 }
 
 /// Send a raw command to Hyprland IPC socket and return the response.
@@ -59,3 +66,75 @@ pub fn output_remove(name: &str) -> Result<()> {
     send_action(&format!("output remove {}", name))
 }
 
+/// Event stream from Hyprland socket2 (subscription-based).
+///
+/// Connect before triggering the action to avoid missing events.
+/// After connecting, call `ensure_registered()` to guarantee Hyprland
+/// has accepted the connection before emitting events.
+pub struct EventStream {
+    sock: UnixStream,
+    buf: String,
+}
+
+impl EventStream {
+    pub fn connect() -> Result<Self> {
+        let path = socket2_path()?;
+        let sock = UnixStream::connect(&path)
+            .with_context(|| format!("failed to connect to Hyprland event socket: {}", path))?;
+        sock.set_read_timeout(Some(Duration::from_millis(500)))?;
+        Ok(Self {
+            sock,
+            buf: String::new(),
+        })
+    }
+
+    /// Force a socket1 roundtrip so Hyprland's event loop processes our
+    /// socket2 accept() before we trigger any actions.
+    pub fn ensure_registered(&self) -> Result<()> {
+        let _ = monitors()?;
+        Ok(())
+    }
+
+    /// Wait for an event matching `event_name` (e.g. "monitoradded").
+    /// Returns the event data (text after ">>").
+    pub fn wait_for(&mut self, event_name: &str, timeout: Duration) -> Result<String> {
+        let start = Instant::now();
+        let mut raw = [0u8; 4096];
+
+        loop {
+            if start.elapsed() >= timeout {
+                bail!(
+                    "timed out waiting for '{}' event after {}ms",
+                    event_name,
+                    timeout.as_millis()
+                );
+            }
+
+            // Check buffered lines first
+            while let Some(newline_pos) = self.buf.find('\n') {
+                let line = self.buf[..newline_pos].trim().to_string();
+                self.buf = self.buf[newline_pos + 1..].to_string();
+                if let Some((event, data)) = line.split_once(">>") {
+                    if event == event_name {
+                        return Ok(data.to_string());
+                    }
+                }
+            }
+
+            // Read more data from socket
+            match self.sock.read(&mut raw) {
+                Ok(0) => bail!("Hyprland event socket closed"),
+                Ok(n) => {
+                    self.buf.push_str(&String::from_utf8_lossy(&raw[..n]));
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e).context("failed to read Hyprland event"),
+            }
+        }
+    }
+}
