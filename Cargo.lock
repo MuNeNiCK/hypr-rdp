@@ -1404,6 +1404,7 @@ dependencies = [
  "cros-libva",
  "ironrdp-cliprdr",
  "ironrdp-core",
+ "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-egfx",
  "ironrdp-pdu",

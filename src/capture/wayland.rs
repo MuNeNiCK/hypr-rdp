@@ -220,6 +220,7 @@ pub async fn start_capture(
     quality: u8,
     fps: u32,
     output: Option<String>,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<CaptureInfo> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
 
@@ -237,6 +238,7 @@ pub async fn start_capture(
                 quality,
                 fps,
                 output,
+                deferred_resize,
             ) {
                 tracing::error!("Capture thread error: {:#}", e);
             }
@@ -257,6 +259,7 @@ fn capture_thread(
     quality: u8,
     fps: u32,
     output: Option<String>,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<()> {
     let mut info_tx = Some(info_tx);
     let result = capture_thread_inner(
@@ -270,6 +273,7 @@ fn capture_thread(
         quality,
         fps,
         output,
+        deferred_resize,
     );
     if let Err(err) = result {
         if let Some(tx) = info_tx.take() {
@@ -305,6 +309,7 @@ fn capture_thread_inner(
     quality: u8,
     fps: u32,
     output: Option<String>,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<()> {
     let (target_w, target_h) = target_resolution;
 
@@ -367,7 +372,7 @@ fn capture_thread_inner(
     match capture_mode {
         CaptureMode::Ext => capture_loop_ext(
             &conn, &mut event_queue, &mut state, &qh, &wl_output, &shm,
-            &output_name, egfx_shared, info_tx, bitrate, quality, fps,
+            &output_name, egfx_shared, info_tx, bitrate, quality, fps, deferred_resize,
         ),
         CaptureMode::Wlr => {
             let screencopy_mgr = state
@@ -378,6 +383,7 @@ fn capture_thread_inner(
             capture_loop_wlr(
                 &conn, &mut event_queue, &mut state, &qh, &wl_output, &shm,
                 &screencopy_mgr, &output_name, egfx_shared, info_tx, bitrate, quality, fps,
+                deferred_resize,
             )
         }
     }
@@ -402,6 +408,7 @@ struct FrameProcessor {
     fps: u32,
     /// Whether we've sent at least one frame (first frame always sent)
     sent_first_frame: bool,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
 }
 
 impl FrameProcessor {
@@ -411,6 +418,7 @@ impl FrameProcessor {
         width: u32, height: u32,
         pixel_format: PixelFormat, stride: u32,
         bitrate: u32, quality: u8, fps: u32,
+        deferred_resize: Option<ironrdp_server::DesktopSize>,
     ) -> Self {
         Self {
             egfx_shared, h264_encoder: None, egfx_handle: None,
@@ -420,6 +428,7 @@ impl FrameProcessor {
             width, height, pixel_format, stride,
             bitrate, quality, fps,
             sent_first_frame: false,
+            deferred_resize,
         }
     }
 
@@ -514,6 +523,13 @@ impl FrameProcessor {
             }
         }
 
+        if sent_via_egfx {
+            if let Some(size) = self.deferred_resize.take() {
+                tracing::info!(width = size.width, height = size.height, "Sending deferred resize");
+                let _ = tx.blocking_send(DisplayUpdate::Resize(size));
+            }
+        }
+
         // Only send bitmaps when EGFX is not expected. Sending bitmaps
         // before EGFX causes a bitmap→EGFX transition that breaks rendering
         // on some RDP clients (first connection after server startup).
@@ -549,6 +565,7 @@ fn capture_loop_ext(
     bitrate: u32,
     quality: u8,
     fps: u32,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<()> {
     let capture_mgr = state
         .capture_manager
@@ -619,7 +636,7 @@ fn capture_loop_ext(
 
     tracing::info!(width, height, ?shm_format, output = %output_name, mode = "ext", fps, "Starting capture loop (double-buffered)");
 
-    let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride, bitrate, quality, fps);
+    let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride, bitrate, quality, fps, deferred_resize);
     let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let mut last_frame_time = Instant::now() - frame_interval;
 
@@ -704,6 +721,7 @@ fn capture_loop_wlr(
     bitrate: u32,
     quality: u8,
     fps: u32,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<()> {
     // First capture to get buffer dimensions
     let probe = screencopy_mgr.capture_output(0, output, qh, ());
@@ -766,7 +784,7 @@ fn capture_loop_wlr(
 
     tracing::info!(width, height, ?shm_format, stride, output = %output_name, mode = "wlr", fps, "Starting capture loop (double-buffered)");
 
-    let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride, bitrate, quality, fps);
+    let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride, bitrate, quality, fps, deferred_resize);
     let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
     let mut last_frame_time = Instant::now() - frame_interval;
 

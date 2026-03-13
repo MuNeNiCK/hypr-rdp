@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use tokio::sync::mpsc;
 
@@ -33,6 +34,8 @@ pub struct HyprDisplay {
     quality: u8,
     fps: u32,
     output: Option<String>,
+    pending_resize: bool,
+    deferred_resize: Option<(u32, u32)>,
 }
 
 impl HyprDisplay {
@@ -53,10 +56,6 @@ impl HyprDisplay {
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
 
-        // Initial capture: bitmap-only (no EGFX). The capture thread started
-        // here is replaced by updates() when a client connects. Giving it EGFX
-        // access would let it consume frame-tracker slots that can never be ACK'd,
-        // blocking the real capture thread's EGFX frames.
         let capture_info = wayland::start_capture(
             tx.clone(),
             resolution,
@@ -67,6 +66,7 @@ impl HyprDisplay {
             quality,
             fps,
             output.clone(),
+            None,
         )
         .await?;
 
@@ -94,6 +94,8 @@ impl HyprDisplay {
             quality,
             fps,
             output,
+            pending_resize: false,
+            deferred_resize: None,
         })
     }
 }
@@ -101,28 +103,74 @@ impl HyprDisplay {
 #[async_trait]
 impl RdpServerDisplay for HyprDisplay {
     async fn size(&mut self) -> DesktopSize {
-        DesktopSize {
-            width: self.width,
-            height: self.height,
+        DesktopSize { width: self.width, height: self.height }
+    }
+
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        let cw = client_size.width as u32;
+        let ch = client_size.height as u32;
+
+        if self.output.is_none() && (cw != self.resolution.0 || ch != self.resolution.1) {
+            tracing::info!(client_w = cw, client_h = ch, "Deferring resize to match client");
+            self.deferred_resize = Some((cw, ch));
         }
+
+        self.size().await
+    }
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        let monitor = match layout.monitors().iter().find(|m| m.is_primary()) {
+            Some(m) => m,
+            None => match layout.monitors().first() {
+                Some(m) => m,
+                None => return,
+            },
+        };
+
+        let (w, h) = monitor.dimensions();
+
+        if (w == self.resolution.0 && h == self.resolution.1) || self.output.is_some() {
+            return;
+        }
+
+        tracing::info!(w, h, "Client requested resize via DisplayControl");
+
+        self.resolution = (w, h);
+        self.width = w as u16;
+        self.height = h as u16;
+        self.pending_resize = true;
+
+        let _ = self.update_tx.try_send(DisplayUpdate::Resize(DesktopSize {
+            width: w as u16,
+            height: h as u16,
+        }));
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        // Always start a fresh capture thread. On first connection, the capture
-        // thread from new() has been filling the channel with stale bitmap frames
-        // since server startup — feeding those to the client causes rendering
-        // glitches during EGFX negotiation. Dropping the old rx causes the old
-        // capture thread to exit on its next send().
         drop(self.update_rx.take());
 
-        // Reset EGFX readiness so the new capture thread waits for this
-        // connection's on_ready callback instead of using stale state.
         if let Some(ref shared) = self.egfx_shared {
-            shared.reset_for_new_client();
+            if self.pending_resize {
+                shared.prepare_for_resize(self.width, self.height);
+                self.pending_resize = false;
+            } else {
+                shared.reset_for_new_client();
+            }
         }
 
         let (tx, rx) = mpsc::channel(128);
         self.update_tx = tx.clone();
+
+        let deferred = if let Some((w, h)) = self.deferred_resize.take() {
+            self.resolution = (w, h);
+            self.width = w as u16;
+            self.height = h as u16;
+            self.pending_resize = true;
+            Some(DesktopSize { width: w as u16, height: h as u16 })
+        } else {
+            None
+        };
+
         let capture_info = wayland::start_capture(
             tx,
             self.resolution,
@@ -133,6 +181,7 @@ impl RdpServerDisplay for HyprDisplay {
             self.quality,
             self.fps,
             self.output.clone(),
+            deferred,
         )
         .await?;
         self.width = capture_info.width as u16;

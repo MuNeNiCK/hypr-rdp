@@ -158,6 +158,54 @@ impl EgfxShared {
         self.ready.store(false, Ordering::Release);
     }
 
+    /// Prepare EGFX state for a resize (Deactivation-Reactivation).
+    /// Deletes all old surfaces, sends ResetGraphics at the new dimensions,
+    /// and bumps generation so the capture thread re-creates encoder/surface.
+    pub fn prepare_for_resize(&self, width: u16, height: u16) {
+        self.ready_generation.fetch_add(1, Ordering::Release);
+
+        let handle = match self.get_handle() {
+            Some(h) => h,
+            None => return,
+        };
+        let sender = match self.get_event_sender() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let dvc_messages;
+        let channel_id;
+        {
+            let mut server = handle.lock().unwrap();
+            if !server.is_ready() {
+                return;
+            }
+            channel_id = match server.channel_id() {
+                Some(id) => id,
+                None => return,
+            };
+            server.resize(width, height);
+            dvc_messages = server.drain_output();
+        }
+
+        if !dvc_messages.is_empty() {
+            match ironrdp_dvc::encode_dvc_messages(
+                channel_id,
+                dvc_messages,
+                ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+            ) {
+                Ok(svc_messages) => {
+                    let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages: svc_messages,
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!("Failed to encode resize PDUs: {}", e);
+                }
+            }
+        }
+    }
+
     /// Initialize the EGFX surface (ResetGraphics + CreateSurface + MapSurfaceToOutput).
     /// Called once when EGFX becomes ready, BEFORE any frames are sent.
     /// Returns the surface_id on success.
