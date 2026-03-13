@@ -282,11 +282,11 @@ impl EgfxShared {
             let mut server = handle.lock().unwrap();
 
             if !server.is_ready() {
-                tracing::warn!("send_frame: server not ready");
+                tracing::debug!("send_frame: server not ready");
                 return false;
             }
             if server.should_backpressure() {
-                tracing::warn!(
+                tracing::debug!(
                     in_flight = server.frames_in_flight(),
                     "send_frame: backpressure"
                 );
@@ -296,7 +296,7 @@ impl EgfxShared {
             let channel_id = match server.channel_id() {
                 Some(id) => id,
                 None => {
-                    tracing::warn!("send_frame: no channel_id");
+                    tracing::debug!("send_frame: no channel_id");
                     return false;
                 }
             };
@@ -306,7 +306,7 @@ impl EgfxShared {
                 match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
                     Some(id) => id,
                     None => {
-                        tracing::warn!("send_frame: send_avc420_frame returned None");
+                        tracing::debug!("send_frame: send_avc420_frame returned None");
                         return false;
                     }
                 };

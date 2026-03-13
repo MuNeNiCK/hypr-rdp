@@ -146,7 +146,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        tracing::info!(
+        tracing::debug!(
             formats = available_formats.len(),
             "Clipboard: remote clipboard updated"
         );

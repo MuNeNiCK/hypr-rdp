@@ -318,7 +318,7 @@ impl VaapiEncoder {
                 self.cached_sps_pps = Some(sps_pps);
             } else {
                 // VA-API driver didn't include SPS/PPS — generate manually
-                tracing::warn!("VA-API IDR missing SPS/PPS, generating manually");
+                tracing::debug!("VA-API IDR missing SPS/PPS, generating manually");
                 let sps_pps = self.generate_sps_pps();
                 // Prepend to IDR frame
                 let mut combined = Vec::with_capacity(sps_pps.len() + data.len());

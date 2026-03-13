@@ -95,11 +95,11 @@ impl InputState {
         // Without this, unread events can accumulate in the socket buffer
         // and cause the compositor to stop reading our requests.
         if let Err(e) = self.event_queue.dispatch_pending(&mut self.wl_state) {
-            tracing::warn!("Wayland dispatch_pending failed: {}", e);
+            tracing::debug!("Wayland dispatch_pending failed: {}", e);
         }
 
         if let Err(e) = self.conn.flush() {
-            tracing::error!("Wayland flush failed: {}", e);
+            tracing::warn!("Wayland flush failed: {}", e);
         }
     }
 
@@ -383,7 +383,7 @@ impl RdpServerInputHandler for HyprInputHandler {
                     state.keyboard_state.send_modifiers(&state.vk);
                     state.flush();
                 } else {
-                    tracing::warn!(code, extended, "No evdev mapping for scancode");
+                    tracing::debug!(code, extended, "No evdev mapping for scancode");
                 }
             }
             KeyboardEvent::Released { code, extended } => {
