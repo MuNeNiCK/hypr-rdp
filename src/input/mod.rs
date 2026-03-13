@@ -279,23 +279,10 @@ impl HyprInputHandler {
 /// Query Hyprland monitor layout to compute coordinate mapping.
 /// Returns (layout_total_w, layout_total_h, output_offset_x, output_offset_y)
 fn query_layout(output_name: &str) -> Result<(u32, u32, u32, u32)> {
-    use std::process::Command;
-    let output = Command::new("hyprctl")
-        .args(["monitors", "-j"])
-        .output()
-        .context("failed to run hyprctl monitors")?;
-    if !output.status.success() {
-        bail!(
-            "hyprctl monitors failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let monitors: serde_json::Value =
-        serde_json::from_slice(&output.stdout).context("failed to parse hyprctl monitors")?;
-
-    let monitors = monitors.as_array().context("expected monitors array")?;
+    let monitors_val = crate::hyprland::monitors()?;
+    let monitors = monitors_val.as_array().context("expected monitors array")?;
     if monitors.is_empty() {
-        bail!("hyprctl monitors returned no outputs");
+        bail!("no monitors found");
     }
 
     // Find layout bounds

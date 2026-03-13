@@ -1,10 +1,8 @@
-use std::collections::BTreeSet;
 use std::num::{NonZeroU16, NonZeroUsize};
 use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::OwnedFd;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -53,13 +51,10 @@ impl Drop for HeadlessOutputGuard {
     }
 }
 
-fn parse_headless_outputs(monitors_json: &[u8]) -> Result<Vec<String>> {
-    let monitors: serde_json::Value =
-        serde_json::from_slice(monitors_json).context("failed to parse hyprctl monitors output")?;
-
-    let monitors = monitors.as_array().context("expected monitors array")?;
-
-    Ok(monitors
+fn list_headless_outputs() -> Result<Vec<String>> {
+    let monitors = crate::hyprland::monitors()?;
+    let arr = monitors.as_array().context("expected monitors array")?;
+    Ok(arr
         .iter()
         .filter_map(|m| {
             let name = m["name"].as_str()?;
@@ -68,35 +63,13 @@ fn parse_headless_outputs(monitors_json: &[u8]) -> Result<Vec<String>> {
         .collect())
 }
 
-fn list_headless_outputs() -> Result<Vec<String>> {
-    let output = Command::new("hyprctl")
-        .args(["monitors", "-j"])
-        .output()
-        .context("failed to run hyprctl monitors")?;
-    if !output.status.success() {
-        bail!(
-            "hyprctl monitors failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    parse_headless_outputs(&output.stdout)
-}
-
 /// Create a headless output in Hyprland at the given resolution.
 /// Returns the output name (e.g. "HEADLESS-1").
 fn create_headless_output(width: u32, height: u32) -> Result<String> {
-    let existing: BTreeSet<_> = list_headless_outputs()?.into_iter().collect();
+    let existing = list_headless_outputs()?.into_iter().collect::<std::collections::BTreeSet<_>>();
 
-    let output = Command::new("hyprctl")
-        .args(["output", "create", "headless"])
-        .output()
-        .context("failed to run hyprctl output create")?;
-    if !output.status.success() {
-        bail!(
-            "hyprctl output create failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    crate::hyprland::output_create_headless()
+        .context("failed to create headless output")?;
 
     let mut created = list_headless_outputs()?
         .into_iter()
@@ -114,52 +87,32 @@ fn create_headless_output(width: u32, height: u32) -> Result<String> {
     // Set resolution
     let mode = format!("{}x{}@60", width, height);
     let rule = format!("{},{},-9999x0,1", name, mode);
-    let result = Command::new("hyprctl")
-        .args(["keyword", "monitor", &rule])
-        .output()
+    crate::hyprland::keyword_monitor(&rule)
         .context("failed to set headless output resolution")?;
-    if !result.status.success() {
-        bail!(
-            "hyprctl keyword monitor failed: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
-    }
 
     tracing::info!(name = %name, width, height, "Created headless output");
     Ok(name)
 }
 
 /// Remove a headless output from Hyprland.
-pub fn remove_headless_output(name: &str) {
-    match Command::new("hyprctl")
-        .args(["output", "remove", name])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
+fn remove_headless_output(name: &str) {
+    match crate::hyprland::output_remove(name) {
+        Ok(()) => {
             tracing::info!(name, "Removed headless output");
         }
-        Ok(output) => {
-            tracing::warn!(name, stderr = %String::from_utf8_lossy(&output.stderr), "Failed to remove headless output");
-        }
         Err(e) => {
-            tracing::warn!(name, error = %e, "Failed to run hyprctl output remove");
+            tracing::warn!(name, error = %e, "Failed to remove headless output");
         }
     }
 }
 
-/// Wait for a Hyprland output to appear, polling with retries.
+/// Wait for a Hyprland output to be ready (has non-zero dimensions).
 fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
 
     loop {
-        let output = Command::new("hyprctl")
-            .args(["monitors", "-j"])
-            .output()
-            .context("failed to run hyprctl monitors")?;
-
-        if output.status.success() {
-            let monitors: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+        if let Ok(monitors) = crate::hyprland::monitors() {
             if let Some(arr) = monitors.as_array() {
                 let found = arr.iter().any(|m| {
                     m["name"].as_str() == Some(output_name)
@@ -185,17 +138,7 @@ fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()> {
 
 /// Verify that a named output exists in Hyprland monitors.
 fn verify_output_exists(output_name: &str) -> Result<()> {
-    let output = Command::new("hyprctl")
-        .args(["monitors", "-j"])
-        .output()
-        .context("failed to run hyprctl monitors")?;
-    if !output.status.success() {
-        bail!(
-            "hyprctl monitors failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let monitors: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    let monitors = crate::hyprland::monitors()?;
     let found = monitors
         .as_array()
         .context("expected monitors array")?

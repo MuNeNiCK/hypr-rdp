@@ -2,6 +2,7 @@ mod audio;
 mod capture;
 mod clipboard;
 mod egfx;
+mod hyprland;
 mod input;
 mod server;
 
