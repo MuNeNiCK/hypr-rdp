@@ -45,6 +45,13 @@ libc = "0.2"
 # TLS auto-cert generation
 rcgen = "0.13"
 
+# Clipboard image support (DIB/PNG conversion)
+ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git" }
+
+# Config file
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
 # Utilities
 anyhow = "1"
 bytes = "1"

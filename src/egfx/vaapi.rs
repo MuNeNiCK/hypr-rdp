@@ -7,7 +7,7 @@
 //! Thread Safety: NOT Send — VA-API is thread-local. Create and use on the
 //! same thread (the capture thread satisfies this).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
@@ -27,8 +27,77 @@ const CODED_BUFFER_COUNT: usize = 3;
 const SLICE_TYPE_I: u8 = 2;
 const SLICE_TYPE_P: u8 = 0;
 
-const DEVICE_PATH: &str = "/dev/dri/renderD128";
 const IDR_INTERVAL: u32 = 30;
+
+/// Scan /dev/dri/renderD* for a VA-API device that supports H.264 encoding.
+fn find_vaapi_device() -> Result<PathBuf> {
+    let dri_path = Path::new("/dev/dri");
+    if !dri_path.exists() {
+        bail!("/dev/dri not found");
+    }
+
+    let mut devices: Vec<PathBuf> = std::fs::read_dir(dri_path)
+        .context("failed to read /dev/dri")?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("renderD")
+        })
+        .map(|e| e.path())
+        .collect();
+    devices.sort();
+
+    if devices.is_empty() {
+        bail!("no render devices found in /dev/dri");
+    }
+
+    for device in &devices {
+        let display = match Display::open_drm_display(device) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::debug!(device = %device.display(), "Skipping VA-API device: {:?}", e);
+                continue;
+            }
+        };
+
+        let profiles = match display.query_config_profiles() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let h264_profile = if profiles.contains(&VAProfile::VAProfileH264High) {
+            VAProfile::VAProfileH264High
+        } else if profiles.contains(&VAProfile::VAProfileH264Main) {
+            VAProfile::VAProfileH264Main
+        } else {
+            continue;
+        };
+
+        let entrypoints = match display.query_config_entrypoints(h264_profile) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        if entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice) {
+            let vendor = display
+                .query_vendor_string()
+                .unwrap_or_else(|_| "unknown".into());
+            tracing::info!(
+                device = %device.display(),
+                vendor = %vendor,
+                profile = ?h264_profile,
+                "Found VA-API device with H.264 encode support"
+            );
+            return Ok(device.clone());
+        }
+    }
+
+    bail!(
+        "no VA-API device with H.264 encode support found (checked {} devices)",
+        devices.len()
+    )
+}
 
 #[derive(Clone)]
 struct DpbEntry {
@@ -64,18 +133,16 @@ impl VaapiEncoder {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
         }
 
-        if !Path::new(DEVICE_PATH).exists() {
-            bail!("VA-API device not found: {}", DEVICE_PATH);
-        }
+        let device_path = find_vaapi_device()?;
 
         tracing::info!(
             "Initializing VA-API encoder: {}x{}, device={}",
             width,
             height,
-            DEVICE_PATH
+            device_path.display()
         );
 
-        let display = Display::open_drm_display(Path::new(DEVICE_PATH))
+        let display = Display::open_drm_display(&device_path)
             .map_err(|e| anyhow::anyhow!("Failed to open VA display: {:?}", e))?;
 
         let driver = display

@@ -5,16 +5,19 @@ mod egfx;
 mod input;
 mod server;
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::Parser;
+use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
 #[command(name = "hypr-rdp", about = "Native RDP server for Hyprland")]
 struct Args {
     /// Address to bind the RDP server
-    #[arg(short, long, default_value = "0.0.0.0:3389")]
-    bind: String,
+    #[arg(short, long)]
+    bind: Option<String>,
 
     /// TLS certificate file (PEM)
     #[arg(long)]
@@ -25,36 +28,89 @@ struct Args {
     key: Option<String>,
 
     /// Username for RDP authentication
-    #[arg(short, long, default_value = "")]
-    username: String,
+    #[arg(short, long)]
+    username: Option<String>,
 
     /// Password for RDP authentication
-    #[arg(short, long, default_value = "")]
-    password: String,
+    #[arg(short, long)]
+    password: Option<String>,
 
     /// RDP session resolution (WxH), e.g. 1920x1080
-    #[arg(short, long, default_value = "1920x1080")]
-    resolution: String,
+    #[arg(short, long)]
+    resolution: Option<String>,
 
     /// Screen capture protocol: "wlr" (wlr-screencopy-v1) or "ext" (ext-image-copy-capture-v1)
-    #[arg(long, default_value = "wlr")]
-    capture_mode: String,
+    #[arg(long)]
+    capture_mode: Option<String>,
 
     /// H.264 encoder bitrate in bps
-    #[arg(long, default_value_t = 5_000_000)]
-    bitrate: u32,
+    #[arg(long)]
+    bitrate: Option<u32>,
 
     /// H.264 quality level (0-51, lower = better)
-    #[arg(long, default_value_t = 23)]
-    quality: u8,
+    #[arg(long)]
+    quality: Option<u8>,
 
     /// Maximum capture frame rate
-    #[arg(long, default_value_t = 30)]
-    fps: u32,
+    #[arg(long)]
+    fps: Option<u32>,
 
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
     output: Option<String>,
+
+    /// Path to config file [default: ~/.config/hypr-rdp/config.toml]
+    #[arg(long)]
+    config: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct Config {
+    bind: Option<String>,
+    cert: Option<String>,
+    key: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+    resolution: Option<String>,
+    capture_mode: Option<String>,
+    bitrate: Option<u32>,
+    quality: Option<u8>,
+    fps: Option<u32>,
+    output: Option<String>,
+}
+
+impl Config {
+    fn load(path: Option<&str>) -> Self {
+        let config_path = match path {
+            Some(p) => PathBuf::from(p),
+            None => {
+                let home = match std::env::var("HOME") {
+                    Ok(h) => h,
+                    Err(_) => return Self::default(),
+                };
+                PathBuf::from(home)
+                    .join(".config")
+                    .join("hypr-rdp")
+                    .join("config.toml")
+            }
+        };
+
+        let content = match std::fs::read_to_string(&config_path) {
+            Ok(c) => c,
+            Err(_) => return Self::default(),
+        };
+
+        match toml::from_str(&content) {
+            Ok(config) => {
+                tracing::info!("Loaded config from {}", config_path.display());
+                config
+            }
+            Err(e) => {
+                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
+                Self::default()
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -64,22 +120,36 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let config = Config::load(args.config.as_deref());
 
-    let resolution = parse_resolution(&args.resolution)?;
-    let capture_mode = match args.capture_mode.as_str() {
+    // CLI args override config file, which overrides defaults
+    let bind = args.bind.or(config.bind).unwrap_or_else(|| "0.0.0.0:3389".into());
+    let cert = args.cert.or(config.cert);
+    let key = args.key.or(config.key);
+    let username = args.username.or(config.username).unwrap_or_default();
+    let password = args.password.or(config.password).unwrap_or_default();
+    let resolution_str = args.resolution.or(config.resolution).unwrap_or_else(|| "1920x1080".into());
+    let capture_mode_str = args.capture_mode.or(config.capture_mode).unwrap_or_else(|| "wlr".into());
+    let bitrate = args.bitrate.or(config.bitrate).unwrap_or(5_000_000);
+    let quality = args.quality.or(config.quality).unwrap_or(23);
+    let fps = args.fps.or(config.fps).unwrap_or(30);
+    let output = args.output.or(config.output);
+
+    let resolution = parse_resolution(&resolution_str)?;
+    let capture_mode = match capture_mode_str.as_str() {
         "ext" => capture::CaptureMode::Ext,
         "wlr" => capture::CaptureMode::Wlr,
         other => anyhow::bail!("unknown capture mode '{}', expected 'ext' or 'wlr'", other),
     };
 
-    if args.quality > 51 {
+    if quality > 51 {
         anyhow::bail!("quality must be 0-51");
     }
-    if args.fps == 0 {
+    if fps == 0 {
         anyhow::bail!("fps must be > 0");
     }
 
-    tracing::info!("Starting hypr-rdp on {}", args.bind);
+    tracing::info!("Starting hypr-rdp on {}", bind);
 
     // Spawn signal handler as independent task — process::exit(0)
     // ensures termination even if server.run() blocks the runtime.
@@ -91,17 +161,17 @@ async fn main() -> Result<()> {
     });
 
     server::run(
-        &args.bind,
-        args.cert.as_deref(),
-        args.key.as_deref(),
-        &args.username,
-        &args.password,
+        &bind,
+        cert.as_deref(),
+        key.as_deref(),
+        &username,
+        &password,
         resolution,
         capture_mode,
-        args.bitrate,
-        args.quality,
-        args.fps,
-        args.output,
+        bitrate,
+        quality,
+        fps,
+        output,
     )
     .await
 }

@@ -64,12 +64,14 @@ impl SharedOutputLayout {
             output_offset_y = snapshot.output_offset_y,
             "Updated input layout mapping"
         );
-        *self.inner.lock().unwrap() = Some(snapshot);
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = Some(snapshot);
+        }
         Ok(())
     }
 
     fn snapshot(&self) -> Option<OutputLayoutSnapshot> {
-        self.inner.lock().unwrap().clone()
+        self.inner.lock().ok()?.clone()
     }
 }
 
@@ -373,7 +375,7 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
 
 impl RdpServerInputHandler for HyprInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        let mut state = self.state.lock().unwrap();
+        let Ok(mut state) = self.state.lock() else { return };
 
         match event {
             KeyboardEvent::Pressed { code, extended } => {
@@ -404,7 +406,7 @@ impl RdpServerInputHandler for HyprInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        let mut state = self.state.lock().unwrap();
+        let Ok(mut state) = self.state.lock() else { return };
 
         match event {
             MouseEvent::Move { x, y } => {

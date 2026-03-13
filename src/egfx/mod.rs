@@ -144,11 +144,11 @@ impl EgfxShared {
     }
 
     pub fn get_handle(&self) -> Option<GfxServerHandle> {
-        self.handle.lock().unwrap().clone()
+        self.handle.lock().ok()?.clone()
     }
 
     pub fn get_event_sender(&self) -> Option<mpsc::UnboundedSender<ServerEvent>> {
-        self.event_sender.lock().unwrap().clone()
+        self.event_sender.lock().ok()?.clone()
     }
 
     /// Reset readiness state for a new client connection.
@@ -176,7 +176,7 @@ impl EgfxShared {
         let dvc_messages;
         let channel_id;
         {
-            let mut server = handle.lock().unwrap();
+            let Ok(mut server) = handle.lock() else { return };
             if !server.is_ready() {
                 return;
             }
@@ -215,7 +215,7 @@ impl EgfxShared {
         width: u16,
         height: u16,
     ) -> Option<u16> {
-        let mut server = handle.lock().unwrap();
+        let Ok(mut server) = handle.lock() else { return None };
 
         if !server.is_ready() {
             return None;
@@ -279,7 +279,7 @@ impl EgfxShared {
     ) -> bool {
         // Lock, send frame, drain — minimize lock duration
         let (_frame_id, dvc_messages, channel_id) = {
-            let mut server = handle.lock().unwrap();
+            let Ok(mut server) = handle.lock() else { return false };
 
             if !server.is_ready() {
                 tracing::debug!("send_frame: server not ready");
@@ -358,7 +358,9 @@ impl HyprGfxFactory {
 impl ServerEventSender for HyprGfxFactory {
     fn set_sender(&mut self, sender: mpsc::UnboundedSender<ServerEvent>) {
         self.event_sender = Some(sender.clone());
-        *self.shared.event_sender.lock().unwrap() = Some(sender);
+        if let Ok(mut guard) = self.shared.event_sender.lock() {
+            *guard = Some(sender);
+        }
     }
 }
 
@@ -377,7 +379,9 @@ impl GfxServerFactory for HyprGfxFactory {
         let handle: GfxServerHandle = Arc::new(Mutex::new(server));
         let bridge = GfxDvcBridge::new(Arc::clone(&handle));
 
-        *self.shared.handle.lock().unwrap() = Some(Arc::clone(&handle));
+        if let Ok(mut guard) = self.shared.handle.lock() {
+            *guard = Some(Arc::clone(&handle));
+        }
 
         Some((bridge, handle))
     }
