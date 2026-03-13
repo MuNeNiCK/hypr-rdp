@@ -43,16 +43,6 @@ impl FrameEncoder {
         }
     }
 
-    /// Force the next encoded frame to be an IDR (key frame).
-    /// Used to recover the H.264 reference chain after a dropped frame.
-    pub fn force_idr(&mut self) {
-        match self {
-            #[cfg(feature = "vaapi")]
-            Self::Vaapi(enc) => enc.force_idr(),
-            Self::Software(enc) => enc.force_idr(),
-        }
-    }
-
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "vaapi")]
@@ -161,6 +151,13 @@ impl EgfxShared {
         self.event_sender.lock().unwrap().clone()
     }
 
+    /// Reset readiness state for a new client connection.
+    /// Called from updates() so each connection starts with a clean EGFX slate.
+    /// The handle and event_sender are preserved (set per-connection by the factory).
+    pub fn reset_for_new_client(&self) {
+        self.ready.store(false, Ordering::Release);
+    }
+
     /// Initialize the EGFX surface (ResetGraphics + CreateSurface + MapSurfaceToOutput).
     /// Called once when EGFX becomes ready, BEFORE any frames are sent.
     /// Returns the surface_id on success.
@@ -237,22 +234,33 @@ impl EgfxShared {
             let mut server = handle.lock().unwrap();
 
             if !server.is_ready() {
+                tracing::warn!("send_frame: server not ready");
                 return false;
             }
             if server.should_backpressure() {
+                tracing::warn!(
+                    in_flight = server.frames_in_flight(),
+                    "send_frame: backpressure"
+                );
                 return false;
             }
 
             let channel_id = match server.channel_id() {
                 Some(id) => id,
-                None => return false,
+                None => {
+                    tracing::warn!("send_frame: no channel_id");
+                    return false;
+                }
             };
 
             let regions = [Avc420Region::full_frame(width, height, quality)];
             let frame_id =
                 match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
                     Some(id) => id,
-                    None => return false,
+                    None => {
+                        tracing::warn!("send_frame: send_avc420_frame returned None");
+                        return false;
+                    }
                 };
 
             let dvc_messages = server.drain_output();
@@ -336,6 +344,10 @@ struct HyprGraphicsHandler {
 }
 
 impl GraphicsPipelineHandler for HyprGraphicsHandler {
+    fn max_frames_in_flight(&self) -> u32 {
+        10
+    }
+
     fn capabilities_advertise(&mut self, pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {
         tracing::info!(count = pdu.0.len(), "EGFX: client advertised capabilities");
     }

@@ -190,12 +190,6 @@ impl VaapiEncoder {
         })
     }
 
-    /// Force the next encoded frame to be an IDR (key frame).
-    /// Used to recover the H.264 reference chain after a dropped frame.
-    pub fn force_idr(&mut self) {
-        self.force_idr = true;
-    }
-
     pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
         let is_idr = self.force_idr || self.frame_count % IDR_INTERVAL as u64 == 0;
 

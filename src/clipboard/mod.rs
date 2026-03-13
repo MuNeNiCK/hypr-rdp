@@ -18,6 +18,7 @@ use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
 };
+
 use ironrdp_core::impl_as_any;
 use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
@@ -102,8 +103,6 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_request_format_list(&mut self) {
-        tracing::debug!("Clipboard: server requested format list");
-
         // Advertise local clipboard content to the RDP client
         let has_content = match read_wayland_clipboard() {
             Ok(data) => !data.is_empty(),
@@ -120,8 +119,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
         }
     }
 
-    fn on_process_negotiated_capabilities(&mut self, capabilities: ClipboardGeneralCapabilityFlags) {
-        tracing::debug!(?capabilities, "Clipboard: negotiated capabilities");
+    fn on_process_negotiated_capabilities(&mut self, _capabilities: ClipboardGeneralCapabilityFlags) {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
@@ -146,13 +144,10 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_format_data_request(&mut self, request: FormatDataRequest) {
-        tracing::debug!(?request, "Clipboard: format data requested");
-
         let response = if request.format == ClipboardFormatId::CF_UNICODETEXT {
             match read_wayland_clipboard() {
                 Ok(data) if !data.is_empty() => {
                     let text = String::from_utf8_lossy(&data);
-                    tracing::debug!(len = data.len(), "Clipboard: sending as CF_UNICODETEXT");
                     FormatDataResponse::new_unicode_string(&text).into_owned()
                 }
                 Ok(_) => FormatDataResponse::new_error().into_owned(),
@@ -162,7 +157,6 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 }
             }
         } else {
-            tracing::debug!(format_id = request.format.value(), "Clipboard: unsupported format requested");
             FormatDataResponse::new_error().into_owned()
         };
 
@@ -175,7 +169,6 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
         if response.is_error() {
-            tracing::debug!("Clipboard: format data response is error");
             return;
         }
 
@@ -195,32 +188,19 @@ impl CliprdrBackend for HyprCliprdrBackend {
         self.suppress_watcher.store(true, Ordering::SeqCst);
         if let Err(e) = write_wayland_clipboard(utf8.as_bytes()) {
             tracing::warn!("Failed to write Wayland clipboard: {:#}", e);
-        } else {
-            tracing::debug!(len = utf8.len(), "Clipboard: wrote to Wayland clipboard");
         }
         // Small delay to ensure wl-paste --watch processes the change before we unsuppress
         std::thread::sleep(std::time::Duration::from_millis(100));
         self.suppress_watcher.store(false, Ordering::SeqCst);
     }
 
-    fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-        tracing::debug!(?request, "Clipboard: file contents requested (not supported)");
-    }
+    fn on_file_contents_request(&mut self, _request: FileContentsRequest) {}
 
-    fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
-        tracing::debug!(
-            stream_id = response.stream_id(),
-            "Clipboard: file contents response (not supported)"
-        );
-    }
+    fn on_file_contents_response(&mut self, _response: FileContentsResponse<'_>) {}
 
-    fn on_lock(&mut self, data_id: LockDataId) {
-        tracing::debug!(?data_id, "Clipboard: lock");
-    }
+    fn on_lock(&mut self, _data_id: LockDataId) {}
 
-    fn on_unlock(&mut self, data_id: LockDataId) {
-        tracing::debug!(?data_id, "Clipboard: unlock");
-    }
+    fn on_unlock(&mut self, _data_id: LockDataId) {}
 }
 
 impl HyprCliprdrBackend {
@@ -258,9 +238,7 @@ impl HyprCliprdrBackend {
                 let reader = BufReader::new(stdout);
                 // Each "changed\n" line = one clipboard change event
                 for _line in reader.lines() {
-                    // Skip notifications triggered by our own wl-copy writes
                     if suppress.load(Ordering::SeqCst) {
-                        tracing::debug!("Clipboard: suppressing self-originated change");
                         continue;
                     }
                     let formats = vec![ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
@@ -272,9 +250,7 @@ impl HyprCliprdrBackend {
                     {
                         break; // Channel closed, session ended
                     }
-                    tracing::debug!("Clipboard: local clipboard changed, notified RDP client");
                 }
-                tracing::debug!("Clipboard watcher thread exiting");
             })
             .ok();
 

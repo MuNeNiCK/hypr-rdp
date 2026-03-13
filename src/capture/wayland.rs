@@ -415,7 +415,8 @@ impl FrameProcessor {
         Self {
             egfx_shared, h264_encoder: None, egfx_handle: None,
             egfx_sender: None, egfx_surface_id: None,
-            egfx_active: false, egfx_ready: false, egfx_generation: 0,
+            egfx_active: false,
+            egfx_ready: false, egfx_generation: 0,
             width, height, pixel_format, stride,
             bitrate, quality, fps,
             sent_first_frame: false,
@@ -449,7 +450,7 @@ impl FrameProcessor {
                     self.egfx_sender = None;
                     self.egfx_surface_id = None;
                     self.h264_encoder = None;
-                    tracing::info!("EGFX channel unavailable, falling back to bitmap");
+                    tracing::info!("EGFX channel became unavailable");
                 }
             }
 
@@ -504,15 +505,6 @@ impl FrameProcessor {
                                     self.width as u16, self.height as u16,
                                     h264_data, timestamp, self.quality,
                                 );
-                                if !sent_via_egfx {
-                                    // Frame was encoded but couldn't be sent (backpressure,
-                                    // server not ready, etc). The encoder's reference state
-                                    // has advanced, so subsequent P-frames would reference
-                                    // this dropped frame — the client can't decode them.
-                                    // Force the next frame to be an IDR to restore the chain.
-                                    encoder.force_idr();
-                                    tracing::warn!("EGFX frame dropped after encode, forcing next IDR");
-                                }
                             }
                             Ok(_) => {}
                             Err(e) => tracing::warn!("H.264 encode failed: {:#}", e),
@@ -522,7 +514,10 @@ impl FrameProcessor {
             }
         }
 
-        if !sent_via_egfx && !self.egfx_active {
+        // Only send bitmaps when EGFX is not expected. Sending bitmaps
+        // before EGFX causes a bitmap→EGFX transition that breaks rendering
+        // on some RDP clients (first connection after server startup).
+        if !sent_via_egfx && self.egfx_shared.is_none() {
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0, y: 0,
                 width: NonZeroU16::new(self.width as u16).unwrap(),

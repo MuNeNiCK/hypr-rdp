@@ -51,12 +51,6 @@ impl H264Encoder {
         })
     }
 
-    /// Force the next encoded frame to be an IDR (key frame).
-    /// Used to recover the H.264 reference chain after a dropped frame.
-    pub fn force_idr(&mut self) {
-        self.encoder.force_intra_frame();
-    }
-
     /// Encode a BGRA frame to H.264 NAL units (Annex B format).
     ///
     /// SPS/PPS from IDR frames are cached and prepended to P-frames.

@@ -552,7 +552,6 @@ fn generate_xkb_keymap() -> Result<Vec<u8>> {
     if keymap_data.is_empty() {
         bail!("XKB keymap generation returned empty string");
     }
-    tracing::debug!(len = keymap_data.len(), "Generated XKB keymap");
     Ok(keymap_data)
 }
 

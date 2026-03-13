@@ -53,11 +53,15 @@ impl HyprDisplay {
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
 
+        // Initial capture: bitmap-only (no EGFX). The capture thread started
+        // here is replaced by updates() when a client connects. Giving it EGFX
+        // access would let it consume frame-tracker slots that can never be ACK'd,
+        // blocking the real capture thread's EGFX frames.
         let capture_info = wayland::start_capture(
             tx.clone(),
             resolution,
             capture_mode,
-            Some(Arc::clone(&egfx_shared)),
+            None,
             Arc::clone(&output_layout),
             bitrate,
             quality,
@@ -104,35 +108,36 @@ impl RdpServerDisplay for HyprDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        let rx = match self.update_rx.take() {
-            Some(rx) => rx,
-            None => {
-                let (tx, rx) = mpsc::channel(128);
-                self.update_tx = tx.clone();
-                let capture_info = wayland::start_capture(
-                    tx,
-                    self.resolution,
-                    self.capture_mode,
-                    self.egfx_shared.clone(),
-                    Arc::clone(&self.output_layout),
-                    self.bitrate,
-                    self.quality,
-                    self.fps,
-                    self.output.clone(),
-                )
-                .await?;
-                self.width = capture_info.width as u16;
-                self.height = capture_info.height as u16;
-                self.output_name = capture_info.output_name;
-                tracing::info!(
-                    width = self.width,
-                    height = self.height,
-                    output = %self.output_name,
-                    "Restarted display capture"
-                );
-                rx
-            }
-        };
+        // Always start a fresh capture thread. On first connection, the capture
+        // thread from new() has been filling the channel with stale bitmap frames
+        // since server startup — feeding those to the client causes rendering
+        // glitches during EGFX negotiation. Dropping the old rx causes the old
+        // capture thread to exit on its next send().
+        drop(self.update_rx.take());
+
+        // Reset EGFX readiness so the new capture thread waits for this
+        // connection's on_ready callback instead of using stale state.
+        if let Some(ref shared) = self.egfx_shared {
+            shared.reset_for_new_client();
+        }
+
+        let (tx, rx) = mpsc::channel(128);
+        self.update_tx = tx.clone();
+        let capture_info = wayland::start_capture(
+            tx,
+            self.resolution,
+            self.capture_mode,
+            self.egfx_shared.clone(),
+            Arc::clone(&self.output_layout),
+            self.bitrate,
+            self.quality,
+            self.fps,
+            self.output.clone(),
+        )
+        .await?;
+        self.width = capture_info.width as u16;
+        self.height = capture_info.height as u16;
+        self.output_name = capture_info.output_name;
 
         Ok(Box::new(HyprDisplayUpdates { rx }))
     }
