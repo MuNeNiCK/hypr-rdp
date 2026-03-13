@@ -81,26 +81,29 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting hypr-rdp on {}", args.bind);
 
-    tokio::select! {
-        result = server::run(
-            &args.bind,
-            args.cert.as_deref(),
-            args.key.as_deref(),
-            &args.username,
-            &args.password,
-            resolution,
-            capture_mode,
-            args.bitrate,
-            args.quality,
-            args.fps,
-            args.output,
-        ) => result,
-        result = shutdown_signal() => {
-            result?;
+    // Spawn signal handler as independent task — process::exit(0)
+    // ensures termination even if server.run() blocks the runtime.
+    tokio::spawn(async {
+        if shutdown_signal().await.is_ok() {
             tracing::info!("Shutting down hypr-rdp");
-            Ok(())
+            std::process::exit(0);
         }
-    }
+    });
+
+    server::run(
+        &args.bind,
+        args.cert.as_deref(),
+        args.key.as_deref(),
+        &args.username,
+        &args.password,
+        resolution,
+        capture_mode,
+        args.bitrate,
+        args.quality,
+        args.fps,
+        args.output,
+    )
+    .await
 }
 
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
