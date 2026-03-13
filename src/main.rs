@@ -1,4 +1,6 @@
+mod audio;
 mod capture;
+mod clipboard;
 mod egfx;
 mod input;
 mod server;
@@ -37,6 +39,22 @@ struct Args {
     /// Screen capture protocol: "wlr" (wlr-screencopy-v1) or "ext" (ext-image-copy-capture-v1)
     #[arg(long, default_value = "wlr")]
     capture_mode: String,
+
+    /// H.264 encoder bitrate in bps
+    #[arg(long, default_value_t = 5_000_000)]
+    bitrate: u32,
+
+    /// H.264 quality level (0-51, lower = better)
+    #[arg(long, default_value_t = 23)]
+    quality: u8,
+
+    /// Maximum capture frame rate
+    #[arg(long, default_value_t = 30)]
+    fps: u32,
+
+    /// Capture a specific output instead of creating a headless one
+    #[arg(long)]
+    output: Option<String>,
 }
 
 #[tokio::main]
@@ -54,6 +72,13 @@ async fn main() -> Result<()> {
         other => anyhow::bail!("unknown capture mode '{}', expected 'ext' or 'wlr'", other),
     };
 
+    if args.quality > 51 {
+        anyhow::bail!("quality must be 0-51");
+    }
+    if args.fps == 0 {
+        anyhow::bail!("fps must be > 0");
+    }
+
     tracing::info!("Starting hypr-rdp on {}", args.bind);
 
     tokio::select! {
@@ -65,6 +90,10 @@ async fn main() -> Result<()> {
             &args.password,
             resolution,
             capture_mode,
+            args.bitrate,
+            args.quality,
+            args.fps,
+            args.output,
         ) => result,
         result = shutdown_signal() => {
             result?;

@@ -17,6 +17,9 @@ ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git" }
 ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP.git" }
 ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git" }
 ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP.git" }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP.git" }
+ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP.git" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git" }
 
 # H.264 encoding (OpenH264 software encoder)
 openh264 = { version = "0.9", features = ["libloading"] }
@@ -34,6 +37,9 @@ wayland-scanner = "0.31"
 
 # System
 libc = "0.2"
+
+# TLS auto-cert generation
+rcgen = "0.13"
 
 # Utilities
 anyhow = "1"

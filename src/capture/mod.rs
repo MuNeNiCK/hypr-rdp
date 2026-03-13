@@ -29,6 +29,10 @@ pub struct HyprDisplay {
     output_layout: Arc<SharedOutputLayout>,
     update_tx: mpsc::Sender<DisplayUpdate>,
     update_rx: Option<mpsc::Receiver<DisplayUpdate>>,
+    bitrate: u32,
+    quality: u8,
+    fps: u32,
+    output: Option<String>,
 }
 
 impl HyprDisplay {
@@ -36,11 +40,16 @@ impl HyprDisplay {
         (self.width, self.height)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         resolution: (u32, u32),
         capture_mode: CaptureMode,
         egfx_shared: Arc<EgfxShared>,
         output_layout: Arc<SharedOutputLayout>,
+        bitrate: u32,
+        quality: u8,
+        fps: u32,
+        output: Option<String>,
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
 
@@ -50,6 +59,10 @@ impl HyprDisplay {
             capture_mode,
             Some(Arc::clone(&egfx_shared)),
             Arc::clone(&output_layout),
+            bitrate,
+            quality,
+            fps,
+            output.clone(),
         )
         .await?;
 
@@ -73,6 +86,10 @@ impl HyprDisplay {
             output_layout,
             update_tx: tx,
             update_rx: Some(rx),
+            bitrate,
+            quality,
+            fps,
+            output,
         })
     }
 }
@@ -98,6 +115,10 @@ impl RdpServerDisplay for HyprDisplay {
                     self.capture_mode,
                     self.egfx_shared.clone(),
                     Arc::clone(&self.output_layout),
+                    self.bitrate,
+                    self.quality,
+                    self.fps,
+                    self.output.clone(),
                 )
                 .await?;
                 self.width = capture_info.width as u16;

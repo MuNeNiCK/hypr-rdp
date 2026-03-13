@@ -21,15 +21,15 @@ pub struct H264Encoder {
 }
 
 impl H264Encoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
         let api = unsafe {
             OpenH264API::from_blob_path_unchecked("libopenh264.so")
                 .context("failed to load libopenh264.so (install openh264 package)")?
         };
 
         let config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(4_000_000))
-            .max_frame_rate(FrameRate::from_hz(30.0))
+            .bitrate(BitRate::from_bps(bitrate))
+            .max_frame_rate(FrameRate::from_hz(fps as f32))
             .rate_control_mode(RateControlMode::Bitrate)
             .usage_type(UsageType::ScreenContentRealTime)
             .skip_frames(false);
@@ -49,6 +49,12 @@ impl H264Encoder {
             v_buf: vec![0u8; (w / 2) * (h / 2)],
             cached_sps_pps: None,
         })
+    }
+
+    /// Force the next encoded frame to be an IDR (key frame).
+    /// Used to recover the H.264 reference chain after a dropped frame.
+    pub fn force_idr(&mut self) {
+        self.encoder.force_intra_frame();
     }
 
     /// Encode a BGRA frame to H.264 NAL units (Annex B format).
@@ -81,7 +87,6 @@ impl H264Encoder {
         if is_keyframe {
             // IDR: extract and cache SPS/PPS
             if let Some(sps_pps) = super::extract_sps_pps(&data) {
-                tracing::debug!(len = sps_pps.len(), "Cached SPS/PPS from IDR frame");
                 self.cached_sps_pps = Some(sps_pps);
             }
         } else {

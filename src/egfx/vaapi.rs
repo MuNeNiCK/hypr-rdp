@@ -28,7 +28,6 @@ const SLICE_TYPE_I: u8 = 2;
 const SLICE_TYPE_P: u8 = 0;
 
 const DEVICE_PATH: &str = "/dev/dri/renderD128";
-const BITRATE_BPS: u32 = 5_000_000;
 const IDR_INTERVAL: u32 = 30;
 
 #[derive(Clone)]
@@ -52,6 +51,8 @@ pub struct VaapiEncoder {
     cached_sps_pps: Option<Vec<u8>>,
     width: u32,
     height: u32,
+    bitrate: u32,
+    fps: u32,
     frame_count: u64,
     force_idr: bool,
     nv12_format: VAImageFormat,
@@ -59,7 +60,7 @@ pub struct VaapiEncoder {
 }
 
 impl VaapiEncoder {
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
         if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
         }
@@ -160,7 +161,7 @@ impl VaapiEncoder {
         tracing::info!(
             profile = ?h264_profile,
             "VA-API encoder ready: {}x{}, {}kbps, IDR every {} frames",
-            width, height, BITRATE_BPS / 1000, IDR_INTERVAL,
+            width, height, bitrate / 1000, IDR_INTERVAL,
         );
 
         Ok(Self {
@@ -176,8 +177,10 @@ impl VaapiEncoder {
             cached_sps_pps: None,
             width,
             height,
+            bitrate,
+            fps,
             frame_count: 0,
-            force_idr: true,
+            force_idr: true, // first frame is always IDR
             nv12_format,
             nv12_buf: {
                 let mut buf = vec![16u8; y_size + uv_size]; // Y=16 (black in limited range)
@@ -185,6 +188,12 @@ impl VaapiEncoder {
                 buf
             },
         })
+    }
+
+    /// Force the next encoded frame to be an IDR (key frame).
+    /// Used to recover the H.264 reference chain after a dropped frame.
+    pub fn force_idr(&mut self) {
+        self.force_idr = true;
     }
 
     pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
@@ -389,7 +398,7 @@ impl VaapiEncoder {
     }
 
     fn get_h264_level(&self) -> u8 {
-        let macroblocks_per_sec = (self.width / 16) * (self.height / 16) * 30;
+        let macroblocks_per_sec = (self.width / 16) * (self.height / 16) * self.fps;
         if macroblocks_per_sec <= 40500 {
             30
         } else if macroblocks_per_sec <= 108000 {
@@ -427,7 +436,7 @@ impl VaapiEncoder {
         let vui_fields = H264VuiFields::new(
             0,  // aspect_ratio_info_present_flag
             1,  // timing_info_present_flag
-            0,  // bitstream_restriction_flag
+            1,  // bitstream_restriction_flag (enables low-latency decode hints)
             16, // log2_max_mv_length_horizontal
             16, // log2_max_mv_length_vertical
             0,  // fixed_frame_rate_flag
@@ -441,7 +450,7 @@ impl VaapiEncoder {
             IDR_INTERVAL,          // intra_period
             IDR_INTERVAL,          // intra_idr_period
             1,                     // ip_period
-            BITRATE_BPS,           // bits_per_second
+            self.bitrate,           // bits_per_second
             1,                     // max_num_ref_frames
             mb_width,
             mb_height,
@@ -457,8 +466,8 @@ impl VaapiEncoder {
             0,  // aspect_ratio_idc
             1,  // sar_width
             1,  // sar_height
-            1,  // num_units_in_tick
-            30, // time_scale
+            1,            // num_units_in_tick
+            self.fps * 2, // time_scale (2 * fps for progressive)
         )
     }
 
@@ -609,7 +618,7 @@ impl VaapiEncoder {
         let mut buffers = Vec::with_capacity(3);
 
         let rc = EncMiscParameterRateControl::new(
-            BITRATE_BPS,
+            self.bitrate,
             100,                                     // target_percentage (CBR)
             1000,                                    // window_size
             0,                                       // initial_qp
@@ -625,10 +634,10 @@ impl VaapiEncoder {
             rc,
         )));
 
-        let hrd = EncMiscParameterHRD::new(BITRATE_BPS / 2, BITRATE_BPS);
+        let hrd = EncMiscParameterHRD::new(self.bitrate / 2, self.bitrate);
         buffers.push(BufferType::EncMiscParameter(EncMiscParameter::HRD(hrd)));
 
-        let fr = EncMiscParameterFrameRate::new(30, 0);
+        let fr = EncMiscParameterFrameRate::new(self.fps, 0);
         buffers.push(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(
             fr,
         )));
@@ -704,12 +713,20 @@ impl VaapiEncoder {
         bs.write_bits(0, 1); // chroma_loc_info_present_flag
         bs.write_bits(1, 1); // timing_info_present_flag
         bs.write_bits(1, 32); // num_units_in_tick
-        bs.write_bits(60, 32); // time_scale (2 * fps for progressive)
+        bs.write_bits(self.fps * 2, 32); // time_scale (2 * fps for progressive)
         bs.write_bits(0, 1); // fixed_frame_rate_flag
         bs.write_bits(0, 1); // nal_hrd_parameters_present_flag
         bs.write_bits(0, 1); // vcl_hrd_parameters_present_flag
         bs.write_bits(0, 1); // pic_struct_present_flag
-        bs.write_bits(0, 1); // bitstream_restriction_flag
+        // Bitstream restriction: tells decoder no reordering needed → output immediately
+        bs.write_bits(1, 1); // bitstream_restriction_flag
+        bs.write_bits(1, 1); // motion_vectors_over_pic_boundaries_flag
+        bs.write_ue(0); // max_bytes_per_pic_denom
+        bs.write_ue(0); // max_bits_per_mb_denom
+        bs.write_ue(16); // log2_max_mv_length_horizontal
+        bs.write_ue(16); // log2_max_mv_length_vertical
+        bs.write_ue(0); // max_num_reorder_frames (no B-frames → no reordering)
+        bs.write_ue(1); // max_dec_frame_buffering (1 ref frame)
 
         bs.write_rbsp_trailing_bits();
         buf.extend_from_slice(&bs.finish_with_emulation_prevention());

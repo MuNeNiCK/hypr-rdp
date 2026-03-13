@@ -76,7 +76,9 @@ impl SharedOutputLayout {
 /// Shared state for sending input commands to the Wayland thread
 struct InputState {
     conn: Connection,
+    #[allow(dead_code)] // Kept alive to maintain Wayland connection state
     event_queue: EventQueue<WlState>,
+    #[allow(dead_code)]
     wl_state: WlState,
     vk: ZwpVirtualKeyboardV1,
     vp: ZwlrVirtualPointerV1,
@@ -85,17 +87,22 @@ struct InputState {
 }
 
 impl InputState {
-    /// Drain pending Wayland events and flush outgoing requests
+    /// Flush outgoing Wayland requests to the compositor.
+    /// Dispatches pending events first (non-blocking) to prevent socket buffer
+    /// backpressure, then flushes outgoing requests.
     fn flush(&mut self) {
-        // Read any pending events from the compositor
-        if let Some(guard) = self.conn.prepare_read() {
-            let _ = guard.read();
+        // Dispatch any pending events from compositor (non-blocking).
+        // Without this, unread events can accumulate in the socket buffer
+        // and cause the compositor to stop reading our requests.
+        if let Err(e) = self.event_queue.dispatch_pending(&mut self.wl_state) {
+            tracing::warn!("Wayland dispatch_pending failed: {}", e);
         }
-        let _ = self.event_queue.dispatch_pending(&mut self.wl_state);
+
         if let Err(e) = self.conn.flush() {
             tracing::error!("Wayland flush failed: {}", e);
         }
     }
+
 }
 
 struct KeyboardStateTracker {
@@ -367,12 +374,11 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
 impl RdpServerInputHandler for HyprInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
         let mut state = self.state.lock().unwrap();
-        let time = timestamp_ms();
 
         match event {
             KeyboardEvent::Pressed { code, extended } => {
                 if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
-                    state.vk.key(time, evdev_key, 1); // 1 = pressed
+                    state.vk.key(0, evdev_key, 1);
                     state.keyboard_state.key(evdev_key, true);
                     state.keyboard_state.send_modifiers(&state.vk);
                     state.flush();
@@ -382,7 +388,7 @@ impl RdpServerInputHandler for HyprInputHandler {
             }
             KeyboardEvent::Released { code, extended } => {
                 if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
-                    state.vk.key(time, evdev_key, 0); // 0 = released
+                    state.vk.key(0, evdev_key, 0);
                     state.keyboard_state.key(evdev_key, false);
                     state.keyboard_state.send_modifiers(&state.vk);
                     state.flush();
@@ -398,136 +404,93 @@ impl RdpServerInputHandler for HyprInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        tracing::debug!(?event, "RDP mouse event received");
         let mut state = self.state.lock().unwrap();
-        let time = timestamp_ms();
 
         match event {
             MouseEvent::Move { x, y } => {
                 let Some(layout) = state.output_layout.snapshot() else {
-                    tracing::warn!("Skipping mouse move: output layout not initialized");
                     return;
                 };
-                // Map RDP coordinates to global layout coordinates
                 let abs_x = layout.output_offset_x + x as u32;
                 let abs_y = layout.output_offset_y + y as u32;
-                state.vp.motion_absolute(
-                    time,
-                    abs_x,
-                    abs_y,
-                    layout.layout_extent_w,
-                    layout.layout_extent_h,
-                );
+                state.vp.motion_absolute(0, abs_x, abs_y, layout.layout_extent_w, layout.layout_extent_h);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::LeftPressed => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_LEFT, ButtonState::Pressed);
+                state.vp.button(0, keymap::BTN_LEFT, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::LeftReleased => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_LEFT, ButtonState::Released);
+                state.vp.button(0, keymap::BTN_LEFT, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::RightPressed => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_RIGHT, ButtonState::Pressed);
+                state.vp.button(0, keymap::BTN_RIGHT, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::RightReleased => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_RIGHT, ButtonState::Released);
+                state.vp.button(0, keymap::BTN_RIGHT, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::MiddlePressed => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_MIDDLE, ButtonState::Pressed);
+                state.vp.button(0, keymap::BTN_MIDDLE, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::MiddleReleased => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_MIDDLE, ButtonState::Released);
+                state.vp.button(0, keymap::BTN_MIDDLE, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button4Pressed => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_SIDE, ButtonState::Pressed);
+                state.vp.button(0, keymap::BTN_SIDE, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button4Released => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_SIDE, ButtonState::Released);
+                state.vp.button(0, keymap::BTN_SIDE, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button5Pressed => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_EXTRA, ButtonState::Pressed);
+                state.vp.button(0, keymap::BTN_EXTRA, ButtonState::Pressed);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Button5Released => {
-                state
-                    .vp
-                    .button(time, keymap::BTN_EXTRA, ButtonState::Released);
+                state.vp.button(0, keymap::BTN_EXTRA, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::VerticalScroll { value } => {
-                let axis_value = (value as f64 / 120.0) * 15.0;
                 state.vp.axis_source(AxisSource::Wheel);
-                state.vp.axis(time, Axis::VerticalScroll, axis_value);
+                state.vp.axis(0, Axis::VerticalScroll, (value as f64 / 120.0) * 15.0);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Scroll { x, y } => {
                 state.vp.axis_source(AxisSource::Wheel);
                 if y != 0 {
-                    state
-                        .vp
-                        .axis(time, Axis::VerticalScroll, (y as f64 / 120.0) * 15.0);
+                    state.vp.axis(0, Axis::VerticalScroll, (y as f64 / 120.0) * 15.0);
                 }
                 if x != 0 {
-                    state
-                        .vp
-                        .axis(time, Axis::HorizontalScroll, (x as f64 / 120.0) * 15.0);
+                    state.vp.axis(0, Axis::HorizontalScroll, (x as f64 / 120.0) * 15.0);
                 }
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::RelMove { x, y } => {
-                state.vp.motion(time, x as f64, y as f64);
+                state.vp.motion(0, x as f64, y as f64);
                 state.vp.frame();
                 state.flush();
             }
         }
     }
-}
-
-fn timestamp_ms() -> u32 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32
 }
 
 fn compile_xkb_keymap(keymap_data: &[u8]) -> Result<xkb::Keymap> {

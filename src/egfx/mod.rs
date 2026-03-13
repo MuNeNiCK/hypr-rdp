@@ -16,10 +16,10 @@ pub enum FrameEncoder {
 
 impl FrameEncoder {
     /// Try VAAPI first, fall back to software.
-    pub fn new(width: u32, height: u32) -> Result<Self> {
+    pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
         #[cfg(feature = "vaapi")]
         {
-            match vaapi::VaapiEncoder::new(width, height) {
+            match vaapi::VaapiEncoder::new(width, height, bitrate, fps) {
                 Ok(enc) => {
                     tracing::info!("Using VA-API hardware encoder");
                     return Ok(Self::Vaapi(Box::new(enc)));
@@ -30,7 +30,7 @@ impl FrameEncoder {
             }
         }
 
-        let enc = encoder::H264Encoder::new(width, height)?;
+        let enc = encoder::H264Encoder::new(width, height, bitrate, fps)?;
         tracing::info!("Using OpenH264 software encoder");
         Ok(Self::Software(Box::new(enc)))
     }
@@ -40,6 +40,16 @@ impl FrameEncoder {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(enc) => enc.encode(bgra),
             Self::Software(enc) => enc.encode(bgra),
+        }
+    }
+
+    /// Force the next encoded frame to be an IDR (key frame).
+    /// Used to recover the H.264 reference chain after a dropped frame.
+    pub fn force_idr(&mut self) {
+        match self {
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(enc) => enc.force_idr(),
+            Self::Software(enc) => enc.force_idr(),
         }
     }
 
@@ -211,6 +221,7 @@ impl EgfxShared {
 
     /// Send an encoded H.264 frame via EGFX.
     /// Surface must already be initialized via `init_surface`.
+    #[allow(clippy::too_many_arguments)]
     pub fn send_frame(
         handle: &GfxServerHandle,
         sender: &mpsc::UnboundedSender<ServerEvent>,
@@ -219,36 +230,29 @@ impl EgfxShared {
         height: u16,
         h264_data: &[u8],
         timestamp_ms: u32,
+        quality: u8,
     ) -> bool {
         // Lock, send frame, drain — minimize lock duration
-        let (frame_id, dvc_messages, channel_id) = {
+        let (_frame_id, dvc_messages, channel_id) = {
             let mut server = handle.lock().unwrap();
 
             if !server.is_ready() {
-                tracing::debug!("send_frame: server not ready");
                 return false;
             }
             if server.should_backpressure() {
-                tracing::debug!("send_frame: backpressure");
                 return false;
             }
 
             let channel_id = match server.channel_id() {
                 Some(id) => id,
-                None => {
-                    tracing::debug!("send_frame: no channel_id");
-                    return false;
-                }
+                None => return false,
             };
 
-            let regions = [Avc420Region::full_frame(width, height, 22)];
+            let regions = [Avc420Region::full_frame(width, height, quality)];
             let frame_id =
                 match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
                     Some(id) => id,
-                    None => {
-                        tracing::debug!("send_frame: send_avc420_frame returned None");
-                        return false;
-                    }
+                    None => return false,
                 };
 
             let dvc_messages = server.drain_output();
@@ -257,7 +261,6 @@ impl EgfxShared {
         };
 
         if dvc_messages.is_empty() {
-            tracing::trace!(frame_id, "No DVC output after send_avc420_frame");
             return false;
         }
 
@@ -267,7 +270,6 @@ impl EgfxShared {
             ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
         ) {
             Ok(svc_messages) => {
-                tracing::debug!(frame_id, surface_id, msgs = svc_messages.len(), "EGFX frame sent");
                 let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
                     messages: svc_messages,
                 }));
@@ -349,9 +351,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
         self.shared.ready.store(true, Ordering::Release);
     }
 
-    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
-        tracing::debug!(frame_id, queue_depth, "EGFX: frame ack");
-    }
+    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32) {}
 
     fn on_close(&mut self) {
         tracing::info!("EGFX: channel closed");
