@@ -96,13 +96,11 @@ impl H264Encoder {
         Ok(data)
     }
 
-    /// Convert BGRA pixels to YUV420P planes.
-    /// BT.601 limited-range (matches OpenH264's internal conversion matrix).
+    /// Convert BGRA pixels to YUV420P planes (BT.709 limited range).
     fn bgra_to_yuv420(&mut self, bgra: &[u8]) {
         let w = self.width;
         let h = self.height;
 
-        // Full-resolution Y plane
         for row in 0..h {
             for col in 0..w {
                 let idx = (row * w + col) * 4;
@@ -110,12 +108,11 @@ impl H264Encoder {
                 let g = bgra[idx + 1] as i32;
                 let r = bgra[idx + 2] as i32;
 
-                let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                let y = ((47 * r + 157 * g + 16 * b + 128) >> 8) + 16;
                 self.y_buf[row * w + col] = y.clamp(0, 255) as u8;
             }
         }
 
-        // Half-resolution U/V planes (2x2 subsampling)
         let half_w = w / 2;
         for row in 0..(h / 2) {
             for col in 0..half_w {
@@ -139,8 +136,8 @@ impl H264Encoder {
                 let g = g_sum / 4;
                 let b = b_sum / 4;
 
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
 
                 let uv_idx = row * half_w + col;
                 self.u_buf[uv_idx] = u.clamp(0, 255) as u8;

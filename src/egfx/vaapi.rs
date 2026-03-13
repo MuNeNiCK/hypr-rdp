@@ -56,7 +56,6 @@ pub struct VaapiEncoder {
     frame_count: u64,
     force_idr: bool,
     nv12_format: VAImageFormat,
-    nv12_buf: Vec<u8>,
 }
 
 impl VaapiEncoder {
@@ -153,11 +152,6 @@ impl VaapiEncoder {
             coded_buffers.push(buf);
         }
 
-        // Align to 16 for macroblock padding — extra rows filled with black
-        let aligned_height = height.div_ceil(16) * 16;
-        let y_size = (width * aligned_height) as usize;
-        let uv_size = (width as usize / 2) * (aligned_height as usize / 2) * 2;
-
         tracing::info!(
             profile = ?h264_profile,
             "VA-API encoder ready: {}x{}, {}kbps, IDR every {} frames",
@@ -182,11 +176,6 @@ impl VaapiEncoder {
             frame_count: 0,
             force_idr: true, // first frame is always IDR
             nv12_format,
-            nv12_buf: {
-                let mut buf = vec![16u8; y_size + uv_size]; // Y=16 (black in limited range)
-                buf[y_size..].fill(128); // U=128, V=128 (neutral chroma)
-                buf
-            },
         })
     }
 
@@ -202,9 +191,8 @@ impl VaapiEncoder {
         let coded_idx = self.current_coded_buffer;
         self.current_coded_buffer = (self.current_coded_buffer + 1) % self.coded_buffers.len();
 
-        // Convert BGRA to NV12 and upload to surface
-        self.bgra_to_nv12(bgra);
-
+        // Convert BGRA to NV12 and upload to surface via VA image,
+        // using the image's actual pitches/offsets (not assuming stride == width).
         {
             let mut image = libva::Image::create_from(
                 &self.input_surfaces[input_idx],
@@ -214,9 +202,26 @@ impl VaapiEncoder {
             )
             .context("Failed to create VA image")?;
 
-            let image_data = image.as_mut();
-            let copy_len = self.nv12_buf.len().min(image_data.len());
-            image_data[..copy_len].copy_from_slice(&self.nv12_buf[..copy_len]);
+            let (y_pitch, uv_pitch, y_offset, uv_offset) = {
+                let i = image.image();
+                (
+                    i.pitches[0] as usize,
+                    i.pitches[1] as usize,
+                    i.offsets[0] as usize,
+                    i.offsets[1] as usize,
+                )
+            };
+
+            Self::bgra_to_nv12(
+                bgra,
+                image.as_mut(),
+                self.width as usize,
+                self.height as usize,
+                y_offset,
+                y_pitch,
+                uv_offset,
+                uv_pitch,
+            );
         }
 
         // Build encoding parameters
@@ -337,30 +342,36 @@ impl VaapiEncoder {
         Ok(data)
     }
 
-    /// Convert BGRA to NV12 (BT.601 limited range, integer math).
-    /// Buffer is sized for 16-aligned height; extra rows stay black.
-    fn bgra_to_nv12(&mut self, bgra: &[u8]) {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let aligned_h = (self.height.div_ceil(16) * 16) as usize;
-        let y_size = w * aligned_h;
-
-        // Y plane (full resolution, only actual height)
+    /// Convert BGRA to NV12 (BT.709 limited range) directly into VA image buffer,
+    /// respecting the image's pitch and plane offsets.
+    #[allow(clippy::too_many_arguments)]
+    fn bgra_to_nv12(
+        bgra: &[u8],
+        dst: &mut [u8],
+        w: usize,
+        h: usize,
+        y_offset: usize,
+        y_pitch: usize,
+        uv_offset: usize,
+        uv_pitch: usize,
+    ) {
+        // Y plane (BT.709 limited range)
         for row in 0..h {
+            let dst_start = y_offset + row * y_pitch;
             for col in 0..w {
                 let idx = (row * w + col) * 4;
                 let b = bgra[idx] as i32;
                 let g = bgra[idx + 1] as i32;
                 let r = bgra[idx + 2] as i32;
-                let y = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
-                self.nv12_buf[row * w + col] = y.clamp(0, 255) as u8;
+                let y = ((47 * r + 157 * g + 16 * b + 128) >> 8) + 16;
+                dst[dst_start + col] = y.clamp(0, 255) as u8;
             }
         }
 
-        // UV plane (half resolution, interleaved U-V pairs, only actual height)
-        let half_w = w / 2;
+        // UV plane (NV12 interleaved, BT.709 limited range, half resolution)
         for row in 0..(h / 2) {
-            for col in 0..half_w {
+            let dst_start = uv_offset + row * uv_pitch;
+            for col in 0..(w / 2) {
                 let src_row = row * 2;
                 let src_col = col * 2;
 
@@ -381,12 +392,11 @@ impl VaapiEncoder {
                 let g = g_sum / 4;
                 let b = b_sum / 4;
 
-                let u = ((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 94 * g - 18 * b + 128) >> 8) + 128;
+                let u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
+                let v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
 
-                let uv_idx = y_size + (row * half_w + col) * 2;
-                self.nv12_buf[uv_idx] = u.clamp(0, 255) as u8;
-                self.nv12_buf[uv_idx + 1] = v.clamp(0, 255) as u8;
+                dst[dst_start + col * 2] = u.clamp(0, 255) as u8;
+                dst[dst_start + col * 2 + 1] = v.clamp(0, 255) as u8;
             }
         }
     }
