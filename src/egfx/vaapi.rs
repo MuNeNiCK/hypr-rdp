@@ -106,6 +106,19 @@ struct DpbEntry {
     poc: i32,
 }
 
+/// Descriptor for importing a NV12 DMA-BUF as a VA surface.
+pub struct DmaBufSurfaceImport {
+    desc: libva::VADRMPRIMESurfaceDescriptor,
+}
+
+impl libva::ExternalBufferDescriptor for DmaBufSurfaceImport {
+    const MEMORY_TYPE: libva::MemoryType = libva::MemoryType::DrmPrime2;
+    type DescriptorAttribute = libva::VADRMPRIMESurfaceDescriptor;
+    fn va_surface_attribute(&mut self) -> libva::VADRMPRIMESurfaceDescriptor {
+        self.desc
+    }
+}
+
 pub struct VaapiEncoder {
     #[allow(dead_code)]
     display: Rc<Display>,
@@ -125,6 +138,8 @@ pub struct VaapiEncoder {
     frame_count: u64,
     force_idr: bool,
     nv12_format: VAImageFormat,
+    /// Cached DMA-BUF imported NV12 surface for zero-copy encode
+    dmabuf_input_surface: Option<Surface<DmaBufSurfaceImport>>,
 }
 
 impl VaapiEncoder {
@@ -243,6 +258,7 @@ impl VaapiEncoder {
             frame_count: 0,
             force_idr: true, // first frame is always IDR
             nv12_format,
+            dmabuf_input_surface: None,
         })
     }
 
@@ -388,6 +404,185 @@ impl VaapiEncoder {
                 tracing::debug!("VA-API IDR missing SPS/PPS, generating manually");
                 let sps_pps = self.generate_sps_pps();
                 // Prepend to IDR frame
+                let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
+                combined.extend_from_slice(&sps_pps);
+                combined.extend_from_slice(&data);
+                data = combined;
+                self.cached_sps_pps = Some(sps_pps);
+            }
+        } else if let Some(ref sps_pps) = self.cached_sps_pps {
+            let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
+            combined.extend_from_slice(sps_pps);
+            combined.extend_from_slice(&data);
+            data = combined;
+        }
+
+        if self.force_idr {
+            self.force_idr = false;
+        }
+        self.frame_count += 1;
+
+        Ok(data)
+    }
+
+    /// Encode from an NV12 DMA-BUF (zero-copy path).
+    ///
+    /// Imports the NV12 DMA-BUF as an encoder input surface (cached after first call),
+    /// then encodes using the same pipeline as the BGRA path but skipping the color conversion.
+    pub fn encode_dmabuf(
+        &mut self,
+        nv12_fd: std::os::unix::io::RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        offset: u32,
+        modifier: u64,
+    ) -> Result<Vec<u8>> {
+        // Import the NV12 DMA-BUF surface on first call (or if dimensions changed)
+        if self.dmabuf_input_surface.is_none() {
+            let mut desc: libva::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+            desc.fourcc = u32::from_ne_bytes(*b"NV12");
+            desc.width = width;
+            desc.height = height;
+            desc.num_objects = 1;
+            desc.objects[0].fd = nv12_fd;
+            desc.objects[0].size = stride * height * 3 / 2;
+            desc.objects[0].drm_format_modifier = modifier;
+            // NV12 has 2 planes: Y and UV
+            desc.num_layers = 2;
+            // Y plane
+            desc.layers[0].drm_format = u32::from_ne_bytes(*b"NV12");
+            desc.layers[0].num_planes = 1;
+            desc.layers[0].object_index[0] = 0;
+            desc.layers[0].offset[0] = offset;
+            desc.layers[0].pitch[0] = stride;
+            // UV plane (interleaved, after Y)
+            desc.layers[1].drm_format = u32::from_ne_bytes(*b"NV12");
+            desc.layers[1].num_planes = 1;
+            desc.layers[1].object_index[0] = 0;
+            desc.layers[1].offset[0] = offset + stride * height;
+            desc.layers[1].pitch[0] = stride;
+
+            let import = DmaBufSurfaceImport { desc };
+            let surfaces = self
+                .display
+                .create_surfaces(
+                    VA_RT_FORMAT_YUV420,
+                    Some(u32::from_ne_bytes(*b"NV12")),
+                    width,
+                    height,
+                    Some(UsageHint::USAGE_HINT_ENCODER),
+                    vec![import],
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to import NV12 DMA-BUF surface: {}", e))?;
+
+            let surface = surfaces.into_iter().next().unwrap();
+            tracing::info!(
+                surface_id = surface.id(),
+                "Encoder: imported NV12 DMA-BUF surface"
+            );
+            self.dmabuf_input_surface = Some(surface);
+        }
+
+        let dmabuf_surface = self.dmabuf_input_surface.as_ref().unwrap();
+        let is_idr = self.force_idr || self.frame_count % IDR_INTERVAL as u64 == 0;
+
+        let recon_idx = self.current_recon_surface;
+        self.current_recon_surface = (self.current_recon_surface + 1) % self.recon_surfaces.len();
+
+        let coded_idx = self.current_coded_buffer;
+        self.current_coded_buffer = (self.current_coded_buffer + 1) % self.coded_buffers.len();
+
+        let mb_width = self.width.div_ceil(16);
+        let mb_height = self.height.div_ceil(16);
+        let num_macroblocks = mb_width * mb_height;
+        let frame_num = (self.frame_count % 65536) as u16;
+        let poc = (self.frame_count * 2) as i32;
+
+        let mut picture = Picture::new(
+            self.frame_count,
+            Rc::clone(&self.context),
+            dmabuf_surface,
+        );
+
+        if is_idr {
+            self.last_ref = None;
+            let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
+            let seq_buffer = self
+                .context
+                .create_buffer(BufferType::EncSequenceParameter(
+                    EncSequenceParameter::H264(seq_param),
+                ))
+                .context("Failed to create seq buffer")?;
+            picture.add_buffer(seq_buffer);
+
+            for rc_buf_type in self.build_rate_control_buffers() {
+                let buf = self
+                    .context
+                    .create_buffer(rc_buf_type)
+                    .context("Failed to create rate control buffer")?;
+                picture.add_buffer(buf);
+            }
+        }
+
+        let pic_param = self.build_picture_params(
+            self.recon_surfaces[recon_idx].id(),
+            self.coded_buffers[coded_idx].id(),
+            is_idr,
+            frame_num,
+            poc,
+        );
+        let pic_buffer = self
+            .context
+            .create_buffer(BufferType::EncPictureParameter(EncPictureParameter::H264(
+                pic_param,
+            )))
+            .context("Failed to create pic buffer")?;
+        picture.add_buffer(pic_buffer);
+
+        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
+        let slice_buffer = self
+            .context
+            .create_buffer(BufferType::EncSliceParameter(EncSliceParameter::H264(
+                slice_param,
+            )))
+            .context("Failed to create slice buffer")?;
+        picture.add_buffer(slice_buffer);
+
+        let picture = picture
+            .begin()
+            .map_err(|e| anyhow::anyhow!("vaBeginPicture failed (dmabuf): {}", e))?;
+        let picture = picture
+            .render()
+            .map_err(|e| anyhow::anyhow!("vaRenderPicture failed (dmabuf): {}", e))?;
+        let picture = picture
+            .end()
+            .map_err(|e| anyhow::anyhow!("vaEndPicture failed (dmabuf): {}", e))?;
+        let _picture = picture
+            .sync()
+            .map_err(|(e, _)| anyhow::anyhow!("vaSyncSurface failed (dmabuf): {}", e))?;
+
+        self.last_ref = Some(DpbEntry {
+            surface_id: self.recon_surfaces[recon_idx].id(),
+            frame_num,
+            poc,
+        });
+
+        let mapped = MappedCodedBuffer::new(&self.coded_buffers[coded_idx])
+            .map_err(|e| anyhow::anyhow!("Failed to map coded buffer: {}", e))?;
+
+        let mut data = Vec::new();
+        for segment in mapped.iter() {
+            data.extend_from_slice(segment.buf);
+        }
+
+        // SPS/PPS handling (same as encode())
+        if is_idr {
+            if let Some(sps_pps) = super::extract_sps_pps(&data) {
+                self.cached_sps_pps = Some(sps_pps);
+            } else {
+                tracing::debug!("VA-API IDR missing SPS/PPS, generating manually");
+                let sps_pps = self.generate_sps_pps();
                 let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
                 combined.extend_from_slice(&sps_pps);
                 combined.extend_from_slice(&data);

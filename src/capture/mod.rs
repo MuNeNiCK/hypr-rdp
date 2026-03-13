@@ -1,3 +1,5 @@
+#[cfg(feature = "vaapi")]
+pub mod dmabuf;
 mod wayland;
 
 use std::sync::Arc;

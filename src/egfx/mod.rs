@@ -1,6 +1,8 @@
 pub mod encoder;
 #[cfg(feature = "vaapi")]
 pub mod vaapi;
+#[cfg(feature = "vaapi")]
+pub mod vpp;
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -40,6 +42,23 @@ impl FrameEncoder {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(enc) => enc.encode(bgra),
             Self::Software(enc) => enc.encode(bgra),
+        }
+    }
+
+    /// Encode from an NV12 DMA-BUF (zero-copy path). Only available with VA-API backend.
+    #[cfg(feature = "vaapi")]
+    pub fn encode_dmabuf(
+        &mut self,
+        nv12_fd: std::os::unix::io::RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        offset: u32,
+        modifier: u64,
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Vaapi(enc) => enc.encode_dmabuf(nv12_fd, width, height, stride, offset, modifier),
+            Self::Software(_) => anyhow::bail!("DMA-BUF encode requires VA-API backend"),
         }
     }
 

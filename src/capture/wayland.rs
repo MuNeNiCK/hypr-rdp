@@ -25,6 +25,10 @@ use wayland_protocols::ext::image_copy_capture::v1::client::{
 use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
+#[cfg(feature = "vaapi")]
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
 
 pub struct CaptureInfo {
     pub width: u32,
@@ -534,6 +538,43 @@ fn capture_loop_ext(
         bail!("invalid buffer dimensions: {}x{}", width, height);
     }
 
+    // Try DMA-BUF path if available (vaapi feature + compositor supports it)
+    #[cfg(feature = "vaapi")]
+    {
+        if let Some(ref dmabuf_result) = try_setup_dmabuf(state, qh, width, height) {
+            match dmabuf_result {
+                Ok(dmabuf_ctx) => {
+                    if let Some(tx) = info_tx.take() {
+                        let _ = tx.send(Ok(CaptureInfo {
+                            width,
+                            height,
+                            output_name: output_name.to_string(),
+                        }));
+                    }
+                    return capture_loop_ext_dmabuf(
+                        conn,
+                        event_queue,
+                        state,
+                        qh,
+                        &session,
+                        width,
+                        height,
+                        dmabuf_ctx,
+                        egfx_shared,
+                        bitrate,
+                        quality,
+                        fps,
+                        deferred_resize,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("DMA-BUF setup failed, falling back to SHM: {:#}", e);
+                }
+            }
+        }
+    }
+
+    // SHM fallback path
     let shm_format = state.shm_format.unwrap_or(wl_shm::Format::Xrgb8888);
     let stride = width * 4;
     let buf_size = (stride * height) as usize;
@@ -573,7 +614,7 @@ fn capture_loop_ext(
         _ => PixelFormat::BgrA32,
     };
 
-    tracing::info!(width, height, ?shm_format, output = %output_name, mode = "ext", fps, "Starting capture loop (double-buffered)");
+    tracing::info!(width, height, ?shm_format, output = %output_name, mode = "ext", fps, "Starting capture loop (double-buffered SHM)");
 
     let mut proc = FrameProcessor::new(egfx_shared, width, height, pixel_format, stride, bitrate, quality, fps, deferred_resize);
     let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
@@ -642,6 +683,389 @@ fn capture_loop_ext(
         libc::munmap(mmap_0, buf_size);
         libc::munmap(mmap_1, buf_size);
     }
+    Ok(())
+}
+
+/// Context for DMA-BUF capture (created during setup, passed to capture loop).
+#[cfg(feature = "vaapi")]
+struct DmaBufCaptureContext {
+    /// GBM device (must outlive gbm_bos)
+    #[allow(dead_code)]
+    gbm_device: super::dmabuf::GbmDevice,
+    /// GBM buffer objects (kept alive for DMA-BUF fd lifetime)
+    #[allow(dead_code)]
+    gbm_bos: Vec<super::dmabuf::GbmBo>,
+    /// Wayland buffers backed by DMA-BUFs
+    wl_buffers: Vec<wl_buffer::WlBuffer>,
+    /// DMA-BUF info for each capture buffer (kept for reference)
+    #[allow(dead_code)]
+    dmabuf_infos: Vec<super::dmabuf::DmaBufInfo>,
+    /// VPP converter (XRGB -> NV12)
+    vpp: crate::egfx::vpp::VppConverter,
+    /// NV12 output DMA-BUF info (for encoder import)
+    nv12_info: super::dmabuf::DmaBufInfo,
+    /// DRM device path
+    drm_device_path: std::path::PathBuf,
+}
+
+/// Try to set up DMA-BUF capture. Returns None if compositor doesn't support DMA-BUF,
+/// or Some(Err) if setup fails.
+#[cfg(feature = "vaapi")]
+fn try_setup_dmabuf(
+    state: &AppState,
+    qh: &QueueHandle<AppState>,
+    width: u32,
+    height: u32,
+) -> Option<Result<DmaBufCaptureContext>> {
+    use super::dmabuf::{DRM_FORMAT_ARGB8888, DRM_FORMAT_XRGB8888};
+
+    let dev = state.dmabuf_device?;
+    if state.dmabuf_formats.is_empty() {
+        return None;
+    }
+    let linux_dmabuf = state.linux_dmabuf.as_ref()?;
+
+    // Find a suitable format (prefer XRGB8888)
+    let (chosen_format, chosen_modifiers) = {
+        let mut best: Option<&(u32, Vec<u64>)> = None;
+        for entry in &state.dmabuf_formats {
+            if entry.0 == DRM_FORMAT_XRGB8888 {
+                best = Some(entry);
+                break;
+            }
+            if entry.0 == DRM_FORMAT_ARGB8888 && best.is_none() {
+                best = Some(entry);
+            }
+        }
+        match best {
+            Some(entry) => (entry.0, &entry.1),
+            None => {
+                tracing::debug!("No XRGB8888/ARGB8888 format in DMA-BUF formats");
+                return None;
+            }
+        }
+    };
+
+    tracing::info!(
+        format = format!("0x{:08x}", chosen_format),
+        num_modifiers = chosen_modifiers.len(),
+        "Attempting DMA-BUF capture setup"
+    );
+
+    Some(setup_dmabuf_inner(
+        dev,
+        linux_dmabuf,
+        qh,
+        width,
+        height,
+        chosen_format,
+        chosen_modifiers,
+    ))
+}
+
+#[cfg(feature = "vaapi")]
+fn setup_dmabuf_inner(
+    dev: libc::dev_t,
+    linux_dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<AppState>,
+    width: u32,
+    height: u32,
+    format: u32,
+    modifiers: &[u64],
+) -> Result<DmaBufCaptureContext> {
+    use super::dmabuf::{drm_device_from_devt, open_drm_device, DRM_FORMAT_MOD_INVALID, GbmBo, GbmDevice};
+
+    // Find DRM device path from dev_t
+    let drm_device_path =
+        drm_device_from_devt(dev).context("failed to find DRM device from dev_t")?;
+    tracing::info!(device = %drm_device_path.display(), "DMA-BUF: found DRM device");
+
+    // Open DRM device and create GBM device
+    let drm_fd = open_drm_device(&drm_device_path)?;
+    let gbm_device = GbmDevice::new(drm_fd)?;
+
+    // Filter out invalid modifiers
+    let valid_modifiers: Vec<u64> = modifiers
+        .iter()
+        .copied()
+        .filter(|m| *m != DRM_FORMAT_MOD_INVALID)
+        .collect();
+
+    // Allocate 2 GBM buffer objects (double-buffered capture)
+    let mut gbm_bos = Vec::with_capacity(2);
+    let mut wl_buffers = Vec::with_capacity(2);
+    let mut dmabuf_infos = Vec::with_capacity(2);
+
+    for i in 0..2 {
+        let bo = if !valid_modifiers.is_empty() {
+            GbmBo::create_with_modifiers(&gbm_device, width, height, format, &valid_modifiers)
+                .or_else(|_| GbmBo::create(&gbm_device, width, height, format))
+        } else {
+            GbmBo::create(&gbm_device, width, height, format)
+        }
+        .with_context(|| format!("failed to allocate GBM buffer {}", i))?;
+
+        let info = bo.dmabuf_info(format, width, height);
+
+        // Create wl_buffer via linux-dmabuf
+        let params = linux_dmabuf.create_params(qh, ());
+        let fd = bo.fd();
+        let stride = bo.stride();
+        let offset = bo.offset(0);
+        let modifier = bo.modifier();
+        let modifier_hi = (modifier >> 32) as u32;
+        let modifier_lo = (modifier & 0xFFFFFFFF) as u32;
+
+        // Add the plane to params.
+        // SAFETY: fd is valid as long as the GBM bo is alive (which we keep in gbm_bos).
+        params.add(
+            unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) },
+            0,
+            offset,
+            stride,
+            modifier_hi,
+            modifier_lo,
+        );
+
+        let wl_buf = params.create_immed(width as i32, height as i32, format, zwp_linux_buffer_params_v1::Flags::empty(), qh, ());
+
+        tracing::debug!(
+            idx = i,
+            fd,
+            stride,
+            offset,
+            modifier = format!("0x{:016x}", modifier),
+            "DMA-BUF: allocated capture buffer"
+        );
+
+        dmabuf_infos.push(info);
+        wl_buffers.push(wl_buf);
+        gbm_bos.push(bo);
+    }
+
+    // Create VPP converter
+    let mut vpp = crate::egfx::vpp::VppConverter::new(&drm_device_path, width, height)?;
+
+    // Import the two XRGB DMA-BUFs as VPP input surfaces
+    for (i, info) in dmabuf_infos.iter().enumerate() {
+        vpp.import_input_surface(info.fd, width, height, info.stride, info.modifier, format)
+            .with_context(|| format!("failed to import VPP input surface {}", i))?;
+    }
+
+    // Export the NV12 output surface as a DMA-BUF
+    let nv12_info = vpp.export_nv12_output()?;
+    tracing::info!(
+        nv12_fd = nv12_info.fd,
+        nv12_stride = nv12_info.stride,
+        "DMA-BUF: VPP NV12 output exported"
+    );
+
+    Ok(DmaBufCaptureContext {
+        gbm_device,
+        gbm_bos,
+        wl_buffers,
+        dmabuf_infos,
+        vpp,
+        nv12_info,
+        drm_device_path,
+    })
+}
+
+/// DMA-BUF capture loop for ext-image-copy-capture.
+#[cfg(feature = "vaapi")]
+#[allow(clippy::too_many_arguments)]
+fn capture_loop_ext_dmabuf(
+    conn: &Connection,
+    event_queue: &mut wayland_client::EventQueue<AppState>,
+    state: &mut AppState,
+    qh: &QueueHandle<AppState>,
+    session: &ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1,
+    width: u32,
+    height: u32,
+    dmabuf_ctx: &DmaBufCaptureContext,
+    egfx_shared: Option<Arc<EgfxShared>>,
+    bitrate: u32,
+    quality: u8,
+    fps: u32,
+    deferred_resize: Option<ironrdp_server::DesktopSize>,
+) -> Result<()> {
+    tracing::info!(
+        width,
+        height,
+        device = %dmabuf_ctx.drm_device_path.display(),
+        mode = "ext-dmabuf",
+        fps,
+        "Starting capture loop (zero-copy DMA-BUF)"
+    );
+
+    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
+    let mut last_frame_time = Instant::now() - frame_interval;
+    let mut cap_idx: usize = 0;
+    let mut sent_first_frame = false;
+    let mut deferred_resize = deferred_resize;
+
+    // EGFX state (mirrors FrameProcessor but for DMA-BUF path)
+    let mut h264_encoder: Option<crate::egfx::FrameEncoder> = None;
+    let mut egfx_handle: Option<ironrdp_server::GfxServerHandle> = None;
+    let mut egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> = None;
+    let mut egfx_surface_id: Option<u16> = None;
+    let mut egfx_active = false;
+    let mut egfx_ready = false;
+    let mut egfx_generation: u32 = 0;
+
+    // Start initial capture
+    let mut frame = session.create_frame(qh, ());
+    state.frame_ready = false;
+    state.frame_failed = false;
+    state.damage_regions.clear();
+    frame.attach_buffer(&dmabuf_ctx.wl_buffers[cap_idx]);
+    frame.damage_buffer(0, 0, width as i32, height as i32);
+    frame.capture();
+    conn.flush().context("Wayland flush failed")?;
+
+    loop {
+        if state.tx.is_closed() { break; }
+        if state.stopped { tracing::warn!("Capture session stopped by compositor"); break; }
+
+        // Wait for current frame to complete
+        loop {
+            event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
+            if state.frame_ready || state.frame_failed { break; }
+        }
+        frame.destroy();
+
+        let completed_failed = state.frame_failed;
+        let completed_idx = cap_idx;
+        let has_damage = !state.damage_regions.is_empty();
+
+        // Start next capture immediately
+        cap_idx = 1 - cap_idx;
+        state.frame_ready = false;
+        state.frame_failed = false;
+        state.damage_regions.clear();
+        frame = session.create_frame(qh, ());
+        frame.attach_buffer(&dmabuf_ctx.wl_buffers[cap_idx]);
+        frame.damage_buffer(0, 0, width as i32, height as i32);
+        frame.capture();
+        conn.flush().context("Wayland flush failed")?;
+
+        if completed_failed { continue; }
+
+        // Rate limit
+        let elapsed = last_frame_time.elapsed();
+        if (!sent_first_frame || elapsed >= frame_interval) && has_damage {
+            // Process via DMA-BUF zero-copy pipeline
+            sent_first_frame = true;
+            last_frame_time = Instant::now();
+
+            // Update EGFX state
+            if let Some(shared) = &egfx_shared {
+                let ready = shared.is_ready();
+                let gen = shared.generation();
+
+                if ready != egfx_ready {
+                    egfx_ready = ready;
+                    if !ready {
+                        egfx_active = false;
+                        egfx_handle = None;
+                        egfx_sender = None;
+                        egfx_surface_id = None;
+                        h264_encoder = None;
+                    }
+                }
+
+                if gen != egfx_generation {
+                    egfx_generation = gen;
+                    egfx_surface_id = None;
+                    h264_encoder = None;
+                    if ready {
+                        match crate::egfx::FrameEncoder::new(width, height, bitrate, fps) {
+                            Ok(enc) => {
+                                tracing::info!(
+                                    width, height,
+                                    backend = enc.backend_name(),
+                                    gen,
+                                    "H.264 encoder initialized (DMA-BUF path)"
+                                );
+                                h264_encoder = Some(enc);
+                            }
+                            Err(e) => tracing::warn!("Failed to initialize H.264 encoder: {:#}", e),
+                        }
+                    }
+                }
+
+                if ready && !egfx_active {
+                    egfx_handle = shared.get_handle();
+                    egfx_sender = shared.get_event_sender();
+                    if h264_encoder.is_some() && egfx_handle.is_some() && egfx_sender.is_some() {
+                        egfx_active = true;
+                        tracing::info!("EGFX transport ready (DMA-BUF path)");
+                    }
+                }
+
+                if egfx_active {
+                    if let (Some(handle), Some(sender), Some(encoder)) =
+                        (&egfx_handle, &egfx_sender, &mut h264_encoder)
+                    {
+                        if egfx_surface_id.is_none() {
+                            egfx_surface_id = EgfxShared::init_surface(
+                                handle,
+                                sender,
+                                width as u16,
+                                height as u16,
+                            );
+                        } else if let Some(sid) = egfx_surface_id {
+                            // Zero-copy encode pipeline:
+                            // 1. VPP: XRGB DMA-BUF -> NV12 (GPU)
+                            // 2. Encoder: NV12 DMA-BUF -> H.264 (GPU)
+                            match dmabuf_ctx.vpp.convert(completed_idx) {
+                                Ok(()) => {
+                                    let nv12 = &dmabuf_ctx.nv12_info;
+                                    match encoder.encode_dmabuf(
+                                        nv12.fd,
+                                        nv12.width,
+                                        nv12.height,
+                                        nv12.stride,
+                                        nv12.offset,
+                                        nv12.modifier,
+                                    ) {
+                                        Ok(ref h264_data) if h264_data.len() > 32 => {
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as u32;
+                                            let sent = EgfxShared::send_frame(
+                                                handle, sender, sid,
+                                                width as u16, height as u16,
+                                                h264_data, timestamp, quality,
+                                            );
+                                            if sent {
+                                                if let Some(size) = deferred_resize.take() {
+                                                    tracing::info!(
+                                                        width = size.width,
+                                                        height = size.height,
+                                                        "Sending deferred resize"
+                                                    );
+                                                    let _ = state
+                                                        .tx
+                                                        .blocking_send(DisplayUpdate::Resize(size));
+                                                }
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => tracing::warn!("H.264 encode (dmabuf) failed: {:#}", e),
+                                    }
+                                }
+                                Err(e) => tracing::warn!("VPP convert failed: {:#}", e),
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -807,12 +1231,19 @@ struct AppState {
     source_manager:
         Option<ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1>,
     screencopy_manager: Option<zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1>,
+    #[cfg(feature = "vaapi")]
+    linux_dmabuf: Option<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1>,
     // Session state
     session: Option<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1>,
     buffer_width: u32,
     buffer_height: u32,
     wlr_stride: u32,
     shm_format: Option<wl_shm::Format>,
+    // DMA-BUF session state
+    #[cfg(feature = "vaapi")]
+    dmabuf_device: Option<libc::dev_t>,
+    #[cfg(feature = "vaapi")]
+    dmabuf_formats: Vec<(u32, Vec<u64>)>, // (drm_format, modifiers)
     // Frame state
     frame_ready: bool,
     frame_failed: bool,
@@ -832,11 +1263,17 @@ impl AppState {
             capture_manager: None,
             source_manager: None,
             screencopy_manager: None,
+            #[cfg(feature = "vaapi")]
+            linux_dmabuf: None,
             session: None,
             buffer_width: 0,
             buffer_height: 0,
             wlr_stride: 0,
             shm_format: None,
+            #[cfg(feature = "vaapi")]
+            dmabuf_device: None,
+            #[cfg(feature = "vaapi")]
+            dmabuf_formats: Vec::new(),
             frame_ready: false,
             frame_failed: false,
             damage_regions: Vec::new(),
@@ -878,6 +1315,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
                 }
                 "zwlr_screencopy_manager_v1" => {
                     state.screencopy_manager = Some(registry.bind(name, version.min(3), qh, ()));
+                }
+                #[cfg(feature = "vaapi")]
+                "zwp_linux_dmabuf_v1" => {
+                    state.linux_dmabuf = Some(registry.bind(name, version.min(4), qh, ()));
                 }
                 _ => {}
             }
@@ -949,6 +1390,39 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
                 tracing::warn!("Session stopped");
                 state.stopped = true;
             }
+            #[cfg(feature = "vaapi")]
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { device } => {
+                // device is a Vec<u8> containing a dev_t value
+                if device.len() >= std::mem::size_of::<libc::dev_t>() {
+                    let dev = libc::dev_t::from_ne_bytes(
+                        device[..std::mem::size_of::<libc::dev_t>()]
+                            .try_into()
+                            .unwrap(),
+                    );
+                    tracing::info!(dev, "Session: DMA-BUF device advertised");
+                    state.dmabuf_device = Some(dev);
+                }
+            }
+            #[cfg(feature = "vaapi")]
+            ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {
+                // modifiers is a Vec<u8> containing an array of u64 values
+                let mut mods = Vec::new();
+                let chunk_size = std::mem::size_of::<u64>();
+                let mut i = 0;
+                while i + chunk_size <= modifiers.len() {
+                    let m = u64::from_ne_bytes(
+                        modifiers[i..i + chunk_size].try_into().unwrap(),
+                    );
+                    mods.push(m);
+                    i += chunk_size;
+                }
+                tracing::debug!(
+                    format = format!("0x{:08x}", format),
+                    num_modifiers = mods.len(),
+                    "Session: DMA-BUF format advertised"
+                );
+                state.dmabuf_formats.push((format, mods));
+            }
             _ => {}
         }
     }
@@ -994,6 +1468,10 @@ delegate_noop!(AppState: ignore ext_image_capture_source_v1::ExtImageCaptureSour
 delegate_noop!(AppState: ignore ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1);
 delegate_noop!(AppState: ignore ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1);
 delegate_noop!(AppState: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1);
+#[cfg(feature = "vaapi")]
+delegate_noop!(AppState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
+#[cfg(feature = "vaapi")]
+delegate_noop!(AppState: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 
 // --- wlr-screencopy frame dispatch ---
 
