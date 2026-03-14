@@ -138,8 +138,8 @@ pub struct VaapiEncoder {
     frame_count: u64,
     force_idr: bool,
     nv12_format: VAImageFormat,
-    /// Cached DMA-BUF imported NV12 surface for zero-copy encode
     dmabuf_input_surface: Option<Surface<DmaBufSurfaceImport>>,
+    profile: VAProfile::Type,
 }
 
 impl VaapiEncoder {
@@ -256,13 +256,19 @@ impl VaapiEncoder {
             bitrate,
             fps,
             frame_count: 0,
-            force_idr: true, // first frame is always IDR
+            force_idr: true,
             nv12_format,
             dmabuf_input_surface: None,
+            profile: h264_profile,
         })
     }
 
-    pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
+    /// Force the next encoded frame to be an IDR (used after error recovery).
+    pub fn force_idr(&mut self) {
+        self.force_idr = true;
+    }
+
+    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
         let is_idr = self.force_idr || self.frame_count % IDR_INTERVAL as u64 == 0;
 
         let input_idx = self.current_input_surface;
@@ -300,6 +306,7 @@ impl VaapiEncoder {
                 image.as_mut(),
                 self.width as usize,
                 self.height as usize,
+                stride,
                 y_offset,
                 y_pitch,
                 uv_offset,
@@ -311,8 +318,10 @@ impl VaapiEncoder {
         let mb_width = self.width.div_ceil(16);
         let mb_height = self.height.div_ceil(16);
         let num_macroblocks = mb_width * mb_height;
-        let frame_num = (self.frame_count % 65536) as u16;
-        let poc = (self.frame_count * 2) as i32;
+        // max_frame_num = 2^(log2_max_frame_num_minus4+4) = 256
+        let frame_num = (self.frame_count % 256) as u16;
+        // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
+        let poc = ((self.frame_count * 2) % 256) as i32;
 
         let mut picture = Picture::new(
             self.frame_count,
@@ -429,6 +438,7 @@ impl VaapiEncoder {
     ///
     /// Imports the NV12 DMA-BUF as an encoder input surface (cached after first call),
     /// then encodes using the same pipeline as the BGRA path but skipping the color conversion.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_dmabuf(
         &mut self,
         nv12_fd: std::os::unix::io::RawFd,
@@ -437,8 +447,9 @@ impl VaapiEncoder {
         stride: u32,
         offset: u32,
         modifier: u64,
+        uv_stride: u32,
+        uv_offset: u32,
     ) -> Result<Vec<u8>> {
-        // Import the NV12 DMA-BUF surface on first call (or if dimensions changed)
         if self.dmabuf_input_surface.is_none() {
             let mut desc: libva::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
             desc.fourcc = u32::from_ne_bytes(*b"NV12");
@@ -446,22 +457,21 @@ impl VaapiEncoder {
             desc.height = height;
             desc.num_objects = 1;
             desc.objects[0].fd = nv12_fd;
-            desc.objects[0].size = stride * height * 3 / 2;
+            let y_end = offset + height * stride;
+            let uv_end = uv_offset + (height / 2) * uv_stride;
+            desc.objects[0].size = y_end.max(uv_end);
             desc.objects[0].drm_format_modifier = modifier;
-            // NV12 has 2 planes: Y and UV
             desc.num_layers = 2;
-            // Y plane
             desc.layers[0].drm_format = u32::from_ne_bytes(*b"NV12");
             desc.layers[0].num_planes = 1;
             desc.layers[0].object_index[0] = 0;
             desc.layers[0].offset[0] = offset;
             desc.layers[0].pitch[0] = stride;
-            // UV plane (interleaved, after Y)
             desc.layers[1].drm_format = u32::from_ne_bytes(*b"NV12");
             desc.layers[1].num_planes = 1;
             desc.layers[1].object_index[0] = 0;
-            desc.layers[1].offset[0] = offset + stride * height;
-            desc.layers[1].pitch[0] = stride;
+            desc.layers[1].offset[0] = uv_offset;
+            desc.layers[1].pitch[0] = uv_stride;
 
             let import = DmaBufSurfaceImport { desc };
             let surfaces = self
@@ -476,7 +486,10 @@ impl VaapiEncoder {
                 )
                 .map_err(|e| anyhow::anyhow!("Failed to import NV12 DMA-BUF surface: {}", e))?;
 
-            let surface = surfaces.into_iter().next().unwrap();
+            let surface = surfaces
+                .into_iter()
+                .next()
+                .context("VA-API returned no surfaces from DMA-BUF import")?;
             tracing::info!(
                 surface_id = surface.id(),
                 "Encoder: imported NV12 DMA-BUF surface"
@@ -496,8 +509,10 @@ impl VaapiEncoder {
         let mb_width = self.width.div_ceil(16);
         let mb_height = self.height.div_ceil(16);
         let num_macroblocks = mb_width * mb_height;
-        let frame_num = (self.frame_count % 65536) as u16;
-        let poc = (self.frame_count * 2) as i32;
+        // max_frame_num = 2^(log2_max_frame_num_minus4+4) = 256
+        let frame_num = (self.frame_count % 256) as u16;
+        // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
+        let poc = ((self.frame_count * 2) % 256) as i32;
 
         let mut picture = Picture::new(
             self.frame_count,
@@ -612,16 +627,24 @@ impl VaapiEncoder {
         dst: &mut [u8],
         w: usize,
         h: usize,
+        src_stride: usize,
         y_offset: usize,
         y_pitch: usize,
         uv_offset: usize,
         uv_pitch: usize,
     ) {
+        if bgra.len() < h * src_stride {
+            tracing::warn!(
+                bgra_len = bgra.len(), expected = h * src_stride,
+                "BGRA buffer too small, skipping conversion"
+            );
+            return;
+        }
         // Y plane (BT.709 limited range)
         for row in 0..h {
             let dst_start = y_offset + row * y_pitch;
             for col in 0..w {
-                let idx = (row * w + col) * 4;
+                let idx = row * src_stride + col * 4;
                 let b = bgra[idx] as i32;
                 let g = bgra[idx + 1] as i32;
                 let r = bgra[idx + 2] as i32;
@@ -643,7 +666,7 @@ impl VaapiEncoder {
 
                 for dy in 0..2 {
                     for dx in 0..2 {
-                        let idx = ((src_row + dy) * w + (src_col + dx)) * 4;
+                        let idx = (src_row + dy) * src_stride + (src_col + dx) * 4;
                         b_sum += bgra[idx] as i32;
                         g_sum += bgra[idx + 1] as i32;
                         r_sum += bgra[idx + 2] as i32;
@@ -776,6 +799,8 @@ impl VaapiEncoder {
             0u8
         };
 
+        let transform_8x8 = if self.profile == VAProfile::VAProfileH264High { 1 } else { 0 };
+
         let pic_fields = H264EncPicFields::new(
             if is_idr { 1 } else { 0 }, // idr_pic_flag
             1,                          // reference_pic_flag
@@ -783,7 +808,7 @@ impl VaapiEncoder {
             0,                          // weighted_pred_flag
             0,                          // weighted_bipred_idc
             0,                          // constrained_intra_pred_flag
-            1,                          // transform_8x8_mode_flag
+            transform_8x8,              // transform_8x8_mode_flag
             1,                          // deblocking_filter_control_present_flag
             0,                          // redundant_pic_cnt_present_flag
             0,                          // pic_order_present_flag
@@ -849,7 +874,7 @@ impl VaapiEncoder {
             slice_type,
             0,                 // pic_parameter_set_id
             frame_num,         // idr_pic_id
-            poc as u32 as u16, // pic_order_cnt_lsb
+            poc as u16, // pic_order_cnt_lsb (already wrapped at call site)
             0,                 // delta_pic_order_cnt_bottom
             [0, 0],            // delta_pic_order_cnt
             0,                 // direct_spatial_mv_pred_flag
@@ -914,64 +939,70 @@ impl VaapiEncoder {
     /// Generate SPS and PPS NAL units matching our encoder configuration.
     /// Used when the VA-API driver doesn't include them in the coded output.
     fn generate_sps_pps(&self) -> Vec<u8> {
+        let profile_idc: u32 = match self.profile {
+            VAProfile::VAProfileH264High => 100,
+            VAProfile::VAProfileH264Main => 77,
+            _ => 100,
+        };
+        let is_high_profile = profile_idc >= 100;
+
         let mb_width = self.width.div_ceil(16);
         let mb_height = self.height.div_ceil(16);
+        let coded_width = mb_width * 16;
         let coded_height = mb_height * 16;
-        let need_crop = coded_height != self.height;
-        let crop_bottom = if need_crop {
-            (coded_height - self.height) / 2 // CropUnitY=2 for frame_mbs_only + 4:2:0
+        let need_crop = coded_width != self.width || coded_height != self.height;
+        let crop_right = if coded_width != self.width {
+            (coded_width - self.width) / 2
+        } else {
+            0
+        };
+        let crop_bottom = if coded_height != self.height {
+            (coded_height - self.height) / 2
         } else {
             0
         };
 
         let mut buf = Vec::with_capacity(64);
 
-        // === SPS (NAL type 7) ===
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         let mut bs = BitWriter::new();
-        // NAL header: forbidden=0, nal_ref_idc=3, nal_unit_type=7
-        bs.write_bits(0, 1); // forbidden_zero_bit
-        bs.write_bits(3, 2); // nal_ref_idc
-        bs.write_bits(7, 5); // nal_unit_type = SPS
+        bs.write_bits(0, 1);
+        bs.write_bits(3, 2);
+        bs.write_bits(7, 5);
 
-        // profile_idc = 100 (High)
-        bs.write_bits(100, 8);
-        // constraint_set0..5_flags + reserved_zero_2bits
+        bs.write_bits(profile_idc, 8);
         bs.write_bits(0, 8);
-        // level_idc
         bs.write_bits(self.get_h264_level() as u32, 8);
-        // seq_parameter_set_id = 0
         bs.write_ue(0);
 
-        // High profile extensions
-        bs.write_ue(1); // chroma_format_idc = 1 (4:2:0)
-        bs.write_ue(0); // bit_depth_luma_minus8
-        bs.write_ue(0); // bit_depth_chroma_minus8
-        bs.write_bits(0, 1); // qpprime_y_zero_transform_bypass_flag
-        bs.write_bits(0, 1); // seq_scaling_matrix_present_flag
+        if is_high_profile {
+            bs.write_ue(1); // chroma_format_idc
+            bs.write_ue(0); // bit_depth_luma_minus8
+            bs.write_ue(0); // bit_depth_chroma_minus8
+            bs.write_bits(0, 1); // qpprime_y_zero_transform_bypass_flag
+            bs.write_bits(0, 1); // seq_scaling_matrix_present_flag
+        }
 
         bs.write_ue(4); // log2_max_frame_num_minus4
         bs.write_ue(0); // pic_order_cnt_type
         bs.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4
         bs.write_ue(1); // max_num_ref_frames
         bs.write_bits(0, 1); // gaps_in_frame_num_value_allowed_flag
-        bs.write_ue(mb_width - 1); // pic_width_in_mbs_minus1
-        bs.write_ue(mb_height - 1); // pic_height_in_map_units_minus1
+        bs.write_ue(mb_width - 1);
+        bs.write_ue(mb_height - 1);
         bs.write_bits(1, 1); // frame_mbs_only_flag
-        // (no mb_adaptive_frame_field_flag since frame_mbs_only=1)
         bs.write_bits(1, 1); // direct_8x8_inference_flag
 
         if need_crop {
-            bs.write_bits(1, 1); // frame_cropping_flag
-            bs.write_ue(0); // frame_crop_left_offset
-            bs.write_ue(0); // frame_crop_right_offset
-            bs.write_ue(0); // frame_crop_top_offset
-            bs.write_ue(crop_bottom); // frame_crop_bottom_offset
+            bs.write_bits(1, 1);
+            bs.write_ue(0);
+            bs.write_ue(crop_right);
+            bs.write_ue(0);
+            bs.write_ue(crop_bottom);
         } else {
-            bs.write_bits(0, 1); // frame_cropping_flag
+            bs.write_bits(0, 1);
         }
 
-        // VUI parameters
         bs.write_bits(1, 1); // vui_parameters_present_flag
         bs.write_bits(0, 1); // aspect_ratio_info_present_flag
         bs.write_bits(0, 1); // overscan_info_present_flag
@@ -979,31 +1010,28 @@ impl VaapiEncoder {
         bs.write_bits(0, 1); // chroma_loc_info_present_flag
         bs.write_bits(1, 1); // timing_info_present_flag
         bs.write_bits(1, 32); // num_units_in_tick
-        bs.write_bits(self.fps * 2, 32); // time_scale (2 * fps for progressive)
+        bs.write_bits(self.fps * 2, 32);
         bs.write_bits(0, 1); // fixed_frame_rate_flag
         bs.write_bits(0, 1); // nal_hrd_parameters_present_flag
         bs.write_bits(0, 1); // vcl_hrd_parameters_present_flag
         bs.write_bits(0, 1); // pic_struct_present_flag
-        // Bitstream restriction: tells decoder no reordering needed → output immediately
         bs.write_bits(1, 1); // bitstream_restriction_flag
         bs.write_bits(1, 1); // motion_vectors_over_pic_boundaries_flag
-        bs.write_ue(0); // max_bytes_per_pic_denom
-        bs.write_ue(0); // max_bits_per_mb_denom
-        bs.write_ue(16); // log2_max_mv_length_horizontal
-        bs.write_ue(16); // log2_max_mv_length_vertical
-        bs.write_ue(0); // max_num_reorder_frames (no B-frames → no reordering)
-        bs.write_ue(1); // max_dec_frame_buffering (1 ref frame)
+        bs.write_ue(0);
+        bs.write_ue(0);
+        bs.write_ue(16);
+        bs.write_ue(16);
+        bs.write_ue(0); // max_num_reorder_frames
+        bs.write_ue(1); // max_dec_frame_buffering
 
         bs.write_rbsp_trailing_bits();
         buf.extend_from_slice(&bs.finish_with_emulation_prevention());
 
-        // === PPS (NAL type 8) ===
-        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]); // start code
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
         let mut bs = BitWriter::new();
-        // NAL header
-        bs.write_bits(0, 1); // forbidden_zero_bit
-        bs.write_bits(3, 2); // nal_ref_idc
-        bs.write_bits(8, 5); // nal_unit_type = PPS
+        bs.write_bits(0, 1);
+        bs.write_bits(3, 2);
+        bs.write_bits(8, 5);
 
         bs.write_ue(0); // pic_parameter_set_id
         bs.write_ue(0); // seq_parameter_set_id
@@ -1014,17 +1042,22 @@ impl VaapiEncoder {
         bs.write_ue(0); // num_ref_idx_l1_default_active_minus1
         bs.write_bits(0, 1); // weighted_pred_flag
         bs.write_bits(0, 2); // weighted_bipred_idc
-        bs.write_se(-3); // pic_init_qp_minus26 (23 - 26 = -3)
+        bs.write_se(-3); // pic_init_qp_minus26
         bs.write_se(0); // pic_init_qs_minus26
         bs.write_se(0); // chroma_qp_index_offset
         bs.write_bits(1, 1); // deblocking_filter_control_present_flag
         bs.write_bits(0, 1); // constrained_intra_pred_flag
         bs.write_bits(0, 1); // redundant_pic_cnt_present_flag
 
-        // High profile PPS extension
-        bs.write_bits(1, 1); // transform_8x8_mode_flag
-        bs.write_bits(0, 1); // pic_scaling_matrix_present_flag
-        bs.write_se(0); // second_chroma_qp_index_offset
+        if is_high_profile {
+            bs.write_bits(1, 1); // transform_8x8_mode_flag
+            bs.write_bits(0, 1); // pic_scaling_matrix_present_flag
+            bs.write_se(0); // second_chroma_qp_index_offset
+        } else {
+            bs.write_bits(0, 1); // transform_8x8_mode_flag
+            bs.write_bits(0, 1); // pic_scaling_matrix_present_flag
+            bs.write_se(0); // second_chroma_qp_index_offset
+        }
 
         bs.write_rbsp_trailing_bits();
         buf.extend_from_slice(&bs.finish_with_emulation_prevention());

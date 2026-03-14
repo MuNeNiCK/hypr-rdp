@@ -51,9 +51,10 @@ pub fn monitors() -> Result<serde_json::Value> {
     serde_json::from_str(&response).context("failed to parse Hyprland monitors JSON")
 }
 
-/// Create a headless output.
-pub fn output_create_headless() -> Result<()> {
-    send_action("output create headless")
+/// Create a headless output with a custom name prefix.
+/// Hyprland will name it `{name}-1`, `{name}-2`, etc.
+pub fn output_create_headless(name: &str) -> Result<()> {
+    send_action(&format!("output create headless {}", name))
 }
 
 /// Set a monitor keyword rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").

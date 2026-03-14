@@ -37,16 +37,17 @@ impl FrameEncoder {
         Ok(Self::Software(Box::new(enc)))
     }
 
-    pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
+    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
         match self {
             #[cfg(feature = "vaapi")]
-            Self::Vaapi(enc) => enc.encode(bgra),
-            Self::Software(enc) => enc.encode(bgra),
+            Self::Vaapi(enc) => enc.encode(bgra, stride),
+            Self::Software(enc) => enc.encode(bgra, stride),
         }
     }
 
     /// Encode from an NV12 DMA-BUF (zero-copy path). Only available with VA-API backend.
     #[cfg(feature = "vaapi")]
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_dmabuf(
         &mut self,
         nv12_fd: std::os::unix::io::RawFd,
@@ -55,9 +56,11 @@ impl FrameEncoder {
         stride: u32,
         offset: u32,
         modifier: u64,
+        uv_stride: u32,
+        uv_offset: u32,
     ) -> Result<Vec<u8>> {
         match self {
-            Self::Vaapi(enc) => enc.encode_dmabuf(nv12_fd, width, height, stride, offset, modifier),
+            Self::Vaapi(enc) => enc.encode_dmabuf(nv12_fd, width, height, stride, offset, modifier, uv_stride, uv_offset),
             Self::Software(_) => anyhow::bail!("DMA-BUF encode requires VA-API backend"),
         }
     }
@@ -67,6 +70,30 @@ impl FrameEncoder {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => "vaapi",
             Self::Software(_) => "openh264",
+        }
+    }
+
+    pub fn is_vaapi(&self) -> bool {
+        match self {
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) => true,
+            Self::Software(_) => false,
+        }
+    }
+
+    /// Create a software-only encoder (fallback when VA-API fails at runtime).
+    pub fn new_software_only(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
+        let enc = encoder::H264Encoder::new(width, height, bitrate, fps)?;
+        tracing::info!("Using OpenH264 software encoder (runtime fallback)");
+        Ok(Self::Software(Box::new(enc)))
+    }
+
+    /// Force the next encoded frame to be an IDR (recovery after dropped frames).
+    pub fn force_idr(&mut self) {
+        match self {
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(enc) => enc.force_idr(),
+            Self::Software(_) => {} // OpenH264 manages IDR internally
         }
     }
 }

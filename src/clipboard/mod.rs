@@ -237,12 +237,24 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+        // 100 MB limit to prevent memory exhaustion from malicious clients
+        const MAX_CLIPBOARD_SIZE: usize = 100 * 1024 * 1024;
+
         if response.is_error() {
             return;
         }
 
         let data = response.data();
         if data.is_empty() {
+            return;
+        }
+
+        if data.len() > MAX_CLIPBOARD_SIZE {
+            tracing::warn!(
+                size = data.len(),
+                max = MAX_CLIPBOARD_SIZE,
+                "Clipboard data too large, ignoring"
+            );
             return;
         }
 
@@ -416,6 +428,10 @@ fn clipboard_thread(
 
         // RDP → Wayland: pick up pending_write and set selection
         if let Some(pending) = state.pending_write.lock().ok().and_then(|mut g| g.take()) {
+            // Destroy previous source to prevent protocol object leak
+            if let Some(old) = state.active_source.take() {
+                old.destroy();
+            }
             let source = manager.create_data_source(&qh, ());
             match &pending {
                 PendingWrite::Text(data) => {
@@ -445,6 +461,7 @@ fn clipboard_thread(
             if let Some(dev) = state.device.as_ref() {
                 dev.set_selection(Some(&source));
             }
+            state.active_source = Some(source);
             // Roundtrip processes any echo Selection event while suppress is true
             event_queue
                 .roundtrip(&mut state)
@@ -497,6 +514,8 @@ struct ClipState {
     offer_mimes: HashMap<ObjectId, Vec<String>>,
     source_data: Arc<Mutex<Option<Vec<u8>>>>,
     source_mime: Arc<Mutex<SourceType>>,
+    /// Currently active data source; destroyed when replaced to avoid protocol object leak.
+    active_source: Option<zwlr_data_control_source_v1::ZwlrDataControlSourceV1>,
 }
 
 impl ClipState {
@@ -519,6 +538,7 @@ impl ClipState {
             offer_mimes: HashMap::new(),
             source_data: Arc::new(Mutex::new(None)),
             source_mime: Arc::new(Mutex::new(SourceType::Text)),
+            active_source: None,
         }
     }
 }
@@ -619,11 +639,28 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 }).cloned();
 
                 if text_mime.is_none() && image_mime.is_none() {
+                    // No supported MIME — clear stale caches
+                    if let Ok(mut g) = state.clipboard_data.lock() { *g = None; }
+                    if let Ok(mut g) = state.clipboard_image.lock() { *g = None; }
                     offer.destroy();
                     return;
                 }
 
                 let mut formats = Vec::new();
+
+                // Clear stale caches for formats NOT present in the new selection.
+                // Without this, switching image→text or text→image leaves the
+                // previous format cached and re-advertisable to the RDP client.
+                if text_mime.is_none() {
+                    if let Ok(mut g) = state.clipboard_data.lock() {
+                        *g = None;
+                    }
+                }
+                if image_mime.is_none() {
+                    if let Ok(mut g) = state.clipboard_image.lock() {
+                        *g = None;
+                    }
+                }
 
                 // Read text content if available
                 if let Some(ref mime) = text_mime {
@@ -745,7 +782,7 @@ impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for ClipSt
 impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for ClipState {
     fn event(
         state: &mut Self,
-        _proxy: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
+        proxy: &zwlr_data_control_source_v1::ZwlrDataControlSourceV1,
         event: zwlr_data_control_source_v1::Event,
         _: &(),
         _conn: &Connection,
@@ -773,7 +810,17 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
                     }
                 }
             }
-            zwlr_data_control_source_v1::Event::Cancelled => {}
+            zwlr_data_control_source_v1::Event::Cancelled => {
+                // Protocol requires destroying the source after cancellation
+                proxy.destroy();
+                if state
+                    .active_source
+                    .as_ref()
+                    .is_some_and(|s| s.id() == proxy.id())
+                {
+                    state.active_source = None;
+                }
+            }
             _ => {}
         }
     }

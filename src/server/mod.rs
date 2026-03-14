@@ -81,11 +81,15 @@ pub async fn run(
         .with_sound_factory(Some(Box::new(sound_factory)))
         .build();
 
-    server.set_credentials(Some(Credentials {
-        username: username.to_string(),
-        password: password.to_string(),
-        domain: None,
-    }));
+    if username.is_empty() && password.is_empty() {
+        server.set_credentials(None);
+    } else {
+        server.set_credentials(Some(Credentials {
+            username: username.to_string(),
+            password: password.to_string(),
+            domain: None,
+        }));
+    }
 
     tracing::info!("RDP server listening on {}", addr);
     server.run().await.context("RDP server error")?;
@@ -95,7 +99,10 @@ pub async fn run(
 
 /// Auto-generate a self-signed TLS certificate and persist it.
 /// Returns paths to (cert.pem, key.pem) in ~/.config/hypr-rdp/.
+/// Uses a lock file to prevent concurrent processes from creating mismatched cert/key pairs.
 fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let home = std::env::var("HOME").context("HOME not set")?;
     let config_dir = PathBuf::from(home).join(".config").join("hypr-rdp");
     let cert_path = config_dir.join("cert.pem");
@@ -110,26 +117,52 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(&config_dir)
         .context("failed to create config directory")?;
 
+    // Acquire an exclusive lock to prevent concurrent TLS generation.
+    // flock is advisory but sufficient since all writers are hypr-rdp instances.
+    let lock_path = config_dir.join(".tls.lock");
+    let lock_file = std::fs::File::create(&lock_path)
+        .context("failed to create TLS lock file")?;
+    let lock_fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
+    let ret = unsafe { libc::flock(lock_fd, libc::LOCK_EX) };
+    if ret != 0 {
+        anyhow::bail!("failed to acquire TLS lock");
+    }
+
+    // Re-check after acquiring lock — another process may have finished first
+    if cert_path.exists() && key_path.exists() {
+        tracing::info!("Reusing existing TLS certificate from {}", config_dir.display());
+        return Ok((cert_path, key_path));
+    }
+
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
     let rcgen::CertifiedKey { cert, key_pair } =
         rcgen::generate_simple_self_signed(subject_alt_names)
             .context("failed to generate self-signed certificate")?;
 
-    // Write to temp files then rename atomically to prevent mismatched cert/key
-    // from concurrent starts
-    let tmp_cert = config_dir.join(".cert.pem.tmp");
+    // Write key with restrictive permissions (0600)
     let tmp_key = config_dir.join(".key.pem.tmp");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_key)
+            .context("failed to create key.pem")?;
+        std::io::Write::write_all(&mut f, key_pair.serialize_pem().as_bytes())
+            .context("failed to write key.pem")?;
+    }
 
+    let tmp_cert = config_dir.join(".cert.pem.tmp");
     std::fs::write(&tmp_cert, cert.pem())
         .context("failed to write cert.pem")?;
-    std::fs::write(&tmp_key, key_pair.serialize_pem())
-        .context("failed to write key.pem")?;
 
     std::fs::rename(&tmp_key, &key_path)
         .context("failed to finalize key.pem")?;
     std::fs::rename(&tmp_cert, &cert_path)
         .context("failed to finalize cert.pem")?;
 
+    // Lock released when lock_file drops
     tracing::info!("Generated self-signed TLS certificate in {}", config_dir.display());
     Ok((cert_path, key_path))
 }

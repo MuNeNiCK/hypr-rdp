@@ -237,12 +237,21 @@ fn run_capture(
                 return;
             }
 
+            let rate = data.format.rate();
+            let channels = data.format.channels();
+            let format = data.format.format();
             tracing::info!(
                 "Audio format negotiated: rate={}, channels={}, format={:?}",
-                data.format.rate(),
-                data.format.channels(),
-                data.format.format()
+                rate, channels, format
             );
+
+            // Validate against the format advertised to the RDP client
+            if rate != SAMPLE_RATE || channels != CHANNELS as u32 {
+                tracing::warn!(
+                    "Audio format mismatch: expected {}Hz {}ch, got {}Hz {}ch — audio may be corrupted",
+                    SAMPLE_RATE, CHANNELS, rate, channels
+                );
+            }
         })
         .process(|stream, data| {
             if data.stop_signal.load(Ordering::Relaxed) {

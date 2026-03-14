@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use openh264::encoder::{BitRate, Encoder, EncoderConfig, FrameRate, RateControlMode, UsageType};
 use openh264::formats::YUVSource;
 use openh264::OpenH264API;
@@ -22,6 +22,10 @@ pub struct H264Encoder {
 
 impl H264Encoder {
     pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            bail!("dimensions must be non-zero and even: {}x{}", width, height);
+        }
+
         let api = unsafe {
             OpenH264API::from_blob_path_unchecked("libopenh264.so")
                 .context("failed to load libopenh264.so (install openh264 package)")?
@@ -54,8 +58,15 @@ impl H264Encoder {
     /// Encode a BGRA frame to H.264 NAL units (Annex B format).
     ///
     /// SPS/PPS from IDR frames are cached and prepended to P-frames.
-    pub fn encode(&mut self, bgra: &[u8]) -> Result<Vec<u8>> {
-        self.bgra_to_yuv420(bgra);
+    /// `stride` is the byte stride of each row in the BGRA buffer.
+    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
+        anyhow::ensure!(
+            bgra.len() >= self.height * stride,
+            "BGRA buffer too small: {} < {}",
+            bgra.len(),
+            self.height * stride,
+        );
+        self.bgra_to_yuv420(bgra, stride);
 
         let yuv = YuvRef {
             y: &self.y_buf,
@@ -97,13 +108,13 @@ impl H264Encoder {
     }
 
     /// Convert BGRA pixels to YUV420P planes (BT.709 limited range).
-    fn bgra_to_yuv420(&mut self, bgra: &[u8]) {
+    fn bgra_to_yuv420(&mut self, bgra: &[u8], stride: usize) {
         let w = self.width;
         let h = self.height;
 
         for row in 0..h {
             for col in 0..w {
-                let idx = (row * w + col) * 4;
+                let idx = row * stride + col * 4;
                 let b = bgra[idx] as i32;
                 let g = bgra[idx + 1] as i32;
                 let r = bgra[idx + 2] as i32;
@@ -125,7 +136,7 @@ impl H264Encoder {
 
                 for dy in 0..2 {
                     for dx in 0..2 {
-                        let idx = ((src_row + dy) * w + (src_col + dx)) * 4;
+                        let idx = (src_row + dy) * stride + (src_col + dx) * 4;
                         b_sum += bgra[idx] as i32;
                         g_sum += bgra[idx + 1] as i32;
                         r_sum += bgra[idx + 2] as i32;

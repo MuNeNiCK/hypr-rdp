@@ -124,11 +124,18 @@ async fn main() -> Result<()> {
     let config = Config::load(args.config.as_deref());
 
     // CLI args override config file, which overrides defaults
-    let bind = args.bind.or(config.bind).unwrap_or_else(|| "0.0.0.0:3389".into());
+    let bind = args.bind.or(config.bind).unwrap_or_else(|| "127.0.0.1:3389".into());
     let cert = args.cert.or(config.cert);
     let key = args.key.or(config.key);
     let username = args.username.or(config.username).unwrap_or_default();
     let password = args.password.or(config.password).unwrap_or_default();
+
+    if username.is_empty() || password.is_empty() {
+        tracing::warn!("No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication.");
+        if bind.starts_with("0.0.0.0") {
+            tracing::warn!("Binding to all interfaces without credentials is a security risk.");
+        }
+    }
     let resolution_str = args.resolution.or(config.resolution).unwrap_or_else(|| "1920x1080".into());
     let capture_mode_str = args.capture_mode.or(config.capture_mode).unwrap_or_else(|| "wlr".into());
     let bitrate = args.bitrate.or(config.bitrate).unwrap_or(5_000_000);
@@ -152,29 +159,25 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting hypr-rdp on {}", bind);
 
-    // Spawn signal handler as independent task — process::exit(0)
-    // ensures termination even if server.run() blocks the runtime.
-    tokio::spawn(async {
-        if shutdown_signal().await.is_ok() {
+    tokio::select! {
+        result = server::run(
+            &bind,
+            cert.as_deref(),
+            key.as_deref(),
+            &username,
+            &password,
+            resolution,
+            capture_mode,
+            bitrate,
+            quality,
+            fps,
+            output,
+        ) => result,
+        _ = shutdown_signal() => {
             tracing::info!("Shutting down hypr-rdp");
-            std::process::exit(0);
+            Ok(())
         }
-    });
-
-    server::run(
-        &bind,
-        cert.as_deref(),
-        key.as_deref(),
-        &username,
-        &password,
-        resolution,
-        capture_mode,
-        bitrate,
-        quality,
-        fps,
-        output,
-    )
-    .await
+    }
 }
 
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
@@ -188,6 +191,18 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
     let h: u32 = parts[1]
         .parse()
         .map_err(|_| anyhow::anyhow!("invalid height"))?;
+    if w == 0 || h == 0 {
+        anyhow::bail!("resolution dimensions must be non-zero");
+    }
+    if w > u16::MAX as u32 || h > u16::MAX as u32 {
+        anyhow::bail!("resolution dimensions must be <= {}", u16::MAX);
+    }
+    // H.264 requires even dimensions (4:2:0 chroma subsampling)
+    let w = w & !1;
+    let h = h & !1;
+    if w == 0 || h == 0 {
+        anyhow::bail!("resolution too small (minimum 2x2 for H.264)");
+    }
     Ok((w, h))
 }
 

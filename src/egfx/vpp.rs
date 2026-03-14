@@ -3,7 +3,7 @@
 //! Uses its own VADisplay (separate from the encoder's cros-libva Display)
 //! because cros-libva's Display::handle() is pub(crate).
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -81,29 +81,27 @@ pub struct VppConverter {
     va_display: VADisplay,
     config_id: VAConfigID,
     context_id: VAContextID,
-    /// Cached imported input surfaces (one per capture buffer)
     input_surfaces: Vec<VASurfaceID>,
-    /// NV12 output surface
     output_surface: VASurfaceID,
     width: u32,
     height: u32,
-    _drm_fd: RawFd,
+    _drm_fd: OwnedFd,
+    nv12_export_fd: Option<OwnedFd>,
 }
 
 impl VppConverter {
     /// Create a VPP converter using the given DRM device.
     pub fn new(drm_device_path: &Path, width: u32, height: u32) -> Result<Self> {
         let drm_fd = {
-            use std::os::unix::io::IntoRawFd;
-            std::fs::OpenOptions::new()
+            let file = std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
                 .open(drm_device_path)
-                .context("failed to open DRM device for VPP")?
-                .into_raw_fd()
+                .context("failed to open DRM device for VPP")?;
+            OwnedFd::from(file)
         };
 
-        let va_display = unsafe { vaGetDisplayDRM(drm_fd) };
+        let va_display = unsafe { vaGetDisplayDRM(drm_fd.as_raw_fd()) };
         if va_display.is_null() {
             bail!("vaGetDisplayDRM returned NULL for VPP");
         }
@@ -193,6 +191,7 @@ impl VppConverter {
             width,
             height,
             _drm_fd: drm_fd,
+            nv12_export_fd: None,
         })
     }
 
@@ -273,7 +272,7 @@ impl VppConverter {
     }
 
     /// Export the NV12 output surface as a DMA-BUF.
-    pub fn export_nv12_output(&self) -> Result<DmaBufInfo> {
+    pub fn export_nv12_output(&mut self) -> Result<DmaBufInfo> {
         let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
         va_check(
             unsafe {
@@ -292,14 +291,33 @@ impl VppConverter {
             bail!("vaExportSurfaceHandle returned empty descriptor");
         }
 
+        let raw_fd = desc.objects[0].fd;
+        if raw_fd < 0 {
+            bail!("vaExportSurfaceHandle returned invalid fd");
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        let fd = owned.as_raw_fd();
+        self.nv12_export_fd = Some(owned);
+
+        let (uv_stride, uv_offset) = if desc.num_layers >= 2 {
+            (desc.layers[1].pitch[0], desc.layers[1].offset[0])
+        } else if desc.layers[0].num_planes >= 2 {
+            (desc.layers[0].pitch[1], desc.layers[0].offset[1])
+        } else {
+            let y_stride = desc.layers[0].pitch[0];
+            (y_stride, y_stride * self.height)
+        };
+
         Ok(DmaBufInfo {
-            fd: desc.objects[0].fd,
+            fd,
             stride: desc.layers[0].pitch[0],
             offset: desc.layers[0].offset[0],
             modifier: desc.objects[0].drm_format_modifier,
             format: crate::capture::dmabuf::DRM_FORMAT_NV12,
             width: self.width,
             height: self.height,
+            uv_stride,
+            uv_offset,
         })
     }
 
@@ -346,7 +364,6 @@ impl VppConverter {
             va_reserved: [0; 16],
         };
 
-        // Create VPP buffer
         let mut buffer_id: VABufferID = 0;
         va_check(
             unsafe {
@@ -363,33 +380,29 @@ impl VppConverter {
             "vaCreateBuffer (VPP pipeline)",
         )?;
 
-        // Execute: begin -> render -> end -> sync
-        va_check(
-            unsafe { vaBeginPicture(self.va_display, self.context_id, self.output_surface) },
-            "vaBeginPicture (VPP)",
-        )?;
+        let result = (|| -> Result<()> {
+            va_check(
+                unsafe { vaBeginPicture(self.va_display, self.context_id, self.output_surface) },
+                "vaBeginPicture (VPP)",
+            )?;
+            va_check(
+                unsafe { vaRenderPicture(self.va_display, self.context_id, &mut buffer_id, 1) },
+                "vaRenderPicture (VPP)",
+            )?;
+            va_check(
+                unsafe { vaEndPicture(self.va_display, self.context_id) },
+                "vaEndPicture (VPP)",
+            )?;
+            va_check(
+                unsafe { vaSyncSurface(self.va_display, self.output_surface) },
+                "vaSyncSurface (VPP output)",
+            )?;
+            Ok(())
+        })();
 
-        va_check(
-            unsafe { vaRenderPicture(self.va_display, self.context_id, &mut buffer_id, 1) },
-            "vaRenderPicture (VPP)",
-        )?;
+        unsafe { vaDestroyBuffer(self.va_display, buffer_id); }
 
-        va_check(
-            unsafe { vaEndPicture(self.va_display, self.context_id) },
-            "vaEndPicture (VPP)",
-        )?;
-
-        va_check(
-            unsafe { vaSyncSurface(self.va_display, self.output_surface) },
-            "vaSyncSurface (VPP output)",
-        )?;
-
-        // Destroy the pipeline parameter buffer
-        unsafe {
-            vaDestroyBuffer(self.va_display, buffer_id);
-        }
-
-        Ok(())
+        result
     }
 
     /// Get the number of imported input surfaces.
@@ -408,20 +421,13 @@ impl VppConverter {
 impl Drop for VppConverter {
     fn drop(&mut self) {
         unsafe {
-            // Destroy input surfaces
             for surface_id in &mut self.input_surfaces {
                 vaDestroySurfaces(self.va_display, surface_id, 1);
             }
-            // Destroy output surface
             vaDestroySurfaces(self.va_display, &mut self.output_surface, 1);
-            // Destroy context and config
             vaDestroyContext(self.va_display, self.context_id);
             vaDestroyConfig(self.va_display, self.config_id);
-            // Terminate display
             vaTerminate(self.va_display);
         }
-        // Note: _drm_fd leaks intentionally (kept alive by RawFd, closed when process exits).
-        // To properly close it, we'd need to store OwnedFd, but that complicates the
-        // drop ordering with VA-API.
     }
 }

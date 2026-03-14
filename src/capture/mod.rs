@@ -112,7 +112,11 @@ impl RdpServerDisplay for HyprDisplay {
         let cw = client_size.width as u32;
         let ch = client_size.height as u32;
 
-        if self.output.is_none() && (cw != self.resolution.0 || ch != self.resolution.1) {
+        // H.264 requires even dimensions
+        let cw = cw & !1;
+        let ch = ch & !1;
+
+        if self.output.is_none() && cw > 0 && ch > 0 && (cw != self.resolution.0 || ch != self.resolution.1) {
             tracing::info!(client_w = cw, client_h = ch, "Deferring resize to match client");
             self.deferred_resize = Some((cw, ch));
         }
@@ -129,7 +133,21 @@ impl RdpServerDisplay for HyprDisplay {
             },
         };
 
-        let (w, h) = monitor.dimensions();
+        let (mut w, mut h) = monitor.dimensions();
+
+        if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
+            tracing::warn!(w, h, "Ignoring invalid DisplayControl dimensions");
+            return;
+        }
+
+        // H.264 requires even dimensions (4:2:0 chroma subsampling)
+        w &= !1;
+        h &= !1;
+
+        if w == 0 || h == 0 {
+            tracing::warn!("Dimensions too small after even-rounding, ignoring");
+            return;
+        }
 
         if (w == self.resolution.0 && h == self.resolution.1) || self.output.is_some() {
             return;

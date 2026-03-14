@@ -30,6 +30,42 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
 
+struct MmapRegion {
+    ptr: *mut libc::c_void,
+    len: usize,
+}
+
+impl MmapRegion {
+    fn new(fd: std::os::unix::io::RawFd, len: usize) -> Result<Self> {
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            bail!("mmap failed");
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.ptr as *const u8, self.len) }
+    }
+}
+
+impl Drop for MmapRegion {
+    fn drop(&mut self) {
+        unsafe {
+            libc::munmap(self.ptr, self.len);
+        }
+    }
+}
+
 pub struct CaptureInfo {
     pub width: u32,
     pub height: u32,
@@ -55,34 +91,48 @@ impl Drop for HeadlessOutputGuard {
     }
 }
 
-fn list_headless_outputs() -> Result<Vec<String>> {
+const HEADLESS_PREFIX: &str = "hypr-rdp";
+
+/// List headless outputs created by hypr-rdp (name starts with "hypr-rdp-").
+fn list_stale_headless_outputs() -> Result<Vec<String>> {
     let monitors = crate::hyprland::monitors()?;
     let arr = monitors.as_array().context("expected monitors array")?;
     Ok(arr
         .iter()
         .filter_map(|m| {
             let name = m["name"].as_str()?;
-            name.starts_with("HEADLESS-").then(|| name.to_string())
+            name.starts_with(HEADLESS_PREFIX).then(|| name.to_string())
         })
         .collect())
 }
 
 /// Create a headless output in Hyprland at the given resolution.
-/// Returns the output name (e.g. "HEADLESS-1").
-fn create_headless_output(width: u32, height: u32) -> Result<String> {
+/// Returns the output name and RAII guard that removes it on drop.
+/// The guard is created immediately after the output appears so that
+/// any subsequent failure (e.g., keyword_monitor) cleans up automatically.
+fn create_headless_output(width: u32, height: u32) -> Result<(String, HeadlessOutputGuard)> {
     // Subscribe to events BEFORE creating the output to catch monitoradded.
     // The ensure_registered() roundtrip guarantees Hyprland has accept()'ed
     // our socket2 connection before we trigger the creation.
     let mut events = crate::hyprland::EventStream::connect()?;
     events.ensure_registered()?;
 
-    crate::hyprland::output_create_headless()
+    crate::hyprland::output_create_headless(HEADLESS_PREFIX)
         .context("failed to create headless output")?;
 
-    // Wait for monitoradded event — data is the output name
-    let name = events
-        .wait_for("monitoradded", Duration::from_secs(5))
-        .context("failed to detect new headless output")?;
+    // Wait for monitoradded event — data is the output name.
+    let name = loop {
+        let candidate = events
+            .wait_for("monitoradded", Duration::from_secs(5))
+            .context("failed to detect new headless output")?;
+        if candidate.starts_with(HEADLESS_PREFIX) {
+            break candidate;
+        }
+        tracing::debug!(name = %candidate, "Ignoring unrelated monitoradded event");
+    };
+
+    // Guard created immediately — any failure below will clean up the output
+    let guard = HeadlessOutputGuard::new(name.clone());
 
     // Set resolution
     let mode = format!("{}x{}@60", width, height);
@@ -91,7 +141,7 @@ fn create_headless_output(width: u32, height: u32) -> Result<String> {
         .context("failed to set headless output resolution")?;
 
     tracing::info!(name = %name, width, height, "Created headless output");
-    Ok(name)
+    Ok((name, guard))
 }
 
 /// Remove a headless output from Hyprland.
@@ -263,15 +313,14 @@ fn capture_thread_inner(
         tracing::info!(output = %name, "Capturing existing output");
         (name.clone(), None)
     } else {
-        // Create headless output
         // Clean up stale headless outputs from previous crashed sessions
-        for stale in list_headless_outputs().unwrap_or_default() {
+        for stale in list_stale_headless_outputs().unwrap_or_default() {
             tracing::warn!(name = %stale, "Removing stale headless output from previous session");
             remove_headless_output(&stale);
         }
 
-        let name = create_headless_output(target_w, target_h)?;
-        let guard = HeadlessOutputGuard::new(name.clone());
+        // Create headless output (guard returned immediately for cleanup on failure)
+        let (name, guard) = create_headless_output(target_w, target_h)?;
 
         // Poll until output is ready (replaces fixed 500ms sleep)
         wait_for_output(&name, Duration::from_secs(5))?;
@@ -332,6 +381,57 @@ fn capture_thread_inner(
     }
 }
 
+/// Maximum consecutive encode failures before falling back to software encoder.
+const MAX_ENCODE_FAILURES: u32 = 5;
+
+/// Poll timeout (ms) for Wayland event dispatch. Controls shutdown responsiveness.
+const POLL_TIMEOUT_MS: i32 = 100;
+
+/// Poll-based Wayland event dispatch with timeout.
+///
+/// Dispatches any already-queued events, then polls the Wayland fd for new events
+/// up to `timeout_ms`. This allows the capture thread to check shutdown conditions
+/// periodically instead of blocking indefinitely in `blocking_dispatch`.
+fn poll_dispatch(
+    event_queue: &mut wayland_client::EventQueue<AppState>,
+    state: &mut AppState,
+    timeout_ms: i32,
+) -> Result<()> {
+    // Dispatch any already-queued events
+    event_queue
+        .dispatch_pending(state)
+        .context("dispatch_pending failed")?;
+
+    // Try to read more events from the Wayland socket
+    if let Some(guard) = event_queue.prepare_read() {
+        let fd = guard.connection_fd();
+        let mut pollfd = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+        if ret > 0 {
+            guard
+                .read()
+                .map_err(|e| anyhow::anyhow!("Wayland read: {}", e))?;
+            event_queue
+                .dispatch_pending(state)
+                .context("dispatch_pending after read")?;
+        } else if ret < 0 {
+            let errno = std::io::Error::last_os_error();
+            if errno.raw_os_error() != Some(libc::EINTR) {
+                bail!("poll failed on Wayland fd: {}", errno);
+            }
+            // EINTR: interrupted by signal, retry next call
+        }
+        // ret == 0: timeout (guard dropped = cancel)
+    }
+    // prepare_read() returned None: events already dispatched above
+
+    Ok(())
+}
+
 /// Common frame processing: EGFX H.264 encoding or bitmap fallback.
 struct FrameProcessor {
     egfx_shared: Option<Arc<EgfxShared>>,
@@ -352,6 +452,8 @@ struct FrameProcessor {
     /// Whether we've sent at least one frame (first frame always sent)
     sent_first_frame: bool,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
+    /// Consecutive encode failure count for runtime VAAPI -> software fallback.
+    encode_failures: u32,
 }
 
 impl FrameProcessor {
@@ -372,6 +474,7 @@ impl FrameProcessor {
             bitrate, quality, fps,
             sent_first_frame: false,
             deferred_resize,
+            encode_failures: 0,
         }
     }
 
@@ -387,7 +490,6 @@ impl FrameProcessor {
         if self.sent_first_frame && !has_damage {
             return true;
         }
-        self.sent_first_frame = true;
 
         let mut sent_via_egfx = false;
         if let Some(shared) = &self.egfx_shared {
@@ -436,18 +538,24 @@ impl FrameProcessor {
             }
 
             if self.egfx_active {
-                if let (Some(handle), Some(sender), Some(encoder)) =
-                    (&self.egfx_handle, &self.egfx_sender, &mut self.h264_encoder)
-                {
-                    if self.egfx_surface_id.is_none() {
+                // Surface initialization (separate borrow scope)
+                if self.egfx_surface_id.is_none() {
+                    if let (Some(handle), Some(sender)) = (&self.egfx_handle, &self.egfx_sender) {
                         if let Some(sid) =
                             EgfxShared::init_surface(handle, sender, self.width as u16, self.height as u16)
                         {
                             self.egfx_surface_id = Some(sid);
                         }
-                    } else if let Some(sid) = self.egfx_surface_id {
-                        match encoder.encode(data) {
-                            Ok(ref h264_data) if h264_data.len() > 32 => {
+                    }
+                }
+
+                // Encode and send (encoder borrow released before fallback check)
+                if let Some(sid) = self.egfx_surface_id {
+                    let encode_result = self.h264_encoder.as_mut().map(|enc| enc.encode(data, self.stride as usize));
+                    match encode_result {
+                        Some(Ok(ref h264_data)) if h264_data.len() > 32 => {
+                            self.encode_failures = 0;
+                            if let (Some(handle), Some(sender)) = (&self.egfx_handle, &self.egfx_sender) {
                                 let timestamp = std::time::SystemTime::now()
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .unwrap_or_default()
@@ -458,8 +566,43 @@ impl FrameProcessor {
                                     h264_data, timestamp, self.quality,
                                 );
                             }
-                            Ok(_) => {}
-                            Err(e) => tracing::warn!("H.264 encode failed: {:#}", e),
+                        }
+                        Some(Ok(_)) => { self.encode_failures = 0; }
+                        Some(Err(e)) => {
+                            self.encode_failures += 1;
+                            tracing::warn!(
+                                failures = self.encode_failures,
+                                max = MAX_ENCODE_FAILURES,
+                                "H.264 encode failed: {:#}", e
+                            );
+                            if let Some(enc) = &mut self.h264_encoder {
+                                enc.force_idr();
+                            }
+                        }
+                        None => {}
+                    }
+
+                    // Dynamic fallback: VAAPI -> software after repeated failures
+                    if self.encode_failures >= MAX_ENCODE_FAILURES
+                        && self.h264_encoder.as_ref().is_some_and(|e| e.is_vaapi())
+                    {
+                        tracing::warn!(
+                            "VA-API encode failed {} consecutive times, switching to software encoder",
+                            self.encode_failures
+                        );
+                        match crate::egfx::FrameEncoder::new_software_only(
+                            self.width, self.height, self.bitrate, self.fps,
+                        ) {
+                            Ok(enc) => {
+                                self.h264_encoder = Some(enc);
+                                self.encode_failures = 0;
+                                self.egfx_surface_id = None; // Force surface re-init
+                            }
+                            Err(e) => {
+                                tracing::error!("Software encoder fallback failed: {:#}", e);
+                                self.h264_encoder = None;
+                                self.egfx_active = false;
+                            }
                         }
                     }
                 }
@@ -467,6 +610,7 @@ impl FrameProcessor {
         }
 
         if sent_via_egfx {
+            self.sent_first_frame = true;
             if let Some(size) = self.deferred_resize.take() {
                 tracing::info!(width = size.width, height = size.height, "Sending deferred resize");
                 let _ = tx.blocking_send(DisplayUpdate::Resize(size));
@@ -477,6 +621,7 @@ impl FrameProcessor {
         // before EGFX causes a bitmap→EGFX transition that breaks rendering
         // on some RDP clients (first connection after server startup).
         if !sent_via_egfx && self.egfx_shared.is_none() {
+            self.sent_first_frame = true;
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0, y: 0,
                 width: NonZeroU16::new(self.width as u16).unwrap(),
@@ -538,9 +683,9 @@ fn capture_loop_ext(
         bail!("invalid buffer dimensions: {}x{}", width, height);
     }
 
-    // Try DMA-BUF path if available (vaapi feature + compositor supports it)
+    // Try DMA-BUF path if available (vaapi feature + compositor supports it + EGFX expected)
     #[cfg(feature = "vaapi")]
-    {
+    if egfx_shared.is_some() {
         if let Some(ref dmabuf_result) = try_setup_dmabuf(state, qh, width, height) {
             match dmabuf_result {
                 Ok(dmabuf_ctx) => {
@@ -551,7 +696,7 @@ fn capture_loop_ext(
                             output_name: output_name.to_string(),
                         }));
                     }
-                    return capture_loop_ext_dmabuf(
+                    match capture_loop_ext_dmabuf(
                         conn,
                         event_queue,
                         state,
@@ -560,12 +705,18 @@ fn capture_loop_ext(
                         width,
                         height,
                         dmabuf_ctx,
-                        egfx_shared,
+                        egfx_shared.clone(),
                         bitrate,
                         quality,
                         fps,
                         deferred_resize,
-                    );
+                    ) {
+                        Ok(()) => return Ok(()),
+                        Err(e) => {
+                            tracing::warn!("DMA-BUF capture failed, falling back to SHM: {:#}", e);
+                            // Fall through to SHM path
+                        }
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("DMA-BUF setup failed, falling back to SHM: {:#}", e);
@@ -577,30 +728,22 @@ fn capture_loop_ext(
     // SHM fallback path
     let shm_format = state.shm_format.unwrap_or(wl_shm::Format::Xrgb8888);
     let stride = width * 4;
-    let buf_size = (stride * height) as usize;
+    let buf_size = (stride as usize)
+        .checked_mul(height as usize)
+        .context("SHM buffer size overflow")?;
+    let buf_size_i32 = i32::try_from(buf_size).context("SHM buffer too large for wl_shm_pool")?;
 
     // Double-buffered SHM: overlap capture and encoding so a capture request
     // is always pending with the compositor, preventing missed presentations.
     let shm_fd_0 = create_shm_fd(buf_size)?;
-    let pool_0 = shm.create_pool(shm_fd_0.as_fd(), buf_size as i32, qh, ());
+    let pool_0 = shm.create_pool(shm_fd_0.as_fd(), buf_size_i32, qh, ());
     let buffer_0 = pool_0.create_buffer(0, width as i32, height as i32, stride as i32, shm_format, qh, ());
-    let mmap_0 = unsafe {
-        libc::mmap(std::ptr::null_mut(), buf_size, libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED, shm_fd_0.as_fd().as_raw_fd(), 0)
-    };
-    if mmap_0 == libc::MAP_FAILED { bail!("mmap failed for buffer 0"); }
+    let mmap_0 = MmapRegion::new(shm_fd_0.as_fd().as_raw_fd(), buf_size)?;
 
     let shm_fd_1 = create_shm_fd(buf_size)?;
-    let pool_1 = shm.create_pool(shm_fd_1.as_fd(), buf_size as i32, qh, ());
+    let pool_1 = shm.create_pool(shm_fd_1.as_fd(), buf_size_i32, qh, ());
     let buffer_1 = pool_1.create_buffer(0, width as i32, height as i32, stride as i32, shm_format, qh, ());
-    let mmap_1 = unsafe {
-        libc::mmap(std::ptr::null_mut(), buf_size, libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED, shm_fd_1.as_fd().as_raw_fd(), 0)
-    };
-    if mmap_1 == libc::MAP_FAILED {
-        unsafe { libc::munmap(mmap_0, buf_size); }
-        bail!("mmap failed for buffer 1");
-    }
+    let mmap_1 = MmapRegion::new(shm_fd_1.as_fd().as_raw_fd(), buf_size)?;
 
     if let Some(tx) = info_tx.take() {
         let _ = tx.send(Ok(CaptureInfo { width, height, output_name: output_name.to_string() }));
@@ -621,7 +764,7 @@ fn capture_loop_ext(
     let mut last_frame_time = Instant::now() - frame_interval;
 
     let buffers = [&buffer_0, &buffer_1];
-    let mmaps = [mmap_0, mmap_1];
+    let mmaps = [&mmap_0, &mmap_1];
     let mut cap_idx: usize = 0;
 
     // Start initial capture into buffer 0
@@ -638,12 +781,15 @@ fn capture_loop_ext(
         if state.tx.is_closed() { break; }
         if state.stopped { tracing::warn!("Capture session stopped by compositor"); break; }
 
-        // Wait for current frame to complete
-        loop {
-            event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
-            if state.frame_ready || state.frame_failed { break; }
+        // Wait for current frame to complete (poll-based for responsive shutdown)
+        while !state.frame_ready && !state.frame_failed {
+            poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
+            if state.tx.is_closed() || state.stopped { break; }
         }
         frame.destroy();
+
+        // Shutdown interrupted the wait — exit cleanly
+        if !state.frame_ready && !state.frame_failed { break; }
 
         // Save completed frame state before starting next capture
         let completed_failed = state.frame_failed;
@@ -666,23 +812,19 @@ fn capture_loop_ext(
         // Process the completed frame while next capture is pending
         if completed_failed { continue; }
 
-        let data = unsafe { std::slice::from_raw_parts(mmaps[completed_idx] as *const u8, buf_size) };
+        let data = mmaps[completed_idx].as_slice();
 
         // Always enforce frame rate limit. Without this, compositor animations
         // (window open, cursor blink) flood the client with 60fps H.264 frames,
         // overwhelming the decoder and building up a decode queue that delays
         // all subsequent frames (including keystroke updates) by seconds.
         let elapsed = last_frame_time.elapsed();
-        if (elapsed >= frame_interval || !proc.sent_first_frame) && has_damage {
+        if !proc.sent_first_frame || (elapsed >= frame_interval && has_damage) {
             last_frame_time = Instant::now();
-            if !proc.process(data, &state.tx, has_damage) { break; }
+            if !proc.process(data, &state.tx, has_damage || !proc.sent_first_frame) { break; }
         }
     }
 
-    unsafe {
-        libc::munmap(mmap_0, buf_size);
-        libc::munmap(mmap_1, buf_size);
-    }
     Ok(())
 }
 
@@ -797,7 +939,7 @@ fn setup_dmabuf_inner(
     let mut dmabuf_infos = Vec::with_capacity(2);
 
     for i in 0..2 {
-        let bo = if !valid_modifiers.is_empty() {
+        let mut bo = if !valid_modifiers.is_empty() {
             GbmBo::create_with_modifiers(&gbm_device, width, height, format, &valid_modifiers)
                 .or_else(|_| GbmBo::create(&gbm_device, width, height, format))
         } else {
@@ -805,11 +947,13 @@ fn setup_dmabuf_inner(
         }
         .with_context(|| format!("failed to allocate GBM buffer {}", i))?;
 
-        let info = bo.dmabuf_info(format, width, height);
+        let info = bo.dmabuf_info(format, width, height)
+            .with_context(|| format!("failed to get DMA-BUF info for buffer {}", i))?;
 
         // Create wl_buffer via linux-dmabuf
         let params = linux_dmabuf.create_params(qh, ());
-        let fd = bo.fd();
+        let fd = bo.fd()
+            .with_context(|| format!("failed to get fd for buffer {}", i))?;
         let stride = bo.stride();
         let offset = bo.offset(0);
         let modifier = bo.modifier();
@@ -912,6 +1056,7 @@ fn capture_loop_ext_dmabuf(
     let mut egfx_active = false;
     let mut egfx_ready = false;
     let mut egfx_generation: u32 = 0;
+    let mut encode_failures: u32 = 0;
 
     // Start initial capture
     let mut frame = session.create_frame(qh, ());
@@ -927,12 +1072,15 @@ fn capture_loop_ext_dmabuf(
         if state.tx.is_closed() { break; }
         if state.stopped { tracing::warn!("Capture session stopped by compositor"); break; }
 
-        // Wait for current frame to complete
-        loop {
-            event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
-            if state.frame_ready || state.frame_failed { break; }
+        // Wait for current frame to complete (poll-based for responsive shutdown)
+        while !state.frame_ready && !state.frame_failed {
+            poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
+            if state.tx.is_closed() || state.stopped { break; }
         }
         frame.destroy();
+
+        // Shutdown interrupted the wait — exit cleanly
+        if !state.frame_ready && !state.frame_failed { break; }
 
         let completed_failed = state.frame_failed;
         let completed_idx = cap_idx;
@@ -953,9 +1101,8 @@ fn capture_loop_ext_dmabuf(
 
         // Rate limit
         let elapsed = last_frame_time.elapsed();
-        if (!sent_first_frame || elapsed >= frame_interval) && has_damage {
+        if !sent_first_frame || (elapsed >= frame_interval && has_damage) {
             // Process via DMA-BUF zero-copy pipeline
-            sent_first_frame = true;
             last_frame_time = Instant::now();
 
             // Update EGFX state
@@ -971,6 +1118,7 @@ fn capture_loop_ext_dmabuf(
                         egfx_sender = None;
                         egfx_surface_id = None;
                         h264_encoder = None;
+                        encode_failures = 0;
                     }
                 }
 
@@ -978,6 +1126,7 @@ fn capture_loop_ext_dmabuf(
                     egfx_generation = gen;
                     egfx_surface_id = None;
                     h264_encoder = None;
+                    encode_failures = 0;
                     if ready {
                         match crate::egfx::FrameEncoder::new(width, height, bitrate, fps) {
                             Ok(enc) => {
@@ -989,7 +1138,11 @@ fn capture_loop_ext_dmabuf(
                                 );
                                 h264_encoder = Some(enc);
                             }
-                            Err(e) => tracing::warn!("Failed to initialize H.264 encoder: {:#}", e),
+                            Err(e) => {
+                                // DMA-BUF path requires a working encoder; bail to SHM fallback
+                                frame.destroy();
+                                bail!("H.264 encoder init failed in DMA-BUF mode, falling back to SHM: {:#}", e);
+                            }
                         }
                     }
                 }
@@ -1004,61 +1157,82 @@ fn capture_loop_ext_dmabuf(
                 }
 
                 if egfx_active {
-                    if let (Some(handle), Some(sender), Some(encoder)) =
-                        (&egfx_handle, &egfx_sender, &mut h264_encoder)
-                    {
-                        if egfx_surface_id.is_none() {
+                    // Surface initialization (separate borrow scope)
+                    if egfx_surface_id.is_none() {
+                        if let (Some(handle), Some(sender)) = (&egfx_handle, &egfx_sender) {
                             egfx_surface_id = EgfxShared::init_surface(
-                                handle,
-                                sender,
-                                width as u16,
-                                height as u16,
+                                handle, sender, width as u16, height as u16,
                             );
-                        } else if let Some(sid) = egfx_surface_id {
-                            // Zero-copy encode pipeline:
-                            // 1. VPP: XRGB DMA-BUF -> NV12 (GPU)
-                            // 2. Encoder: NV12 DMA-BUF -> H.264 (GPU)
-                            match dmabuf_ctx.vpp.convert(completed_idx) {
-                                Ok(()) => {
-                                    let nv12 = &dmabuf_ctx.nv12_info;
-                                    match encoder.encode_dmabuf(
-                                        nv12.fd,
-                                        nv12.width,
-                                        nv12.height,
-                                        nv12.stride,
-                                        nv12.offset,
-                                        nv12.modifier,
-                                    ) {
-                                        Ok(ref h264_data) if h264_data.len() > 32 => {
-                                            let timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis()
-                                                as u32;
-                                            let sent = EgfxShared::send_frame(
-                                                handle, sender, sid,
-                                                width as u16, height as u16,
-                                                h264_data, timestamp, quality,
+                        }
+                    }
+
+                    if let Some(sid) = egfx_surface_id {
+                        // Zero-copy encode pipeline:
+                        // 1. VPP: XRGB DMA-BUF -> NV12 (GPU)
+                        // 2. Encoder: NV12 DMA-BUF -> H.264 (GPU)
+                        let vpp_result = dmabuf_ctx.vpp.convert(completed_idx);
+                        let encode_result = match vpp_result {
+                            Ok(()) => {
+                                let nv12 = &dmabuf_ctx.nv12_info;
+                                h264_encoder.as_mut().map(|enc| enc.encode_dmabuf(
+                                    nv12.fd, nv12.width, nv12.height,
+                                    nv12.stride, nv12.offset, nv12.modifier,
+                                    nv12.uv_stride, nv12.uv_offset,
+                                ))
+                            }
+                            Err(e) => Some(Err(e)),
+                        };
+
+                        match encode_result {
+                            Some(Ok(ref h264_data)) if h264_data.len() > 32 => {
+                                encode_failures = 0;
+                                if let (Some(handle), Some(sender)) = (&egfx_handle, &egfx_sender) {
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis() as u32;
+                                    let sent = EgfxShared::send_frame(
+                                        handle, sender, sid,
+                                        width as u16, height as u16,
+                                        h264_data, timestamp, quality,
+                                    );
+                                    if sent {
+                                        sent_first_frame = true;
+                                        if let Some(size) = deferred_resize.take() {
+                                            tracing::info!(
+                                                width = size.width,
+                                                height = size.height,
+                                                "Sending deferred resize"
                                             );
-                                            if sent {
-                                                if let Some(size) = deferred_resize.take() {
-                                                    tracing::info!(
-                                                        width = size.width,
-                                                        height = size.height,
-                                                        "Sending deferred resize"
-                                                    );
-                                                    let _ = state
-                                                        .tx
-                                                        .blocking_send(DisplayUpdate::Resize(size));
-                                                }
-                                            }
+                                            let _ = state
+                                                .tx
+                                                .blocking_send(DisplayUpdate::Resize(size));
                                         }
-                                        Ok(_) => {}
-                                        Err(e) => tracing::warn!("H.264 encode (dmabuf) failed: {:#}", e),
                                     }
                                 }
-                                Err(e) => tracing::warn!("VPP convert failed: {:#}", e),
                             }
+                            Some(Ok(_)) => { encode_failures = 0; }
+                            Some(Err(e)) => {
+                                encode_failures += 1;
+                                tracing::warn!(
+                                    failures = encode_failures,
+                                    max = MAX_ENCODE_FAILURES,
+                                    "DMA-BUF encode pipeline failed: {:#}", e
+                                );
+                                if let Some(enc) = &mut h264_encoder {
+                                    enc.force_idr();
+                                }
+                                if encode_failures >= MAX_ENCODE_FAILURES {
+                                    // Destroy the in-flight frame before dropping DMA-BUF resources
+                                    frame.destroy();
+                                    bail!(
+                                        "VA-API encode failed {} consecutive times in DMA-BUF mode, \
+                                         falling back to SHM",
+                                        encode_failures
+                                    );
+                                }
+                            }
+                            None => {}
                         }
                     }
                 }
@@ -1092,14 +1266,18 @@ fn capture_loop_wlr(
     state.buffer_height = 0;
     state.frame_ready = false;
     state.frame_failed = false;
+    conn.flush().context("Wayland flush failed")?;
 
     // Wait for buffer info events
+    let probe_start = Instant::now();
+    let probe_timeout = Duration::from_secs(5);
     loop {
-        event_queue.blocking_dispatch(state).context("Wayland dispatch (wlr probe) failed")?;
-        // buffer events arrive before buffer_done; we get ready/failed only after copy()
-        // Just wait until we have dimensions
+        poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
         if state.buffer_width > 0 && state.buffer_height > 0 {
             break;
+        }
+        if probe_start.elapsed() >= probe_timeout {
+            bail!("timed out waiting for wlr-screencopy buffer info after {}s", probe_timeout.as_secs());
         }
     }
     probe.destroy();
@@ -1108,30 +1286,22 @@ fn capture_loop_wlr(
     let height = state.buffer_height;
     let shm_format = state.shm_format.unwrap_or(wl_shm::Format::Xrgb8888);
     let stride = if state.wlr_stride > 0 { state.wlr_stride } else { width * 4 };
-    let buf_size = (stride * height) as usize;
+    let buf_size = (stride as usize)
+        .checked_mul(height as usize)
+        .context("SHM buffer size overflow")?;
+    let buf_size_i32 = i32::try_from(buf_size).context("SHM buffer too large for wl_shm_pool")?;
 
     // Double-buffered SHM: overlap capture and encoding so a capture request
     // is always pending with the compositor, preventing missed presentations.
     let shm_fd_0 = create_shm_fd(buf_size)?;
-    let pool_0 = shm.create_pool(shm_fd_0.as_fd(), buf_size as i32, qh, ());
+    let pool_0 = shm.create_pool(shm_fd_0.as_fd(), buf_size_i32, qh, ());
     let buffer_0 = pool_0.create_buffer(0, width as i32, height as i32, stride as i32, shm_format, qh, ());
-    let mmap_0 = unsafe {
-        libc::mmap(std::ptr::null_mut(), buf_size, libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED, shm_fd_0.as_fd().as_raw_fd(), 0)
-    };
-    if mmap_0 == libc::MAP_FAILED { bail!("mmap failed for buffer 0"); }
+    let mmap_0 = MmapRegion::new(shm_fd_0.as_fd().as_raw_fd(), buf_size)?;
 
     let shm_fd_1 = create_shm_fd(buf_size)?;
-    let pool_1 = shm.create_pool(shm_fd_1.as_fd(), buf_size as i32, qh, ());
+    let pool_1 = shm.create_pool(shm_fd_1.as_fd(), buf_size_i32, qh, ());
     let buffer_1 = pool_1.create_buffer(0, width as i32, height as i32, stride as i32, shm_format, qh, ());
-    let mmap_1 = unsafe {
-        libc::mmap(std::ptr::null_mut(), buf_size, libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED, shm_fd_1.as_fd().as_raw_fd(), 0)
-    };
-    if mmap_1 == libc::MAP_FAILED {
-        unsafe { libc::munmap(mmap_0, buf_size); }
-        bail!("mmap failed for buffer 1");
-    }
+    let mmap_1 = MmapRegion::new(shm_fd_1.as_fd().as_raw_fd(), buf_size)?;
 
     if let Some(tx) = info_tx.take() {
         let _ = tx.send(Ok(CaptureInfo { width, height, output_name: output_name.to_string() }));
@@ -1152,7 +1322,7 @@ fn capture_loop_wlr(
     let mut last_frame_time = Instant::now() - frame_interval;
 
     let buffers = [&buffer_0, &buffer_1];
-    let mmaps = [mmap_0, mmap_1];
+    let mmaps = [&mmap_0, &mmap_1];
     let mut cap_idx: usize = 0;
 
     // Start initial capture into buffer 0
@@ -1160,15 +1330,17 @@ fn capture_loop_wlr(
     state.frame_ready = false;
     state.frame_failed = false;
     state.damage_regions.clear();
+    state.buffer_width = 0; // Reset so we wait for this frame's buffer events
+    conn.flush().context("Wayland flush failed")?;
     let mut buffer_sent = false;
-    loop {
-        event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
+    while !state.frame_ready && !state.frame_failed {
+        poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
         if !buffer_sent && state.buffer_width > 0 {
             frame.copy_with_damage(buffers[cap_idx]);
             conn.flush().context("Wayland flush failed")?;
             buffer_sent = true;
         }
-        if state.frame_ready || state.frame_failed { break; }
+        if state.tx.is_closed() || state.stopped { break; }
     }
 
     loop {
@@ -1179,6 +1351,7 @@ fn capture_loop_wlr(
         frame.destroy();
 
         if state.tx.is_closed() { break; }
+        if !state.frame_ready && !state.frame_failed { break; } // shutdown interrupted
 
         // Start NEXT capture immediately into the other buffer.
         cap_idx = 1 - cap_idx;
@@ -1186,34 +1359,47 @@ fn capture_loop_wlr(
         state.frame_failed = false;
         state.damage_regions.clear();
         frame = screencopy_mgr.capture_output(0, output, qh, ());
+        state.buffer_width = 0; // Reset so we wait for this frame's buffer events
+        conn.flush().context("Wayland flush failed")?;
         buffer_sent = false;
 
         // Process the completed frame while waiting for next buffer info + capture
         if !completed_failed {
-            let data = unsafe { std::slice::from_raw_parts(mmaps[completed_idx] as *const u8, buf_size) };
+            let data = mmaps[completed_idx].as_slice();
             let elapsed = last_frame_time.elapsed();
-            if (elapsed >= frame_interval || !proc.sent_first_frame) && has_damage {
+            if !proc.sent_first_frame || (elapsed >= frame_interval && has_damage) {
                 last_frame_time = Instant::now();
-                if !proc.process(data, &state.tx, has_damage) { break; }
+                if !proc.process(data, &state.tx, has_damage || !proc.sent_first_frame) { break; }
             }
         }
 
-        // Wait for next frame to complete (send buffer when ready)
-        loop {
-            event_queue.blocking_dispatch(state).context("Wayland dispatch failed")?;
+        // Wait for next frame to complete (poll-based for responsive shutdown)
+        while !state.frame_ready && !state.frame_failed {
+            poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
             if !buffer_sent && state.buffer_width > 0 {
+                // Detect compositor buffer renegotiation (dimensions, stride, or format)
+                let new_stride = if state.wlr_stride > 0 { state.wlr_stride } else { state.buffer_width * 4 };
+                if state.buffer_width != width
+                    || state.buffer_height != height
+                    || new_stride != stride
+                    || state.shm_format.unwrap_or(wl_shm::Format::Xrgb8888) != shm_format
+                {
+                    tracing::warn!(
+                        old_w = width, old_h = height,
+                        new_w = state.buffer_width, new_h = state.buffer_height,
+                        "WLR: compositor changed buffer parameters, restarting capture"
+                    );
+                    frame.destroy();
+                    bail!("WLR buffer parameters changed, restarting capture");
+                }
                 frame.copy_with_damage(buffers[cap_idx]);
                 conn.flush().context("Wayland flush failed")?;
                 buffer_sent = true;
             }
-            if state.frame_ready || state.frame_failed { break; }
+            if state.tx.is_closed() || state.stopped { break; }
         }
     }
 
-    unsafe {
-        libc::munmap(mmap_0, buf_size);
-        libc::munmap(mmap_1, buf_size);
-    }
     Ok(())
 }
 
@@ -1543,36 +1729,3 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for AppStat
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parse_headless_outputs;
-
-    #[test]
-    fn parses_headless_output_names() {
-        let json = br#"
-            [
-                {"name":"DP-1"},
-                {"name":"HEADLESS-2"},
-                {"name":"HEADLESS-3"}
-            ]
-        "#;
-
-        let names = parse_headless_outputs(json).unwrap();
-
-        assert_eq!(names, vec!["HEADLESS-2", "HEADLESS-3"]);
-    }
-
-    #[test]
-    fn ignores_non_headless_outputs() {
-        let json = br#"
-            [
-                {"name":"DP-1"},
-                {"name":"HDMI-A-1"}
-            ]
-        "#;
-
-        let names = parse_headless_outputs(json).unwrap();
-
-        assert!(names.is_empty());
-    }
-}

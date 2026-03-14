@@ -535,11 +535,15 @@ fn generate_xkb_keymap() -> Result<Vec<u8>> {
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
     .context("Failed to compile XKB keymap from system defaults")?;
-    let keymap_data = keymap
+    let mut keymap_data = keymap
         .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
         .into_bytes();
     if keymap_data.is_empty() {
         bail!("XKB keymap generation returned empty string");
+    }
+    // XKB v1 format requires NUL-terminated string
+    if keymap_data.last() != Some(&0) {
+        keymap_data.push(0);
     }
     Ok(keymap_data)
 }
@@ -560,7 +564,9 @@ fn create_keymap_fd(keymap: &[u8]) -> Result<OwnedFd> {
         bail!("failed to write keymap");
     }
     // Seek back to beginning so compositor can read from start
-    unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) };
+    if unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_SET) } < 0 {
+        bail!("lseek failed on keymap memfd");
+    }
     Ok(fd)
 }
 

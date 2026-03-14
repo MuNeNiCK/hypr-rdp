@@ -2,7 +2,7 @@
 //!
 //! Raw FFI to libgbm.so with RAII wrappers for zero-copy screen capture.
 
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{bail, Result};
@@ -66,19 +66,20 @@ pub struct DmaBufInfo {
     pub format: u32,
     pub width: u32,
     pub height: u32,
+    pub uv_stride: u32,
+    pub uv_offset: u32,
 }
 
 /// RAII wrapper around `gbm_device*`.
 pub struct GbmDevice {
     ptr: *mut gbm_device,
-    _drm_fd: RawFd, // keep alive
+    _drm_fd: OwnedFd,
 }
 
 impl GbmDevice {
-    /// Create a GBM device from an open DRM device fd.
-    /// The fd must remain open for the lifetime of the device.
-    pub fn new(drm_fd: RawFd) -> Result<Self> {
-        let ptr = unsafe { gbm_create_device(drm_fd) };
+    pub fn new(drm_fd: OwnedFd) -> Result<Self> {
+        use std::os::unix::io::AsRawFd;
+        let ptr = unsafe { gbm_create_device(drm_fd.as_raw_fd()) };
         if ptr.is_null() {
             bail!("gbm_create_device failed");
         }
@@ -104,6 +105,7 @@ impl Drop for GbmDevice {
 /// RAII wrapper around `gbm_bo*`.
 pub struct GbmBo {
     ptr: *mut gbm_bo,
+    cached_fd: Option<OwnedFd>,
 }
 
 impl GbmBo {
@@ -133,7 +135,7 @@ impl GbmBo {
                 format
             );
         }
-        Ok(Self { ptr })
+        Ok(Self { ptr, cached_fd: None })
     }
 
     /// Allocate a buffer object without modifiers (fallback).
@@ -148,11 +150,22 @@ impl GbmBo {
                 format
             );
         }
-        Ok(Self { ptr })
+        Ok(Self { ptr, cached_fd: None })
     }
 
-    pub fn fd(&self) -> RawFd {
-        unsafe { gbm_bo_get_fd(self.ptr) }
+    pub fn fd(&mut self) -> Result<RawFd> {
+        use std::os::unix::io::AsRawFd;
+        if let Some(ref fd) = self.cached_fd {
+            return Ok(fd.as_raw_fd());
+        }
+        let raw = unsafe { gbm_bo_get_fd(self.ptr) };
+        if raw < 0 {
+            bail!("gbm_bo_get_fd failed");
+        }
+        let owned = unsafe { OwnedFd::from_raw_fd(raw) };
+        let raw = owned.as_raw_fd();
+        self.cached_fd = Some(owned);
+        Ok(raw)
     }
 
     pub fn stride(&self) -> u32 {
@@ -183,16 +196,18 @@ impl GbmBo {
     }
 
     /// Get DMA-BUF info for this buffer object.
-    pub fn dmabuf_info(&self, format: u32, width: u32, height: u32) -> DmaBufInfo {
-        DmaBufInfo {
-            fd: self.fd(),
+    pub fn dmabuf_info(&mut self, format: u32, width: u32, height: u32) -> Result<DmaBufInfo> {
+        Ok(DmaBufInfo {
+            fd: self.fd()?,
             stride: self.stride(),
             offset: self.offset(0),
             modifier: self.modifier(),
             format,
             width,
             height,
-        }
+            uv_stride: 0,
+            uv_offset: 0,
+        })
     }
 }
 
@@ -219,11 +234,10 @@ pub fn drm_device_from_devt(dev: libc::dev_t) -> Option<std::path::PathBuf> {
 }
 
 /// Open a DRM device fd from a path.
-pub fn open_drm_device(path: &Path) -> Result<RawFd> {
-    use std::os::unix::io::IntoRawFd;
+pub fn open_drm_device(path: &Path) -> Result<OwnedFd> {
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(path)?;
-    Ok(file.into_raw_fd())
+    Ok(OwnedFd::from(file))
 }
