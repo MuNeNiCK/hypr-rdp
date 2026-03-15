@@ -34,6 +34,8 @@ build() {
     cd "$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
+    # aws-lc-sys: use C fallback instead of Go/NASM assembly
+    export AWS_LC_SYS_NO_ASM=1
     cargo build --frozen --release
 }
 
