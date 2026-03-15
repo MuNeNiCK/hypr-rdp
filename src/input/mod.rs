@@ -263,6 +263,14 @@ impl HyprInputHandler {
             (),
         );
 
+        // Release all wl_output proxies — they were only needed to find the
+        // target output for create_virtual_pointer_with_output. Keeping them
+        // alive would require dispatching their events; without that, the
+        // compositor's send buffer fills up and blocks the event loop.
+        for (output, _) in wl_state.outputs.drain(..) {
+            output.release();
+        }
+
         let (keymap_data, keymap_source) = load_keymap(&mut event_queue, &mut wl_state, &seat, &qh)
             .or_else(|err| {
                 tracing::warn!(
