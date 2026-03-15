@@ -14,7 +14,7 @@ use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "hypr-rdp", about = "Native RDP server for Hyprland")]
+#[command(name = "hypr-rdp", version, about = "Native RDP server for Hyprland")]
 struct Args {
     /// Address to bind the RDP server
     #[arg(short, long)]

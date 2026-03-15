@@ -598,11 +598,11 @@ impl FrameProcessor {
             self.sent_first_frame = true;
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0, y: 0,
-                width: NonZeroU16::new(self.width as u16).unwrap(),
-                height: NonZeroU16::new(self.height as u16).unwrap(),
+                width: NonZeroU16::new(self.width as u16).expect("width is non-zero"),
+                height: NonZeroU16::new(self.height as u16).expect("height is non-zero"),
                 format: self.pixel_format,
                 data: Bytes::copy_from_slice(data),
-                stride: NonZeroUsize::new(self.stride as usize).unwrap(),
+                stride: NonZeroUsize::new(self.stride as usize).expect("stride is non-zero"),
             });
             if tx.blocking_send(update).is_err() {
                 tracing::info!("Display update channel closed");

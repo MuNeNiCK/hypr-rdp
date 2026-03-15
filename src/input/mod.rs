@@ -498,18 +498,24 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.flush();
             }
             MouseEvent::VerticalScroll { value } => {
+                let discrete = (value as f64 / 120.0).round() as i32;
+                let continuous = discrete as f64 * 15.0;
                 state.vp.axis_source(AxisSource::Wheel);
-                state.vp.axis(t, Axis::VerticalScroll, (value as f64 / 120.0) * 15.0);
+                state.vp.axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
                 state.vp.frame();
                 state.flush();
             }
             MouseEvent::Scroll { x, y } => {
                 state.vp.axis_source(AxisSource::Wheel);
                 if y != 0 {
-                    state.vp.axis(t, Axis::VerticalScroll, (y as f64 / 120.0) * 15.0);
+                    let discrete = (y as f64 / 120.0).round() as i32;
+                    let continuous = discrete as f64 * 15.0;
+                    state.vp.axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
                 }
                 if x != 0 {
-                    state.vp.axis(t, Axis::HorizontalScroll, (x as f64 / 120.0) * 15.0);
+                    let discrete = (x as f64 / 120.0).round() as i32;
+                    let continuous = discrete as f64 * 15.0;
+                    state.vp.axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
                 }
                 state.vp.frame();
                 state.flush();

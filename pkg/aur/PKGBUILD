@@ -1,0 +1,43 @@
+# Maintainer: munenick <https://github.com/MuNeNICK>
+pkgname=hypr-rdp
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native RDP server for Hyprland"
+arch=('x86_64')
+url="https://github.com/MuNeNICK/hypr-rdp"
+license=('MIT')
+depends=(
+    'libxkbcommon'
+    'libva'
+    'pipewire'
+)
+makedepends=(
+    'cargo'
+)
+optdepends=(
+    'openh264: software H.264 encoding fallback'
+    'intel-media-driver: VA-API hardware encoding for Intel GPUs'
+    'libva-mesa-driver: VA-API hardware encoding for AMD GPUs'
+)
+source=("$pkgname-$pkgver.tar.gz::https://github.com/MuNeNICK/hypr-rdp/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP') # Update after first release
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 "target/release/hypr-rdp" "$pkgdir/usr/bin/hypr-rdp"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+}

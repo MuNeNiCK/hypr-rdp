@@ -118,7 +118,7 @@ impl HyprDisplay {
             output,
             pending_resize: false,
             deferred_resize: None,
-            headless_guard: headless_guard,
+            headless_guard,
         })
     }
 }

@@ -22,7 +22,7 @@ pub struct H264Encoder {
 
 impl H264Encoder {
     pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
         }
 

@@ -144,7 +144,7 @@ pub struct VaapiEncoder {
 
 impl VaapiEncoder {
     pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
-        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+        if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
         }
 
@@ -269,7 +269,7 @@ impl VaapiEncoder {
     }
 
     pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
-        let is_idr = self.force_idr || self.frame_count % IDR_INTERVAL as u64 == 0;
+        let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
 
         let input_idx = self.current_input_surface;
         self.current_input_surface = (self.current_input_surface + 1) % self.input_surfaces.len();
@@ -497,8 +497,9 @@ impl VaapiEncoder {
             self.dmabuf_input_surface = Some(surface);
         }
 
-        let dmabuf_surface = self.dmabuf_input_surface.as_ref().unwrap();
-        let is_idr = self.force_idr || self.frame_count % IDR_INTERVAL as u64 == 0;
+        let dmabuf_surface = self.dmabuf_input_surface.as_ref()
+            .expect("dmabuf_input_surface must be set before encode");
+        let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
 
         let recon_idx = self.current_recon_surface;
         self.current_recon_surface = (self.current_recon_surface + 1) % self.recon_surfaces.len();
