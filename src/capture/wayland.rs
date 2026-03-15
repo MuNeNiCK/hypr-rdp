@@ -73,7 +73,7 @@ pub struct CaptureInfo {
     pub output_name: String,
 }
 
-struct HeadlessOutputGuard {
+pub(crate) struct HeadlessOutputGuard {
     name: Option<String>,
 }
 
@@ -94,7 +94,7 @@ impl Drop for HeadlessOutputGuard {
 const HEADLESS_PREFIX: &str = "hypr-rdp";
 
 /// List headless outputs created by hypr-rdp (name starts with "hypr-rdp-").
-fn list_stale_headless_outputs() -> Result<Vec<String>> {
+pub(crate) fn list_stale_headless_outputs() -> Result<Vec<String>> {
     let monitors = crate::hyprland::monitors()?;
     let arr = monitors.as_array().context("expected monitors array")?;
     Ok(arr
@@ -110,7 +110,7 @@ fn list_stale_headless_outputs() -> Result<Vec<String>> {
 /// Returns the output name and RAII guard that removes it on drop.
 /// The guard is created immediately after the output appears so that
 /// any subsequent failure (e.g., keyword_monitor) cleans up automatically.
-fn create_headless_output(width: u32, height: u32) -> Result<(String, HeadlessOutputGuard)> {
+pub(crate) fn create_headless_output(width: u32, height: u32) -> Result<(String, HeadlessOutputGuard)> {
     // Subscribe to events BEFORE creating the output to catch monitoradded.
     // The ensure_registered() roundtrip guarantees Hyprland has accept()'ed
     // our socket2 connection before we trigger the creation.
@@ -145,7 +145,7 @@ fn create_headless_output(width: u32, height: u32) -> Result<(String, HeadlessOu
 }
 
 /// Remove a headless output from Hyprland.
-fn remove_headless_output(name: &str) {
+pub(crate) fn remove_headless_output(name: &str) {
     match crate::hyprland::output_remove(name) {
         Ok(()) => {
             tracing::info!(name, "Removed headless output");
@@ -157,7 +157,7 @@ fn remove_headless_output(name: &str) {
 }
 
 /// Wait for a Hyprland output to be ready (has non-zero dimensions).
-fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()> {
+pub(crate) fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()> {
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
 
@@ -201,18 +201,18 @@ fn verify_output_exists(output_name: &str) -> Result<()> {
 }
 
 /// Start screen capture on a background thread.
-/// If `output` is Some, captures that output directly; otherwise creates a headless output.
+/// Start capture on the given output name.
+/// The caller is responsible for creating/managing the headless output.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_capture(
     tx: mpsc::Sender<DisplayUpdate>,
-    target_resolution: (u32, u32),
     capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
     bitrate: u32,
     quality: u8,
     fps: u32,
-    output: Option<String>,
+    output_name: String,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<CaptureInfo> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
@@ -223,14 +223,13 @@ pub async fn start_capture(
             if let Err(e) = capture_thread(
                 tx,
                 info_tx,
-                target_resolution,
                 capture_mode,
                 egfx_shared,
                 output_layout,
                 bitrate,
                 quality,
                 fps,
-                output,
+                output_name,
                 deferred_resize,
             ) {
                 tracing::error!("Capture thread error: {:#}", e);
@@ -244,28 +243,26 @@ pub async fn start_capture(
 fn capture_thread(
     tx: mpsc::Sender<DisplayUpdate>,
     info_tx: tokio::sync::oneshot::Sender<Result<CaptureInfo>>,
-    target_resolution: (u32, u32),
     capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
     bitrate: u32,
     quality: u8,
     fps: u32,
-    output: Option<String>,
+    output_name: String,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<()> {
     let mut info_tx = Some(info_tx);
     let result = capture_thread_inner(
         tx,
         &mut info_tx,
-        target_resolution,
         capture_mode,
         egfx_shared,
         output_layout,
         bitrate,
         quality,
         fps,
-        output,
+        output_name,
         deferred_resize,
     );
     if let Err(err) = result {
@@ -294,39 +291,16 @@ fn create_shm_fd(size: usize) -> Result<OwnedFd> {
 fn capture_thread_inner(
     tx: mpsc::Sender<DisplayUpdate>,
     info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
-    target_resolution: (u32, u32),
     capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
     bitrate: u32,
     quality: u8,
     fps: u32,
-    output: Option<String>,
+    output_name: String,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
 ) -> Result<()> {
-    let (target_w, target_h) = target_resolution;
-
-    // Determine output to capture
-    let (output_name, _output_guard) = if let Some(ref name) = output {
-        // Capture a real output directly
-        verify_output_exists(name)?;
-        tracing::info!(output = %name, "Capturing existing output");
-        (name.clone(), None)
-    } else {
-        // Clean up stale headless outputs from previous crashed sessions
-        for stale in list_stale_headless_outputs().unwrap_or_default() {
-            tracing::warn!(name = %stale, "Removing stale headless output from previous session");
-            remove_headless_output(&stale);
-        }
-
-        // Create headless output (guard returned immediately for cleanup on failure)
-        let (name, guard) = create_headless_output(target_w, target_h)?;
-
-        // Poll until output is ready (replaces fixed 500ms sleep)
-        wait_for_output(&name, Duration::from_secs(5))?;
-
-        (name, Some(guard))
-    };
+    verify_output_exists(&output_name)?;
 
     output_layout
         .update_from_output(&output_name)

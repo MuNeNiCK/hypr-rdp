@@ -3,8 +3,9 @@ pub mod dmabuf;
 mod wayland;
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
@@ -12,6 +13,8 @@ use tokio::sync::mpsc;
 
 use crate::egfx::EgfxShared;
 use crate::input::SharedOutputLayout;
+
+pub(crate) use wayland::HeadlessOutputGuard;
 
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureMode {
@@ -38,6 +41,9 @@ pub struct HyprDisplay {
     output: Option<String>,
     pending_resize: bool,
     deferred_resize: Option<(u32, u32)>,
+    /// Keeps the headless output alive for the lifetime of the server.
+    /// Dropped only when HyprDisplay itself is dropped (server shutdown).
+    headless_guard: Option<HeadlessOutputGuard>,
 }
 
 impl HyprDisplay {
@@ -58,16 +64,30 @@ impl HyprDisplay {
     ) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
 
+        // Create or verify output before starting capture
+        let (output_name, headless_guard) = if let Some(ref name) = output {
+            (name.clone(), None)
+        } else {
+            // Clean up stale headless outputs from previous crashed sessions
+            for stale in wayland::list_stale_headless_outputs().unwrap_or_default() {
+                tracing::warn!(name = %stale, "Removing stale headless output from previous session");
+                wayland::remove_headless_output(&stale);
+            }
+
+            let (name, guard) = wayland::create_headless_output(resolution.0, resolution.1)?;
+            wayland::wait_for_output(&name, Duration::from_secs(5))?;
+            (name, Some(guard))
+        };
+
         let capture_info = wayland::start_capture(
             tx.clone(),
-            resolution,
             capture_mode,
             None,
             Arc::clone(&output_layout),
             bitrate,
             quality,
             fps,
-            output.clone(),
+            output_name.clone(),
             None,
         )
         .await?;
@@ -98,6 +118,7 @@ impl HyprDisplay {
             output,
             pending_resize: false,
             deferred_resize: None,
+            headless_guard: headless_guard,
         })
     }
 }
@@ -186,6 +207,18 @@ impl RdpServerDisplay for HyprDisplay {
             self.width = w as u16;
             self.height = h as u16;
             self.pending_resize = true;
+
+            // Resize the existing headless output
+            if self.headless_guard.is_some() {
+                let mode = format!("{}x{}@60", w, h);
+                let rule = format!("{},{},{}x0,1", self.output_name, mode, -9999);
+                if let Err(e) = crate::hyprland::keyword_monitor(&rule) {
+                    tracing::warn!("Failed to resize headless output: {}", e);
+                }
+                wayland::wait_for_output(&self.output_name, Duration::from_secs(5))
+                    .context("headless output not ready after resize")?;
+            }
+
             Some(DesktopSize { width: w as u16, height: h as u16 })
         } else {
             None
@@ -193,14 +226,13 @@ impl RdpServerDisplay for HyprDisplay {
 
         let capture_info = wayland::start_capture(
             tx,
-            self.resolution,
             self.capture_mode,
             self.egfx_shared.clone(),
             Arc::clone(&self.output_layout),
             self.bitrate,
             self.quality,
             self.fps,
-            self.output.clone(),
+            self.output_name.clone(),
             deferred,
         )
         .await?;
