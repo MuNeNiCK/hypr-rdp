@@ -91,10 +91,46 @@ pub async fn run(
         }));
     }
 
+    // Custom accept loop: when a new connection arrives while one is active,
+    // cancel the current session and switch to the new client.
+    // ironrdp-server's run() processes connections sequentially, blocking new
+    // clients until the current one disconnects.
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .context("failed to bind RDP port")?;
     tracing::info!("RDP server listening on {}", addr);
-    server.run().await.context("RDP server error")?;
 
-    Ok(())
+    let mut pending: Option<tokio::net::TcpStream> = None;
+
+    loop {
+        let stream = match pending.take() {
+            Some(s) => s,
+            None => {
+                let (s, peer) = listener.accept().await.context("accept failed")?;
+                tracing::info!(%peer, "RDP connection accepted");
+                s
+            }
+        };
+
+        tokio::select! {
+            result = server.run_connection(stream) => {
+                if let Err(e) = result {
+                    tracing::error!(error = %e, "Connection error");
+                }
+            }
+            accept_result = listener.accept() => {
+                match accept_result {
+                    Ok((new_stream, new_peer)) => {
+                        tracing::info!(%new_peer, "New connection, replacing current session");
+                        pending = Some(new_stream);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "Accept error");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Auto-generate a self-signed TLS certificate and persist it.
