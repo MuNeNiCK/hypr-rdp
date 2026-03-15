@@ -1485,6 +1485,7 @@ dependencies = [
  "openh264",
  "pipewire",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",

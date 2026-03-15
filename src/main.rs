@@ -116,6 +116,11 @@ impl Config {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install rustls CryptoProvider before any TLS operations.
+    // Both ring and aws-lc-rs features are enabled (via transitive deps),
+    // so rustls cannot auto-select — we must choose explicitly.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hypr_rdp=info")))
         .init();
