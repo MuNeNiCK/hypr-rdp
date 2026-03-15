@@ -498,7 +498,8 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.flush();
             }
             MouseEvent::VerticalScroll { value } => {
-                let discrete = (value as f64 / 120.0).round() as i32;
+                // Negate: RDP positive=up, Wayland positive=down
+                let discrete = -((value as f64 / 120.0).round() as i32);
                 let continuous = discrete as f64 * 15.0;
                 state.vp.axis_source(AxisSource::Wheel);
                 state.vp.axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
@@ -508,12 +509,12 @@ impl RdpServerInputHandler for HyprInputHandler {
             MouseEvent::Scroll { x, y } => {
                 state.vp.axis_source(AxisSource::Wheel);
                 if y != 0 {
-                    let discrete = (y as f64 / 120.0).round() as i32;
+                    let discrete = -((y as f64 / 120.0).round() as i32);
                     let continuous = discrete as f64 * 15.0;
                     state.vp.axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
                 }
                 if x != 0 {
-                    let discrete = (x as f64 / 120.0).round() as i32;
+                    let discrete = -((x as f64 / 120.0).round() as i32);
                     let continuous = discrete as f64 * 15.0;
                     state.vp.axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
                 }
