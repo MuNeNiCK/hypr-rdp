@@ -412,10 +412,11 @@ fn poll_dispatch(
     Ok(())
 }
 
-/// Common frame processing: EGFX H.264 encoding or bitmap fallback.
+/// Common frame processing: EGFX H.264/RFX encoding or bitmap fallback.
 struct FrameProcessor {
     egfx_shared: Option<Arc<EgfxShared>>,
     h264_encoder: Option<crate::egfx::FrameEncoder>,
+    rfx_encoder: Option<crate::egfx::rfx::RfxEncoder>,
     egfx_handle: Option<ironrdp_server::GfxServerHandle>,
     egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>>,
     egfx_surface_id: Option<u16>,
@@ -446,7 +447,7 @@ impl FrameProcessor {
         deferred_resize: Option<ironrdp_server::DesktopSize>,
     ) -> Self {
         Self {
-            egfx_shared, h264_encoder: None, egfx_handle: None,
+            egfx_shared, h264_encoder: None, rfx_encoder: None, egfx_handle: None,
             egfx_sender: None, egfx_surface_id: None,
             egfx_active: false,
             egfx_ready: false, egfx_generation: 0,
@@ -473,7 +474,9 @@ impl FrameProcessor {
 
         let mut sent_via_egfx = false;
         if let Some(shared) = &self.egfx_shared {
-            let ready = shared.is_ready() && shared.is_avc_enabled();
+            let egfx_ready = shared.is_ready();
+            let avc_enabled = shared.is_avc_enabled();
+            let ready = egfx_ready && avc_enabled;
             let gen = shared.generation();
 
             if ready != self.egfx_ready {
@@ -484,7 +487,10 @@ impl FrameProcessor {
                     self.egfx_sender = None;
                     self.egfx_surface_id = None;
                     self.h264_encoder = None;
-                    tracing::info!("EGFX channel became unavailable");
+                    if !egfx_ready {
+                        self.rfx_encoder = None;
+                        tracing::info!("EGFX channel became unavailable");
+                    }
                 }
             }
 
@@ -492,6 +498,7 @@ impl FrameProcessor {
                 self.egfx_generation = gen;
                 self.egfx_surface_id = None;
                 self.h264_encoder = None;
+                self.rfx_encoder = None;
                 if ready {
                     match crate::egfx::FrameEncoder::new(self.width, self.height, self.bitrate, self.fps) {
                         Ok(enc) => {
@@ -505,6 +512,9 @@ impl FrameProcessor {
                         }
                         Err(e) => tracing::warn!("Failed to initialize H.264 encoder: {:#}", e),
                     }
+                } else if egfx_ready && !avc_enabled {
+                    self.rfx_encoder = Some(crate::egfx::rfx::RfxEncoder::new(self.width, self.height));
+                    tracing::info!(width = self.width, height = self.height, "RFX encoder initialized (AVC disabled)");
                 }
             }
 
@@ -587,6 +597,10 @@ impl FrameProcessor {
                     }
                 }
             }
+
+            // RFX path is disabled: iOS disconnects on any EGFX graphics PDU
+            // (CreateSurface, ResetGraphics) after CapabilitiesConfirm.
+            // AVC-disabled clients fall through to bitmap fallback below.
         }
 
         if sent_via_egfx {

@@ -187,13 +187,12 @@ impl RdpServerDisplay for HyprDisplay {
         let cw = cw & !1;
         let ch = ch & !1;
 
-        let mut inner = self.inner.lock().await;
-        if inner.output.is_none() && cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
-            tracing::info!(client_w = cw, client_h = ch, "Resizing to match client");
-            inner.deferred_resize = Some((cw, ch));
-            inner.width = cw as u16;
-            inner.height = ch as u16;
-            inner.resolution = (cw, ch);
+        let inner = self.inner.lock().await;
+        // Don't defer resize here — it triggers DeactivationReactivation which
+        // causes iOS to disconnect. Resize is handled via DisplayControl instead.
+        if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
+            tracing::info!(client_w = cw, client_h = ch, server_w = inner.width, server_h = inner.height,
+                "Client requested different size (keeping server size)");
         }
 
         DesktopSize { width: inner.width, height: inner.height }

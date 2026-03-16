@@ -120,6 +120,7 @@ impl InputState {
 
 struct KeyboardStateTracker {
     modifier_masks_by_key: HashMap<u32, u32>,
+    unicode_to_keycode: HashMap<u16, u32>,
     pressed_keys: HashSet<u32>,
     depressed_mods: u32,
     locked_mods: u32,
@@ -135,6 +136,7 @@ impl KeyboardStateTracker {
 
         Ok(Self {
             modifier_masks_by_key: build_modifier_masks_by_key(&keymap),
+            unicode_to_keycode: build_unicode_to_keycode(&keymap),
             pressed_keys: HashSet::new(),
             depressed_mods: 0,
             locked_mods: 0,
@@ -143,6 +145,10 @@ impl KeyboardStateTracker {
             scroll_lock_mask: locked_mask_for_key(&keymap, KEY_SCROLLLOCK),
             kana_lock_mask: locked_mask_for_key(&keymap, KEY_KATAKANAHIRAGANA),
         })
+    }
+
+    fn unicode_to_evdev(&self, code_point: u16) -> Option<u32> {
+        self.unicode_to_keycode.get(&code_point).copied()
     }
 
     fn key(&mut self, evdev_key: u32, pressed: bool) {
@@ -429,7 +435,22 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.keyboard_state.send_modifiers(&state.vk);
                 state.flush();
             }
-            _ => {}
+            KeyboardEvent::UnicodePressed(code_point) => {
+                if let Some(evdev_key) = state.keyboard_state.unicode_to_evdev(code_point) {
+                    state.vk.key(t, evdev_key, 1);
+                    state.keyboard_state.send_modifiers(&state.vk);
+                    state.flush();
+                } else {
+                    tracing::debug!(code_point, "No evdev mapping for Unicode character");
+                }
+            }
+            KeyboardEvent::UnicodeReleased(code_point) => {
+                if let Some(evdev_key) = state.keyboard_state.unicode_to_evdev(code_point) {
+                    state.vk.key(t, evdev_key, 0);
+                    state.keyboard_state.send_modifiers(&state.vk);
+                    state.flush();
+                }
+            }
         }
     }
 
@@ -549,6 +570,25 @@ fn compile_xkb_keymap(keymap_data: &[u8]) -> Result<xkb::Keymap> {
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
     .context("failed to compile XKB keymap from Wayland keymap data")
+}
+
+fn build_unicode_to_keycode(keymap: &xkb::Keymap) -> HashMap<u16, u32> {
+    let mut map = HashMap::new();
+    let state = xkb::State::new(keymap);
+
+    for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
+        let keycode = xkb::Keycode::new(keycode_raw);
+        let syms = state.key_get_syms(keycode);
+        for sym in syms {
+            let ch = xkb::keysym_to_utf32(*sym);
+            if ch > 0 && ch <= u32::from(u16::MAX) {
+                let evdev_key = keycode_raw - XKB_KEYCODE_OFFSET;
+                map.entry(ch as u16).or_insert(evdev_key);
+            }
+        }
+    }
+
+    map
 }
 
 fn build_modifier_masks_by_key(keymap: &xkb::Keymap) -> HashMap<u32, u32> {

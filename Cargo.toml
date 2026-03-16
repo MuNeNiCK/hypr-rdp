@@ -22,6 +22,7 @@ ironrdp-cliprdr = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "h
 ironrdp-rdpsnd = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
 ironrdp-core = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
 ironrdp-displaycontrol = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
+ironrdp-graphics = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
 
 # H.264 encoding (OpenH264 software encoder)
 openh264 = { version = "0.9", features = ["libloading"] }

@@ -14,6 +14,7 @@ use crate::input::{HyprInputHandler, SharedOutputLayout};
 pub struct ServerContext {
     server: RdpServer,
     pub display_handle: HyprDisplayHandle,
+    egfx_shared: Arc<crate::egfx::EgfxShared>,
     listener: tokio::net::TcpListener,
 }
 
@@ -34,6 +35,7 @@ pub async fn setup(
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
     let egfx_shared = Arc::new(EgfxShared::new());
+    egfx_shared.set_surface_size(resolution.0 as u16, resolution.1 as u16);
     let output_layout = Arc::new(SharedOutputLayout::new());
 
     let (display, display_handle, (rdp_width, rdp_height)) = HyprDisplay::new(
@@ -51,7 +53,7 @@ pub async fn setup(
     let input_handler = HyprInputHandler::new(rdp_width, rdp_height, output_layout)
         .context("failed to initialize input handler")?;
 
-    let gfx_factory = HyprGfxFactory::new(egfx_shared);
+    let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
     let sound_factory = HyprSoundFactory::new();
 
@@ -99,7 +101,7 @@ pub async fn setup(
         .context("failed to bind RDP port")?;
     tracing::info!("RDP server listening on {}", addr);
 
-    Ok(ServerContext { server, display_handle, listener })
+    Ok(ServerContext { server, display_handle, egfx_shared, listener })
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
@@ -153,10 +155,11 @@ pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
                     tracing::info!("New connection, replacing current session");
                     pending = Some(s);
                 }
-                // recv() returning None means accept task died — loop will
-                // exit on next iteration when pending is None and recv fails.
             }
         }
+        // Reset channel state after each connection (same as run() does internally).
+        ctx.server.reset_channels();
+        ctx.egfx_shared.reset_for_new_client();
     }
 }
 
