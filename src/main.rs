@@ -164,25 +164,34 @@ async fn main() -> Result<()> {
 
     tracing::info!("Starting hypr-rdp on {}", bind);
 
-    tokio::select! {
-        result = server::run(
-            &bind,
-            cert.as_deref(),
-            key.as_deref(),
-            &username,
-            &password,
-            resolution,
-            capture_mode,
-            bitrate,
-            quality,
-            fps,
-            output,
-        ) => result,
+    let mut ctx = server::setup(
+        &bind,
+        cert.as_deref(),
+        key.as_deref(),
+        &username,
+        &password,
+        resolution,
+        capture_mode,
+        bitrate,
+        quality,
+        fps,
+        output,
+    )
+    .await?;
+
+    let result = tokio::select! {
+        result = server::serve(&mut ctx) => result,
         _ = shutdown_signal() => {
             tracing::info!("Shutting down hypr-rdp");
             Ok(())
         }
-    }
+    };
+
+    // Explicit shutdown: stop capture → close Wayland → remove headless output.
+    // Runs regardless of how the server exited (error or signal).
+    ctx.display_handle.shutdown().await;
+
+    result
 }
 
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {

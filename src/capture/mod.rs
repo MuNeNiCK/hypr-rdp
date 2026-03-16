@@ -2,6 +2,7 @@
 pub mod dmabuf;
 mod wayland;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,7 +10,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 
 use crate::egfx::EgfxShared;
 use crate::input::SharedOutputLayout;
@@ -24,8 +25,9 @@ pub enum CaptureMode {
     Wlr,
 }
 
-/// Captures frames from Hyprland via Wayland capture protocols.
-pub struct HyprDisplay {
+/// Inner state for display capture. Held behind Arc<Mutex<>> so that
+/// server::run() can call shutdown() independently of RdpServer's drop.
+struct HyprDisplayInner {
     width: u16,
     height: u16,
     resolution: (u32, u32),
@@ -41,16 +43,50 @@ pub struct HyprDisplay {
     output: Option<String>,
     pending_resize: bool,
     deferred_resize: Option<(u32, u32)>,
-    /// Keeps the headless output alive for the lifetime of the server.
-    /// Dropped only when HyprDisplay itself is dropped (server shutdown).
+    stop_flag: Arc<AtomicBool>,
+    capture_handle: Option<std::thread::JoinHandle<()>>,
     headless_guard: Option<HeadlessOutputGuard>,
 }
 
-impl HyprDisplay {
-    pub fn dimensions(&self) -> (u16, u16) {
-        (self.width, self.height)
+impl HyprDisplayInner {
+    /// Explicit shutdown: stop capture thread → join → remove headless output.
+    fn shutdown(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = self.capture_handle.take() {
+            let _ = handle.join();
+        }
+        // Thread exited, Wayland connection closed. Safe to remove output.
+        drop(self.headless_guard.take());
     }
+}
 
+impl Drop for HyprDisplayInner {
+    fn drop(&mut self) {
+        // Safety net: if shutdown() was not called (e.g. early error in setup()),
+        // ensure capture thread is joined before headless_guard drops.
+        self.shutdown();
+    }
+}
+
+/// Shared handle to HyprDisplayInner for explicit shutdown from server::run().
+#[derive(Clone)]
+pub struct HyprDisplayHandle {
+    inner: Arc<Mutex<HyprDisplayInner>>,
+}
+
+impl HyprDisplayHandle {
+    pub async fn shutdown(&self) {
+        let mut inner = self.inner.lock().await;
+        inner.shutdown();
+    }
+}
+
+/// RdpServerDisplay implementation that delegates to HyprDisplayInner.
+pub struct HyprDisplay {
+    inner: Arc<Mutex<HyprDisplayInner>>,
+}
+
+impl HyprDisplay {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         resolution: (u32, u32),
@@ -61,25 +97,31 @@ impl HyprDisplay {
         quality: u8,
         fps: u32,
         output: Option<String>,
-    ) -> Result<Self> {
+    ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
 
         // Create or verify output before starting capture
         let (output_name, headless_guard) = if let Some(ref name) = output {
             (name.clone(), None)
         } else {
-            // Clean up stale headless outputs from previous crashed sessions
-            for stale in wayland::list_stale_headless_outputs().unwrap_or_default() {
-                tracing::warn!(name = %stale, "Removing stale headless output from previous session");
-                wayland::remove_headless_output(&stale);
+            let stale = wayland::list_stale_headless_outputs().unwrap_or_default();
+            if let Some(existing) = stale.into_iter().next() {
+                tracing::info!(name = %existing, "Reusing headless output from previous session");
+                let mode = format!("{}x{}@60", resolution.0, resolution.1);
+                let rule = format!("{},{},-9999x0,1", existing, mode);
+                crate::hyprland::keyword_monitor(&rule)
+                    .context("failed to resize reused headless output")?;
+                wayland::wait_for_output(&existing, Duration::from_secs(5))?;
+                (existing.clone(), Some(wayland::HeadlessOutputGuard::adopt(existing)))
+            } else {
+                let (name, guard) = wayland::create_headless_output(resolution.0, resolution.1)?;
+                wayland::wait_for_output(&name, Duration::from_secs(5))?;
+                (name, Some(guard))
             }
-
-            let (name, guard) = wayland::create_headless_output(resolution.0, resolution.1)?;
-            wayland::wait_for_output(&name, Duration::from_secs(5))?;
-            (name, Some(guard))
         };
 
-        let capture_info = wayland::start_capture(
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let (capture_info, capture_handle) = wayland::start_capture(
             tx.clone(),
             capture_mode,
             None,
@@ -89,6 +131,7 @@ impl HyprDisplay {
             fps,
             output_name.clone(),
             None,
+            Arc::clone(&stop_flag),
         )
         .await?;
 
@@ -102,7 +145,7 @@ impl HyprDisplay {
             "Display capture initialized via {}", protocol_name
         );
 
-        Ok(Self {
+        let inner = Arc::new(Mutex::new(HyprDisplayInner {
             width: capture_info.width as u16,
             height: capture_info.height as u16,
             resolution,
@@ -118,15 +161,22 @@ impl HyprDisplay {
             output,
             pending_resize: false,
             deferred_resize: None,
+            stop_flag,
+            capture_handle: Some(capture_handle),
             headless_guard,
-        })
+        }));
+
+        let dims = (capture_info.width as u16, capture_info.height as u16);
+        let handle = HyprDisplayHandle { inner: Arc::clone(&inner) };
+        Ok((Self { inner }, handle, dims))
     }
 }
 
 #[async_trait]
 impl RdpServerDisplay for HyprDisplay {
     async fn size(&mut self) -> DesktopSize {
-        DesktopSize { width: self.width, height: self.height }
+        let inner = self.inner.lock().await;
+        DesktopSize { width: inner.width, height: inner.height }
     }
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
@@ -137,12 +187,13 @@ impl RdpServerDisplay for HyprDisplay {
         let cw = cw & !1;
         let ch = ch & !1;
 
-        if self.output.is_none() && cw > 0 && ch > 0 && (cw != self.resolution.0 || ch != self.resolution.1) {
+        let mut inner = self.inner.lock().await;
+        if inner.output.is_none() && cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
             tracing::info!(client_w = cw, client_h = ch, "Deferring resize to match client");
-            self.deferred_resize = Some((cw, ch));
+            inner.deferred_resize = Some((cw, ch));
         }
 
-        self.size().await
+        DesktopSize { width: inner.width, height: inner.height }
     }
 
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
@@ -161,7 +212,6 @@ impl RdpServerDisplay for HyprDisplay {
             return;
         }
 
-        // H.264 requires even dimensions (4:2:0 chroma subsampling)
         w &= !1;
         h &= !1;
 
@@ -170,52 +220,65 @@ impl RdpServerDisplay for HyprDisplay {
             return;
         }
 
-        if (w == self.resolution.0 && h == self.resolution.1) || self.output.is_some() {
+        // request_layout is sync, so use try_lock
+        let mut inner = match self.inner.try_lock() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+
+        if (w == inner.resolution.0 && h == inner.resolution.1) || inner.output.is_some() {
             return;
         }
 
         tracing::info!(w, h, "Client requested resize via DisplayControl");
 
-        self.resolution = (w, h);
-        self.width = w as u16;
-        self.height = h as u16;
-        self.pending_resize = true;
+        inner.resolution = (w, h);
+        inner.width = w as u16;
+        inner.height = h as u16;
+        inner.pending_resize = true;
 
-        let _ = self.update_tx.try_send(DisplayUpdate::Resize(DesktopSize {
+        let _ = inner.update_tx.try_send(DisplayUpdate::Resize(DesktopSize {
             width: w as u16,
             height: h as u16,
         }));
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        drop(self.update_rx.take());
+        let mut inner = self.inner.lock().await;
 
-        if let Some(ref shared) = self.egfx_shared {
-            if self.pending_resize {
-                shared.prepare_for_resize(self.width, self.height);
-                self.pending_resize = false;
+        drop(inner.update_rx.take());
+
+        // Stop and join previous capture thread
+        inner.stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = inner.capture_handle.take() {
+            let _ = handle.join();
+        }
+
+        if let Some(ref shared) = inner.egfx_shared {
+            if inner.pending_resize {
+                shared.prepare_for_resize(inner.width, inner.height);
+                inner.pending_resize = false;
             } else {
                 shared.reset_for_new_client();
             }
         }
 
         let (tx, rx) = mpsc::channel(128);
-        self.update_tx = tx.clone();
+        inner.update_tx = tx.clone();
 
-        let deferred = if let Some((w, h)) = self.deferred_resize.take() {
-            self.resolution = (w, h);
-            self.width = w as u16;
-            self.height = h as u16;
-            self.pending_resize = true;
+        let deferred = if let Some((w, h)) = inner.deferred_resize.take() {
+            inner.resolution = (w, h);
+            inner.width = w as u16;
+            inner.height = h as u16;
+            inner.pending_resize = true;
 
-            // Resize the existing headless output
-            if self.headless_guard.is_some() {
+            if inner.headless_guard.is_some() {
                 let mode = format!("{}x{}@60", w, h);
-                let rule = format!("{},{},{}x0,1", self.output_name, mode, -9999);
+                let rule = format!("{},{},{}x0,1", inner.output_name, mode, -9999);
                 if let Err(e) = crate::hyprland::keyword_monitor(&rule) {
                     tracing::warn!("Failed to resize headless output: {}", e);
                 }
-                wayland::wait_for_output(&self.output_name, Duration::from_secs(5))
+                wayland::wait_for_output(&inner.output_name, Duration::from_secs(5))
                     .context("headless output not ready after resize")?;
             }
 
@@ -224,21 +287,24 @@ impl RdpServerDisplay for HyprDisplay {
             None
         };
 
-        let capture_info = wayland::start_capture(
+        inner.stop_flag = Arc::new(AtomicBool::new(false));
+        let (capture_info, capture_handle) = wayland::start_capture(
             tx,
-            self.capture_mode,
-            self.egfx_shared.clone(),
-            Arc::clone(&self.output_layout),
-            self.bitrate,
-            self.quality,
-            self.fps,
-            self.output_name.clone(),
+            inner.capture_mode,
+            inner.egfx_shared.clone(),
+            Arc::clone(&inner.output_layout),
+            inner.bitrate,
+            inner.quality,
+            inner.fps,
+            inner.output_name.clone(),
             deferred,
+            Arc::clone(&inner.stop_flag),
         )
         .await?;
-        self.width = capture_info.width as u16;
-        self.height = capture_info.height as u16;
-        self.output_name = capture_info.output_name;
+        inner.capture_handle = Some(capture_handle);
+        inner.width = capture_info.width as u16;
+        inner.height = capture_info.height as u16;
+        inner.output_name = capture_info.output_name;
 
         Ok(Box::new(HyprDisplayUpdates { rx }))
     }

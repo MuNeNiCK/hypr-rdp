@@ -6,13 +6,19 @@ use anyhow::{Context, Result};
 use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
 
 use crate::audio::HyprSoundFactory;
-use crate::capture::{CaptureMode, HyprDisplay};
+use crate::capture::{CaptureMode, HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
 use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::{HyprInputHandler, SharedOutputLayout};
 
+pub struct ServerContext {
+    server: RdpServer,
+    pub display_handle: HyprDisplayHandle,
+    listener: tokio::net::TcpListener,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn run(
+pub async fn setup(
     bind: &str,
     cert: Option<&str>,
     key: Option<&str>,
@@ -24,14 +30,13 @@ pub async fn run(
     quality: u8,
     fps: u32,
     output: Option<String>,
-) -> Result<()> {
+) -> Result<ServerContext> {
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
-    // Create shared EGFX state before display so capture thread has it from the start
     let egfx_shared = Arc::new(EgfxShared::new());
     let output_layout = Arc::new(SharedOutputLayout::new());
 
-    let display = HyprDisplay::new(
+    let (display, display_handle, (rdp_width, rdp_height)) = HyprDisplay::new(
         resolution,
         capture_mode,
         Arc::clone(&egfx_shared),
@@ -43,7 +48,6 @@ pub async fn run(
     )
     .await
     .context("failed to initialize display capture")?;
-    let (rdp_width, rdp_height) = display.dimensions();
     let input_handler = HyprInputHandler::new(rdp_width, rdp_height, output_layout)
         .context("failed to initialize input handler")?;
 
@@ -53,7 +57,6 @@ pub async fn run(
 
     let builder = RdpServer::builder().with_addr(addr);
 
-    // Resolve TLS: explicit cert/key > auto-generated (always TLS)
     let (cert_path, key_path) = match (cert, key) {
         (Some(c), Some(k)) => (c.to_string(), k.to_string()),
         (Some(_), None) => anyhow::bail!("--cert provided without --key"),
@@ -91,51 +94,73 @@ pub async fn run(
         }));
     }
 
-    // Custom accept loop: when a new connection arrives while one is active,
-    // cancel the current session and switch to the new client.
-    // ironrdp-server's run() processes connections sequentially, blocking new
-    // clients until the current one disconnects.
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .context("failed to bind RDP port")?;
     tracing::info!("RDP server listening on {}", addr);
+
+    Ok(ServerContext { server, display_handle, listener })
+}
+
+pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
+    // Note: ironrdp-server's run() resets static_channels after each connection.
+    // We can't do that (private field), but run_connection() overwrites it
+    // in accept_finalize() each time, so stale state doesn't leak across sessions.
+
+    // Accept new connections in a background task so that accept errors
+    // don't cancel the active RDP session via tokio::select!.
+    let (new_conn_tx, mut new_conn_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
+    let listener = std::mem::replace(
+        &mut ctx.listener,
+        // Placeholder — listener is moved to the accept task
+        tokio::net::TcpListener::bind("127.0.0.1:0").await?,
+    );
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    tracing::info!(%peer, "RDP connection accepted");
+                    if new_conn_tx.send(stream).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Accept error");
+                }
+            }
+        }
+    });
 
     let mut pending: Option<tokio::net::TcpStream> = None;
 
     loop {
         let stream = match pending.take() {
             Some(s) => s,
-            None => {
-                let (s, peer) = listener.accept().await.context("accept failed")?;
-                tracing::info!(%peer, "RDP connection accepted");
-                s
-            }
+            None => match new_conn_rx.recv().await {
+                Some(s) => s,
+                None => anyhow::bail!("accept task exited"),
+            },
         };
 
         tokio::select! {
-            result = server.run_connection(stream) => {
+            result = ctx.server.run_connection(stream) => {
                 if let Err(e) = result {
                     tracing::error!(error = %e, "Connection error");
                 }
             }
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((new_stream, new_peer)) => {
-                        tracing::info!(%new_peer, "New connection, replacing current session");
-                        pending = Some(new_stream);
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "Accept error");
-                    }
+            new_stream = new_conn_rx.recv() => {
+                if let Some(s) = new_stream {
+                    tracing::info!("New connection, replacing current session");
+                    pending = Some(s);
                 }
+                // recv() returning None means accept task died — loop will
+                // exit on next iteration when pending is None and recv fails.
             }
         }
     }
 }
 
 /// Auto-generate a self-signed TLS certificate and persist it.
-/// Returns paths to (cert.pem, key.pem) in ~/.config/hypr-rdp/.
-/// Uses a lock file to prevent concurrent processes from creating mismatched cert/key pairs.
 fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -144,7 +169,6 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     let cert_path = config_dir.join("cert.pem");
     let key_path = config_dir.join("key.pem");
 
-    // Reuse existing cert if both files exist
     if cert_path.exists() && key_path.exists() {
         tracing::info!("Reusing existing TLS certificate from {}", config_dir.display());
         return Ok((cert_path, key_path));
@@ -153,8 +177,6 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     std::fs::create_dir_all(&config_dir)
         .context("failed to create config directory")?;
 
-    // Acquire an exclusive lock to prevent concurrent TLS generation.
-    // flock is advisory but sufficient since all writers are hypr-rdp instances.
     let lock_path = config_dir.join(".tls.lock");
     let lock_file = std::fs::File::create(&lock_path)
         .context("failed to create TLS lock file")?;
@@ -164,7 +186,6 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
         anyhow::bail!("failed to acquire TLS lock");
     }
 
-    // Re-check after acquiring lock — another process may have finished first
     if cert_path.exists() && key_path.exists() {
         tracing::info!("Reusing existing TLS certificate from {}", config_dir.display());
         return Ok((cert_path, key_path));
@@ -175,7 +196,6 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
         rcgen::generate_simple_self_signed(subject_alt_names)
             .context("failed to generate self-signed certificate")?;
 
-    // Write key with restrictive permissions (0600)
     let tmp_key = config_dir.join(".key.pem.tmp");
     {
         let mut f = std::fs::OpenOptions::new()
@@ -198,7 +218,6 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     std::fs::rename(&tmp_cert, &cert_path)
         .context("failed to finalize cert.pem")?;
 
-    // Lock released when lock_file drops
     tracing::info!("Generated self-signed TLS certificate in {}", config_dir.display());
     Ok((cert_path, key_path))
 }

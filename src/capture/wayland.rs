@@ -81,12 +81,22 @@ impl HeadlessOutputGuard {
     fn new(name: String) -> Self {
         Self { name: Some(name) }
     }
+
+    /// Take ownership of an existing headless output (for reuse across restarts).
+    pub(crate) fn adopt(name: String) -> Self {
+        Self { name: Some(name) }
+    }
 }
 
 impl Drop for HeadlessOutputGuard {
     fn drop(&mut self) {
         if let Some(name) = self.name.take() {
-            remove_headless_output(&name);
+            // Safe to remove here: HyprDisplay::drop() has already joined the
+            // capture thread, so no Wayland clients reference this output.
+            match crate::hyprland::output_remove(&name) {
+                Ok(()) => tracing::info!(name, "Removed headless output"),
+                Err(e) => tracing::warn!(name, error = %e, "Failed to remove headless output"),
+            }
         }
     }
 }
@@ -144,17 +154,7 @@ pub(crate) fn create_headless_output(width: u32, height: u32) -> Result<(String,
     Ok((name, guard))
 }
 
-/// Remove a headless output from Hyprland.
-pub(crate) fn remove_headless_output(name: &str) {
-    match crate::hyprland::output_remove(name) {
-        Ok(()) => {
-            tracing::info!(name, "Removed headless output");
-        }
-        Err(e) => {
-            tracing::warn!(name, error = %e, "Failed to remove headless output");
-        }
-    }
-}
+
 
 /// Wait for a Hyprland output to be ready (has non-zero dimensions).
 pub(crate) fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()> {
@@ -214,10 +214,11 @@ pub async fn start_capture(
     fps: u32,
     output_name: String,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
-) -> Result<CaptureInfo> {
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(CaptureInfo, std::thread::JoinHandle<()>)> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
 
-    std::thread::Builder::new()
+    let handle = std::thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
             if let Err(e) = capture_thread(
@@ -231,12 +232,14 @@ pub async fn start_capture(
                 fps,
                 output_name,
                 deferred_resize,
+                stop_flag,
             ) {
                 tracing::error!("Capture thread error: {:#}", e);
             }
         })?;
 
-    info_rx.await.context("capture thread failed to start")?
+    let info = info_rx.await.context("capture thread failed to start")??;
+    Ok((info, handle))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -251,6 +254,7 @@ fn capture_thread(
     fps: u32,
     output_name: String,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut info_tx = Some(info_tx);
     let result = capture_thread_inner(
@@ -264,6 +268,7 @@ fn capture_thread(
         fps,
         output_name,
         deferred_resize,
+        stop_flag,
     );
     if let Err(err) = result {
         if let Some(tx) = info_tx.take() {
@@ -299,6 +304,7 @@ fn capture_thread_inner(
     fps: u32,
     output_name: String,
     deferred_resize: Option<ironrdp_server::DesktopSize>,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     verify_output_exists(&output_name)?;
 
@@ -313,7 +319,7 @@ fn capture_thread_inner(
     let display = conn.display();
     let _registry = display.get_registry(&qh, ());
 
-    let mut state = AppState::new(tx, output_name.clone());
+    let mut state = AppState::new(tx, output_name.clone(), stop_flag);
 
     // First roundtrip: collect globals
     event_queue
@@ -752,13 +758,12 @@ fn capture_loop_ext(
     conn.flush().context("Wayland flush failed")?;
 
     loop {
-        if state.tx.is_closed() { break; }
-        if state.stopped { tracing::warn!("Capture session stopped by compositor"); break; }
+        if state.should_stop() { break; }
 
         // Wait for current frame to complete (poll-based for responsive shutdown)
         while !state.frame_ready && !state.frame_failed {
             poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
-            if state.tx.is_closed() || state.stopped { break; }
+            if state.should_stop() { break; }
         }
         frame.destroy();
 
@@ -1043,13 +1048,12 @@ fn capture_loop_ext_dmabuf(
     conn.flush().context("Wayland flush failed")?;
 
     loop {
-        if state.tx.is_closed() { break; }
-        if state.stopped { tracing::warn!("Capture session stopped by compositor"); break; }
+        if state.should_stop() { break; }
 
         // Wait for current frame to complete (poll-based for responsive shutdown)
         while !state.frame_ready && !state.frame_failed {
             poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
-            if state.tx.is_closed() || state.stopped { break; }
+            if state.should_stop() { break; }
         }
         frame.destroy();
 
@@ -1314,7 +1318,7 @@ fn capture_loop_wlr(
             conn.flush().context("Wayland flush failed")?;
             buffer_sent = true;
         }
-        if state.tx.is_closed() || state.stopped { break; }
+        if state.should_stop() { break; }
     }
 
     loop {
@@ -1324,7 +1328,7 @@ fn capture_loop_wlr(
         let has_damage = !state.damage_regions.is_empty();
         frame.destroy();
 
-        if state.tx.is_closed() { break; }
+        if state.should_stop() { break; }
         if !state.frame_ready && !state.frame_failed { break; } // shutdown interrupted
 
         // Start NEXT capture immediately into the other buffer.
@@ -1370,7 +1374,7 @@ fn capture_loop_wlr(
                 conn.flush().context("Wayland flush failed")?;
                 buffer_sent = true;
             }
-            if state.tx.is_closed() || state.stopped { break; }
+            if state.should_stop() { break; }
         }
     }
 
@@ -1409,10 +1413,11 @@ struct AppState {
     frame_failed: bool,
     damage_regions: Vec<(i32, i32, i32, i32)>,
     stopped: bool,
+    stop_flag: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl AppState {
-    fn new(tx: mpsc::Sender<DisplayUpdate>, target_output_name: String) -> Self {
+    fn new(tx: mpsc::Sender<DisplayUpdate>, target_output_name: String, stop_flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
         Self {
             tx,
             target_output_name,
@@ -1438,7 +1443,12 @@ impl AppState {
             frame_failed: false,
             damage_regions: Vec::new(),
             stopped: false,
+            stop_flag,
         }
+    }
+
+    fn should_stop(&self) -> bool {
+        self.tx.is_closed() || self.stopped || self.stop_flag.load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
