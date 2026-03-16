@@ -118,9 +118,16 @@ impl InputState {
 
 }
 
+/// Evdev keycode + required modifier (e.g. Shift) for a Unicode character.
+#[derive(Clone, Copy)]
+struct UnicodeKeyMapping {
+    evdev_key: u32,
+    needs_shift: bool,
+}
+
 struct KeyboardStateTracker {
     modifier_masks_by_key: HashMap<u32, u32>,
-    unicode_to_keycode: HashMap<u16, u32>,
+    unicode_to_keycode: HashMap<u16, UnicodeKeyMapping>,
     pressed_keys: HashSet<u32>,
     depressed_mods: u32,
     locked_mods: u32,
@@ -147,7 +154,7 @@ impl KeyboardStateTracker {
         })
     }
 
-    fn unicode_to_evdev(&self, code_point: u16) -> Option<u32> {
+    fn unicode_to_evdev(&self, code_point: u16) -> Option<UnicodeKeyMapping> {
         self.unicode_to_keycode.get(&code_point).copied()
     }
 
@@ -407,6 +414,48 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
 }
 
 impl RdpServerInputHandler for HyprInputHandler {
+    fn set_keyboard_layout(&mut self, layout: u32, keyboard_type: u32) {
+        let xkb_layout = lcid_to_xkb_layout(layout);
+        tracing::info!(lcid = layout, keyboard_type, xkb_layout, "Client keyboard layout");
+
+        let Ok(mut state) = self.state.lock() else { return };
+
+        // Generate xkb keymap with the client's layout
+        let keymap_string = format!(
+            "xkb_keymap {{\n\
+             xkb_keycodes {{ include \"evdev+aliases(qwerty)\" }};\n\
+             xkb_types {{ include \"complete\" }};\n\
+             xkb_compat {{ include \"complete\" }};\n\
+             xkb_symbols {{ include \"pc+{}+inet(evdev)\" }};\n\
+             xkb_geometry {{ include \"pc(pc105)\" }};\n\
+             }};\n",
+            xkb_layout
+        );
+
+        match compile_xkb_keymap(keymap_string.as_bytes()) {
+            Ok(keymap) => {
+                let keymap_data = keymap_string.into_bytes();
+                match create_keymap_fd(&keymap_data) {
+                    Ok(fd) => {
+                        state.vk.keymap(1, fd.as_fd(), keymap_data.len() as u32);
+                        state.keyboard_state = match KeyboardStateTracker::new(&keymap_data) {
+                            Ok(tracker) => tracker,
+                            Err(e) => {
+                                tracing::warn!("Failed to create keyboard state tracker: {}", e);
+                                return;
+                            }
+                        };
+                        state.keyboard_state.send_modifiers(&state.vk);
+                        state.flush();
+                        tracing::info!(xkb_layout, "Virtual keyboard layout updated");
+                    }
+                    Err(e) => tracing::warn!("Failed to create keymap fd: {}", e),
+                }
+            }
+            Err(e) => tracing::warn!(xkb_layout, "Failed to compile xkb keymap: {}", e),
+        }
+    }
+
     fn keyboard(&mut self, event: KeyboardEvent) {
         let Ok(mut state) = self.state.lock() else { return };
 
@@ -436,18 +485,27 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.flush();
             }
             KeyboardEvent::UnicodePressed(code_point) => {
-                if let Some(evdev_key) = state.keyboard_state.unicode_to_evdev(code_point) {
-                    state.vk.key(t, evdev_key, 1);
-                    state.keyboard_state.send_modifiers(&state.vk);
+                if let Some(mapping) = state.keyboard_state.unicode_to_evdev(code_point) {
+                    if mapping.needs_shift {
+                        // 42 = KEY_LEFTSHIFT
+                        state.vk.key(t, 42, 1);
+                        state.keyboard_state.key(42, true);
+                        state.keyboard_state.send_modifiers(&state.vk);
+                    }
+                    state.vk.key(t, mapping.evdev_key, 1);
                     state.flush();
                 } else {
                     tracing::debug!(code_point, "No evdev mapping for Unicode character");
                 }
             }
             KeyboardEvent::UnicodeReleased(code_point) => {
-                if let Some(evdev_key) = state.keyboard_state.unicode_to_evdev(code_point) {
-                    state.vk.key(t, evdev_key, 0);
-                    state.keyboard_state.send_modifiers(&state.vk);
+                if let Some(mapping) = state.keyboard_state.unicode_to_evdev(code_point) {
+                    state.vk.key(t, mapping.evdev_key, 0);
+                    if mapping.needs_shift {
+                        state.vk.key(t, 42, 0);
+                        state.keyboard_state.key(42, false);
+                        state.keyboard_state.send_modifiers(&state.vk);
+                    }
                     state.flush();
                 }
             }
@@ -572,18 +630,56 @@ fn compile_xkb_keymap(keymap_data: &[u8]) -> Result<xkb::Keymap> {
     .context("failed to compile XKB keymap from Wayland keymap data")
 }
 
-fn build_unicode_to_keycode(keymap: &xkb::Keymap) -> HashMap<u16, u32> {
+/// Map RDP keyboard layout LCID to xkb layout name.
+fn lcid_to_xkb_layout(lcid: u32) -> &'static str {
+    match lcid & 0xFFFF {
+        0x0409 => "us",
+        0x0411 => "jp",
+        0x0407 => "de",
+        0x040C => "fr",
+        0x0410 => "it",
+        0x0419 => "ru",
+        0x0412 => "kr",
+        0x0404 => "tw",
+        0x0804 => "cn",
+        0x0809 => "gb",
+        0x0416 => "br",
+        0x0C0A | 0x040A => "es",
+        0x0816 => "pt",
+        0x041D => "se",
+        0x0414 | 0x0814 => "no",
+        0x0406 => "dk",
+        0x040B => "fi",
+        0x0413 | 0x0813 => "nl",
+        0x0415 => "pl",
+        0x0405 => "cz",
+        0x040E => "hu",
+        0x041F => "tr",
+        _ => "us",
+    }
+}
+
+fn build_unicode_to_keycode(keymap: &xkb::Keymap) -> HashMap<u16, UnicodeKeyMapping> {
     let mut map = HashMap::new();
-    let state = xkb::State::new(keymap);
 
     for keycode_raw in keymap.min_keycode().raw()..=keymap.max_keycode().raw() {
         let keycode = xkb::Keycode::new(keycode_raw);
-        let syms = state.key_get_syms(keycode);
-        for sym in syms {
-            let ch = xkb::keysym_to_utf32(*sym);
-            if ch > 0 && ch <= u32::from(u16::MAX) {
-                let evdev_key = keycode_raw - XKB_KEYCODE_OFFSET;
-                map.entry(ch as u16).or_insert(evdev_key);
+        let evdev_key = keycode_raw - XKB_KEYCODE_OFFSET;
+        let num_layouts = keymap.num_layouts_for_key(keycode);
+
+        for layout in 0..num_layouts {
+            let num_levels = keymap.num_levels_for_key(keycode, layout);
+            for level in 0..num_levels {
+                let syms = keymap.key_get_syms_by_level(keycode, layout, level);
+                for sym in syms {
+                    let ch = xkb::keysym_to_utf32(*sym);
+                    if ch > 0 && ch <= u32::from(u16::MAX) {
+                        map.entry(ch as u16).or_insert(UnicodeKeyMapping {
+                            evdev_key,
+                            needs_shift: level == 1, // level 1 = Shift
+                        });
+                    }
+                }
             }
         }
     }
