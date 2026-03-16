@@ -165,6 +165,8 @@ pub struct EgfxShared {
     handle: Mutex<Option<GfxServerHandle>>,
     /// Whether EGFX capability negotiation is complete
     ready: AtomicBool,
+    /// Whether the negotiated capability supports AVC420/AVC444 (H.264)
+    avc_enabled: AtomicBool,
     /// Incremented each time on_ready fires; lets capture thread detect re-negotiation
     ready_generation: AtomicU32,
     /// Event sender for routing encoded frames to the RDP wire
@@ -176,9 +178,14 @@ impl EgfxShared {
         Self {
             handle: Mutex::new(None),
             ready: AtomicBool::new(false),
+            avc_enabled: AtomicBool::new(false),
             ready_generation: AtomicU32::new(0),
             event_sender: Mutex::new(None),
         }
+    }
+
+    pub fn is_avc_enabled(&self) -> bool {
+        self.avc_enabled.load(Ordering::Acquire)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -448,14 +455,32 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
 
     fn capabilities_advertise(&mut self, pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {
         tracing::info!(count = pdu.0.len(), "EGFX: client advertised capabilities");
+        for cap in &pdu.0 {
+            tracing::info!(?cap, "EGFX: client capability");
+        }
     }
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
+        use ironrdp_egfx::pdu::*;
+        let avc = match cap {
+            CapabilitySet::V8 { .. } => false,
+            CapabilitySet::V8_1 { flags } => flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
+            CapabilitySet::V10 { flags } => !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
+            CapabilitySet::V10_1 => true,
+            CapabilitySet::V10_2 { flags } => !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
+            CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
+            CapabilitySet::V10_4 { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
+            CapabilitySet::V10_5 { .. } | CapabilitySet::V10_6 { .. } | CapabilitySet::V10_6Err { .. } => true,
+            CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
+            CapabilitySet::Unknown(_) => false,
+        };
+        self.shared.avc_enabled.store(avc, Ordering::Release);
+
         let was_ready = self.shared.ready.load(Ordering::Acquire);
         if was_ready {
-            tracing::info!(?cap, "EGFX: client re-negotiated (keeping surface)");
+            tracing::info!(?cap, avc, "EGFX: client re-negotiated (keeping surface)");
         } else {
-            tracing::info!(?cap, "EGFX: channel ready (first time)");
+            tracing::info!(?cap, avc, "EGFX: channel ready (first time)");
             self.shared.ready_generation.fetch_add(1, Ordering::Release);
         }
         self.shared.ready.store(true, Ordering::Release);

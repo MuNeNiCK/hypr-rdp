@@ -189,8 +189,11 @@ impl RdpServerDisplay for HyprDisplay {
 
         let mut inner = self.inner.lock().await;
         if inner.output.is_none() && cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
-            tracing::info!(client_w = cw, client_h = ch, "Deferring resize to match client");
+            tracing::info!(client_w = cw, client_h = ch, "Resizing to match client");
             inner.deferred_resize = Some((cw, ch));
+            inner.width = cw as u16;
+            inner.height = ch as u16;
+            inner.resolution = (cw, ch);
         }
 
         DesktopSize { width: inner.width, height: inner.height }
@@ -244,15 +247,19 @@ impl RdpServerDisplay for HyprDisplay {
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
-        let mut inner = self.inner.lock().await;
-
-        drop(inner.update_rx.take());
-
-        // Stop and join previous capture thread
-        inner.stop_flag.store(true, Ordering::Release);
-        if let Some(handle) = inner.capture_handle.take() {
-            let _ = handle.join();
+        // Extract stop_flag and handle before joining, to avoid holding
+        // the Mutex during a blocking join() call.
+        let (stop_flag, handle) = {
+            let mut inner = self.inner.lock().await;
+            drop(inner.update_rx.take());
+            (Arc::clone(&inner.stop_flag), inner.capture_handle.take())
+        };
+        stop_flag.store(true, Ordering::Release);
+        if let Some(handle) = handle {
+            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
+
+        let mut inner = self.inner.lock().await;
 
         if let Some(ref shared) = inner.egfx_shared {
             if inner.pending_resize {

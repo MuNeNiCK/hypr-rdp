@@ -473,7 +473,7 @@ impl FrameProcessor {
 
         let mut sent_via_egfx = false;
         if let Some(shared) = &self.egfx_shared {
-            let ready = shared.is_ready();
+            let ready = shared.is_ready() && shared.is_avc_enabled();
             let gen = shared.generation();
 
             if ready != self.egfx_ready {
@@ -597,10 +597,10 @@ impl FrameProcessor {
             }
         }
 
-        // Only send bitmaps when EGFX is not expected. Sending bitmaps
-        // before EGFX causes a bitmap→EGFX transition that breaks rendering
-        // on some RDP clients (first connection after server startup).
-        if !sent_via_egfx && self.egfx_shared.is_none() {
+        // Send bitmaps when EGFX is not active (not configured, or AVC disabled).
+        let egfx_active = self.egfx_shared.as_ref()
+            .is_some_and(|s| s.is_ready() && s.is_avc_enabled());
+        if !sent_via_egfx && !egfx_active {
             self.sent_first_frame = true;
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0, y: 0,
