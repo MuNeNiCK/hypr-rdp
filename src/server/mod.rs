@@ -33,7 +33,6 @@ pub async fn setup(
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
     let egfx_shared = Arc::new(EgfxShared::new());
-    egfx_shared.set_surface_size(resolution.0 as u16, resolution.1 as u16);
     let output_layout = Arc::new(SharedOutputLayout::new());
 
     let (display, display_handle, (rdp_width, rdp_height)) = HyprDisplay::new(
@@ -48,6 +47,7 @@ pub async fn setup(
     )
     .await
     .context("failed to initialize display capture")?;
+    egfx_shared.set_surface_size(rdp_width, rdp_height);
     let input_handler = HyprInputHandler::new(rdp_width, rdp_height, output_layout)
         .context("failed to initialize input handler")?;
 

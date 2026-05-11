@@ -100,7 +100,8 @@ impl HyprDisplay {
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
 
-        // Create or verify output before starting capture
+        // Create or verify output up front, but defer Wayland capture until a
+        // client subscribes to display updates. This keeps idle memory bounded.
         let (output_name, headless_guard) = if let Some(ref name) = output {
             (name.clone(), None)
         } else {
@@ -120,20 +121,13 @@ impl HyprDisplay {
             }
         };
 
+        let capture_info = wayland::output_info(&output_name)
+            .context("failed to get initial output dimensions")?;
+        output_layout
+            .update_from_output(&output_name)
+            .context("failed to initialize input layout for output")?;
+
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let (capture_info, capture_handle) = wayland::start_capture(
-            tx.clone(),
-            capture_mode,
-            None,
-            Arc::clone(&output_layout),
-            bitrate,
-            quality,
-            fps,
-            output_name.clone(),
-            None,
-            Arc::clone(&stop_flag),
-        )
-        .await?;
 
         let protocol_name = match capture_mode {
             CaptureMode::Ext => "ext-image-copy-capture-v1",
@@ -142,7 +136,7 @@ impl HyprDisplay {
         tracing::info!(
             width = capture_info.width,
             height = capture_info.height,
-            "Display capture initialized via {}", protocol_name
+            "Display prepared via {}; capture will start on client connection", protocol_name
         );
 
         let inner = Arc::new(Mutex::new(HyprDisplayInner {
@@ -162,7 +156,7 @@ impl HyprDisplay {
             pending_resize: false,
             deferred_resize: None,
             stop_flag,
-            capture_handle: Some(capture_handle),
+            capture_handle: None,
             headless_guard,
         }));
 

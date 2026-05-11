@@ -186,18 +186,32 @@ pub(crate) fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()
     }
 }
 
-/// Verify that a named output exists in Hyprland monitors.
-fn verify_output_exists(output_name: &str) -> Result<()> {
+/// Query a Hyprland output's current dimensions without starting capture.
+pub(crate) fn output_info(output_name: &str) -> Result<CaptureInfo> {
     let monitors = crate::hyprland::monitors()?;
-    let found = monitors
+    let monitor = monitors
         .as_array()
         .context("expected monitors array")?
         .iter()
-        .any(|m| m["name"].as_str() == Some(output_name));
-    if !found {
-        bail!("output '{}' not found in Hyprland monitors", output_name);
+        .find(|m| m["name"].as_str() == Some(output_name))
+        .with_context(|| format!("output '{}' not found in Hyprland monitors", output_name))?;
+
+    let width = monitor["width"].as_u64().unwrap_or(0) as u32;
+    let height = monitor["height"].as_u64().unwrap_or(0) as u32;
+    if width == 0 || height == 0 {
+        bail!("output '{}' has invalid dimensions: {}x{}", output_name, width, height);
     }
-    Ok(())
+
+    Ok(CaptureInfo {
+        width,
+        height,
+        output_name: output_name.to_string(),
+    })
+}
+
+/// Verify that a named output exists in Hyprland monitors.
+fn verify_output_exists(output_name: &str) -> Result<()> {
+    output_info(output_name).map(|_| ())
 }
 
 /// Start screen capture on a background thread.
