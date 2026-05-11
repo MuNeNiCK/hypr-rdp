@@ -1,5 +1,4 @@
 pub mod encoder;
-pub mod rfx;
 #[cfg(feature = "vaapi")]
 pub mod vaapi;
 #[cfg(feature = "vaapi")]
@@ -174,8 +173,6 @@ pub struct EgfxShared {
     event_sender: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
     /// Surface size for auto-create in EGFX negotiation
     surface_size: Mutex<(u16, u16)>,
-    /// Surface ID created by auto-create (set by on_ready callback)
-    auto_surface_id: Mutex<Option<u16>>,
 }
 
 impl EgfxShared {
@@ -187,17 +184,6 @@ impl EgfxShared {
             ready_generation: AtomicU32::new(0),
             event_sender: Mutex::new(None),
             surface_size: Mutex::new((0, 0)),
-            auto_surface_id: Mutex::new(None),
-        }
-    }
-
-    pub fn take_auto_surface_id(&self) -> Option<u16> {
-        self.auto_surface_id.lock().ok()?.take()
-    }
-
-    pub fn set_auto_surface_id(&self, id: u16) {
-        if let Ok(mut guard) = self.auto_surface_id.lock() {
-            *guard = Some(id);
         }
     }
 
@@ -421,47 +407,6 @@ impl EgfxShared {
         true
     }
 
-    /// Send an RFX-encoded frame via EGFX.
-    pub fn send_rfx_frame(
-        handle: &GfxServerHandle,
-        sender: &mpsc::UnboundedSender<ServerEvent>,
-        surface_id: u16,
-        width: u16,
-        height: u16,
-        rfx_data: Vec<u8>,
-        timestamp_ms: u32,
-    ) -> bool {
-        let (_frame_id, dvc_messages, channel_id) = {
-            let Ok(mut server) = handle.lock() else { return false };
-            if !server.is_ready() || server.should_backpressure() { return false; }
-            let channel_id = match server.channel_id() {
-                Some(id) => id,
-                None => return false,
-            };
-            let dest_rect = ironrdp_pdu::geometry::InclusiveRectangle {
-                left: 0, top: 0,
-                right: width.saturating_sub(1),
-                bottom: height.saturating_sub(1),
-            };
-            let frame_id = match server.send_rfx_frame(surface_id, rfx_data, dest_rect, timestamp_ms) {
-                Some(id) => id,
-                None => return false,
-            };
-            let dvc_messages = server.drain_output();
-            (frame_id, dvc_messages, channel_id)
-        };
-        if dvc_messages.is_empty() { return false; }
-        match ironrdp_dvc::encode_dvc_messages(channel_id, dvc_messages, ironrdp_svc::ChannelFlags::SHOW_PROTOCOL) {
-            Ok(svc_messages) => {
-                let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages: svc_messages }));
-            }
-            Err(e) => {
-                tracing::error!("Failed to encode RFX frame: {}", e);
-                return false;
-            }
-        }
-        true
-    }
 }
 
 /// Factory for creating EGFX pipeline handlers.
@@ -530,15 +475,13 @@ struct HyprGraphicsHandler {
 impl GraphicsPipelineHandler for HyprGraphicsHandler {
     fn preferred_capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
         use ironrdp_egfx::pdu::*;
-        // V10_7 first for Windows (AVC444), then V8_1 for iOS (RemoteFX).
-        // V10 is after V8_1 because iOS disconnects when server confirms
-        // V10 with AVC_DISABLED. iOS doesn't advertise V10_7, so it falls
-        // through to V8_1 which works correctly.
+        // V8_1 without SMALL_CACHE — iOS sends SMALL_CACHE but
+        // intersect (AND) will clear it if server doesn't set it.
         vec![
-            CapabilitySet::V10_7 { flags: CapabilitiesV107Flags::SMALL_CACHE },
-            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::AVC420_ENABLED | CapabilitiesV81Flags::SMALL_CACHE },
-            CapabilitySet::V10 { flags: CapabilitiesV10Flags::SMALL_CACHE },
-            CapabilitySet::V8 { flags: CapabilitiesV8Flags::SMALL_CACHE },
+            CapabilitySet::V10_7 { flags: CapabilitiesV107Flags::empty() },
+            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::empty() },
+            CapabilitySet::V10 { flags: CapabilitiesV10Flags::empty() },
+            CapabilitySet::V8 { flags: CapabilitiesV8Flags::empty() },
         ]
     }
 

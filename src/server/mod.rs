@@ -14,8 +14,6 @@ use crate::input::{HyprInputHandler, SharedOutputLayout};
 pub struct ServerContext {
     server: RdpServer,
     pub display_handle: HyprDisplayHandle,
-    egfx_shared: Arc<crate::egfx::EgfxShared>,
-    listener: tokio::net::TcpListener,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,71 +94,13 @@ pub async fn setup(
         }));
     }
 
-    let listener = tokio::net::TcpListener::bind(addr)
-        .await
-        .context("failed to bind RDP port")?;
-    tracing::info!("RDP server listening on {}", addr);
+    tracing::info!("RDP server configured for {}", addr);
 
-    Ok(ServerContext { server, display_handle, egfx_shared, listener })
+    Ok(ServerContext { server, display_handle })
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
-    // Note: ironrdp-server's run() resets static_channels after each connection.
-    // We can't do that (private field), but run_connection() overwrites it
-    // in accept_finalize() each time, so stale state doesn't leak across sessions.
-
-    // Accept new connections in a background task so that accept errors
-    // don't cancel the active RDP session via tokio::select!.
-    let (new_conn_tx, mut new_conn_rx) = tokio::sync::mpsc::channel::<tokio::net::TcpStream>(1);
-    let listener = std::mem::replace(
-        &mut ctx.listener,
-        // Placeholder — listener is moved to the accept task
-        tokio::net::TcpListener::bind("127.0.0.1:0").await?,
-    );
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, peer)) => {
-                    tracing::info!(%peer, "RDP connection accepted");
-                    if new_conn_tx.send(stream).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "Accept error");
-                }
-            }
-        }
-    });
-
-    let mut pending: Option<tokio::net::TcpStream> = None;
-
-    loop {
-        let stream = match pending.take() {
-            Some(s) => s,
-            None => match new_conn_rx.recv().await {
-                Some(s) => s,
-                None => anyhow::bail!("accept task exited"),
-            },
-        };
-
-        tokio::select! {
-            result = ctx.server.run_connection(stream) => {
-                if let Err(e) = result {
-                    tracing::error!(error = %e, "Connection error");
-                }
-            }
-            new_stream = new_conn_rx.recv() => {
-                if let Some(s) = new_stream {
-                    tracing::info!("New connection, replacing current session");
-                    pending = Some(s);
-                }
-            }
-        }
-        // Reset channel state after each connection (same as run() does internally).
-        ctx.server.reset_channels();
-        ctx.egfx_shared.reset_for_new_client();
-    }
+    ctx.server.run().await
 }
 
 /// Auto-generate a self-signed TLS certificate and persist it.

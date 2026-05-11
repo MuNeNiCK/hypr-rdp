@@ -4,7 +4,7 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from any RDP cl
 
 ## Features
 
-- **H.264/EGFX** — Hardware-accelerated encoding via VA-API (Intel/AMD), with OpenH264 software fallback
+- **H.264/EGFX** — OpenH264 software encoding by default, with optional VA-API hardware encoding
 - **Screen capture** — `wlr-screencopy-v1` and `ext-image-copy-capture-v1` protocols
 - **Audio** — PipeWire audio forwarding via RDPSND
 - **Clipboard** — Bidirectional text and image clipboard sync
@@ -33,13 +33,14 @@ tar xzf hypr-rdp-v*.tar.gz
 sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-Runtime dependencies: `libva`, `pipewire`, `libxkbcommon`
+Runtime dependencies: `openh264`, `pipewire`, `libxkbcommon`
 
 ### Build from source
 
 Requirements:
 - Rust 1.75+
-- `libva`, `pipewire`, `libxkbcommon` (development headers)
+- `pipewire`, `libxkbcommon` (development headers)
+- `openh264` at runtime
 
 ```sh
 git clone https://github.com/MuNeNICK/hypr-rdp.git
@@ -48,15 +49,15 @@ cargo build --release
 sudo install -Dm755 target/release/hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-Software-only build (no VA-API dependency):
+VA-API build (optional hardware encoding):
 
 ```sh
-cargo build --release --no-default-features
+cargo build --release --features vaapi
 ```
 
 ## Usage
 
-Requires **Hyprland 0.54+** and optionally a VA-API driver (`intel-media-driver` for Intel, `libva-mesa-driver` for AMD) for hardware encoding.
+Requires **Hyprland 0.54+**. VA-API builds additionally need `libva` and a VA-API driver (`intel-media-driver` for Intel, `libva-mesa-driver` for AMD).
 
 ```sh
 # Basic (auto-generates TLS cert, binds to 127.0.0.1:3389)

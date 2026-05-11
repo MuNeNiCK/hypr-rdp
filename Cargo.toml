@@ -6,23 +6,25 @@ description = "Native RDP server for Hyprland"
 license = "MIT"
 
 [features]
-default = ["vaapi"]
+# Keep the default build software-only so Arch/libva updates do not break
+# installation. VA-API can be enabled explicitly with `--features vaapi`.
+default = []
 vaapi = ["dep:cros-libva"]
 
 [dependencies]
 # VA-API hardware encoding (Intel/AMD)
 cros-libva = { version = "0.0.13", optional = true }
-# RDP server (official Devolutions repo, main branch has EGFX merged)
-ironrdp-server = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-egfx = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-dvc = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-svc = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-cliprdr = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-rdpsnd = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-core = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-displaycontrol = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
-ironrdp-graphics = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
+# RDP server (official Devolutions repo; pin a known master revision for reproducible builds)
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
 
 # H.264 encoding (OpenH264 software encoder)
 openh264 = { version = "0.9", features = ["libloading"] }
@@ -48,7 +50,7 @@ libc = "0.2"
 rcgen = "0.13"
 
 # Clipboard image support (DIB/PNG conversion)
-ironrdp-cliprdr-format = { git = "https://github.com/MuNeNICK/IronRDP.git", branch = "hypr-rdp-fixes" }
+ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", rev = "ba8b8b30f1d3a6374e33ff72e0d930e88ac8f8da" }
 
 # Config file
 serde = { version = "1", features = ["derive"] }
