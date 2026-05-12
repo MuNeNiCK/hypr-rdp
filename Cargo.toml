@@ -28,6 +28,7 @@ ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP.git", rev = "
 
 # H.264 encoding (OpenH264 software encoder)
 openh264 = { version = "0.9", features = ["libloading"] }
+yuv = "0.8.14"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -1433,6 +1433,7 @@ dependencies = [
  "wayland-protocols-wlr",
  "wayland-scanner",
  "xkbcommon",
+ "yuv",
 ]
 
 [[package]]

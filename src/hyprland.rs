@@ -9,15 +9,15 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 
 fn socket_path() -> Result<String> {
-    let sig =
-        std::env::var("HYPRLAND_INSTANCE_SIGNATURE").context("HYPRLAND_INSTANCE_SIGNATURE not set")?;
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .context("HYPRLAND_INSTANCE_SIGNATURE not set")?;
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?;
     Ok(format!("{}/hypr/{}/.socket.sock", runtime_dir, sig))
 }
 
 fn socket2_path() -> Result<String> {
-    let sig =
-        std::env::var("HYPRLAND_INSTANCE_SIGNATURE").context("HYPRLAND_INSTANCE_SIGNATURE not set")?;
+    let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE")
+        .context("HYPRLAND_INSTANCE_SIGNATURE not set")?;
     let runtime_dir = std::env::var("XDG_RUNTIME_DIR").context("XDG_RUNTIME_DIR not set")?;
     Ok(format!("{}/hypr/{}/.socket2.sock", runtime_dir, sig))
 }

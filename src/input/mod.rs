@@ -50,8 +50,14 @@ impl SharedOutputLayout {
     }
 
     pub fn update_from_output(&self, output_name: &str) -> Result<()> {
-        let (output_w, output_h, layout_extent_w, layout_extent_h, output_offset_x, output_offset_y) =
-            query_layout(output_name)?;
+        let (
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+        ) = query_layout(output_name)?;
         let snapshot = OutputLayoutSnapshot {
             output_name: output_name.to_string(),
             output_w,
@@ -115,7 +121,6 @@ impl InputState {
             tracing::warn!("Wayland flush failed: {}", e);
         }
     }
-
 }
 
 /// Evdev keycode + required modifier (e.g. Shift) for a Unicode character.
@@ -269,12 +274,8 @@ impl HyprInputHandler {
             .map(|(o, _)| o)
             .context(format!("wl_output '{}' not found", layout.output_name))?;
 
-        let vp = vp_mgr.create_virtual_pointer_with_output(
-            Some(&seat),
-            Some(target_output),
-            &qh,
-            (),
-        );
+        let vp =
+            vp_mgr.create_virtual_pointer_with_output(Some(&seat), Some(target_output), &qh, ());
 
         // Release all wl_output proxies — they were only needed to find the
         // target output for create_virtual_pointer_with_output. Keeping them
@@ -369,7 +370,14 @@ fn query_layout(output_name: &str) -> Result<(u32, u32, u32, u32, u32, u32)> {
     let offset_x = (target_x - min_x) as u32;
     let offset_y = (target_y - min_y) as u32;
 
-    Ok((target_w as u32, target_h as u32, layout_w, layout_h, offset_x, offset_y))
+    Ok((
+        target_w as u32,
+        target_h as u32,
+        layout_w,
+        layout_h,
+        offset_x,
+        offset_y,
+    ))
 }
 
 fn load_keymap(
@@ -415,7 +423,9 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
 
 impl RdpServerInputHandler for HyprInputHandler {
     fn keyboard(&mut self, event: KeyboardEvent) {
-        let Ok(mut state) = self.state.lock() else { return };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
 
         let t = state.timestamp();
         match event {
@@ -471,7 +481,9 @@ impl RdpServerInputHandler for HyprInputHandler {
     }
 
     fn mouse(&mut self, event: MouseEvent) {
-        let Ok(mut state) = self.state.lock() else { return };
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
         let t = state.timestamp();
 
         match event {
@@ -482,13 +494,9 @@ impl RdpServerInputHandler for HyprInputHandler {
                 let Some(layout) = state.output_layout.snapshot() else {
                     return;
                 };
-                state.vp.motion_absolute(
-                    t,
-                    x as u32,
-                    y as u32,
-                    layout.output_w,
-                    layout.output_h,
-                );
+                state
+                    .vp
+                    .motion_absolute(t, x as u32, y as u32, layout.output_w, layout.output_h);
                 state.vp.frame();
                 state.flush();
             }
@@ -518,7 +526,9 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.flush();
             }
             MouseEvent::MiddleReleased => {
-                state.vp.button(t, keymap::BTN_MIDDLE, ButtonState::Released);
+                state
+                    .vp
+                    .button(t, keymap::BTN_MIDDLE, ButtonState::Released);
                 state.vp.frame();
                 state.flush();
             }
@@ -547,7 +557,9 @@ impl RdpServerInputHandler for HyprInputHandler {
                 let discrete = -((value as f64 / 120.0).round() as i32);
                 let continuous = discrete as f64 * 15.0;
                 state.vp.axis_source(AxisSource::Wheel);
-                state.vp.axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
+                state
+                    .vp
+                    .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
                 state.vp.frame();
                 state.flush();
             }
@@ -556,12 +568,16 @@ impl RdpServerInputHandler for HyprInputHandler {
                 if y != 0 {
                     let discrete = -((y as f64 / 120.0).round() as i32);
                     let continuous = discrete as f64 * 15.0;
-                    state.vp.axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
+                    state
+                        .vp
+                        .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
                 }
                 if x != 0 {
                     let discrete = -((x as f64 / 120.0).round() as i32);
                     let continuous = discrete as f64 * 15.0;
-                    state.vp.axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
+                    state
+                        .vp
+                        .axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
                 }
                 state.vp.frame();
                 state.flush();

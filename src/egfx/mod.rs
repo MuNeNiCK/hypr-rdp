@@ -9,16 +9,30 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum H264RateControl {
+    Vbr,
+    Cqp,
+}
+
 /// Encoder backend: VAAPI hardware or OpenH264 software.
 pub enum FrameEncoder {
     #[cfg(feature = "vaapi")]
     Vaapi(Box<vaapi::VaapiEncoder>),
     Software(Box<encoder::H264Encoder>),
+    SoftwareAvc444(Box<encoder::Avc444Encoder>),
 }
 
 impl FrameEncoder {
     /// Try VAAPI first, fall back to software.
-    pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
         {
             match vaapi::VaapiEncoder::new(width, height, bitrate, fps) {
@@ -32,7 +46,7 @@ impl FrameEncoder {
             }
         }
 
-        let enc = encoder::H264Encoder::new(width, height, bitrate, fps)?;
+        let enc = encoder::H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using OpenH264 software encoder");
         Ok(Self::Software(Box::new(enc)))
     }
@@ -42,6 +56,27 @@ impl FrameEncoder {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(enc) => enc.encode(bgra, stride),
             Self::Software(enc) => enc.encode(bgra, stride),
+            Self::SoftwareAvc444(_) => anyhow::bail!("AVC444 encoder requires encode_avc444"),
+        }
+    }
+
+    pub fn encode_avc444(
+        &mut self,
+        bgra: &[u8],
+        stride: usize,
+        candidate_regions: &[(i32, i32, i32, i32)],
+    ) -> Result<encoder::Avc444EncodedFrame> {
+        match self {
+            Self::SoftwareAvc444(enc) => enc.encode(bgra, stride, candidate_regions),
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) => anyhow::bail!("AVC444 encoding requires software encoder"),
+            Self::Software(_) => anyhow::bail!("AVC444 encoding requires AVC444 encoder"),
+        }
+    }
+
+    pub fn commit_avc444_reference(&mut self) {
+        if let Self::SoftwareAvc444(enc) = self {
+            enc.commit_reference();
         }
     }
 
@@ -60,7 +95,9 @@ impl FrameEncoder {
         uv_offset: u32,
     ) -> Result<Vec<u8>> {
         match self {
-            Self::Vaapi(enc) => enc.encode_dmabuf(nv12_fd, width, height, stride, offset, modifier, uv_stride, uv_offset),
+            Self::Vaapi(enc) => enc.encode_dmabuf(
+                nv12_fd, width, height, stride, offset, modifier, uv_stride, uv_offset,
+            ),
             Self::Software(_) => anyhow::bail!("DMA-BUF encode requires VA-API backend"),
         }
     }
@@ -70,6 +107,7 @@ impl FrameEncoder {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => "vaapi",
             Self::Software(_) => "openh264",
+            Self::SoftwareAvc444(_) => "openh264-avc444",
         }
     }
 
@@ -78,14 +116,35 @@ impl FrameEncoder {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => true,
             Self::Software(_) => false,
+            Self::SoftwareAvc444(_) => false,
         }
     }
 
     /// Create a software-only encoder (fallback when VA-API fails at runtime).
-    pub fn new_software_only(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
-        let enc = encoder::H264Encoder::new(width, height, bitrate, fps)?;
+    pub fn new_software_only(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
+        let enc = encoder::H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using OpenH264 software encoder (runtime fallback)");
         Ok(Self::Software(Box::new(enc)))
+    }
+
+    pub fn new_avc444_software_only(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
+        let enc = encoder::Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
+        tracing::info!("Using OpenH264 software AVC444 encoder");
+        Ok(Self::SoftwareAvc444(Box::new(enc)))
     }
 
     /// Force the next encoded frame to be an IDR (recovery after dropped frames).
@@ -93,7 +152,8 @@ impl FrameEncoder {
         match self {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(enc) => enc.force_idr(),
-            Self::Software(_) => {} // OpenH264 manages IDR internally
+            Self::Software(enc) => enc.force_idr(),
+            Self::SoftwareAvc444(enc) => enc.force_idr(),
         }
     }
 }
@@ -159,6 +219,8 @@ use ironrdp_server::{
 };
 use tokio::sync::mpsc;
 
+pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 120;
+
 /// Shared EGFX state accessible from factory, handler, and capture thread.
 pub struct EgfxShared {
     /// The GFX server handle (set once during build_server_with_handle)
@@ -167,23 +229,29 @@ pub struct EgfxShared {
     ready: AtomicBool,
     /// Whether the negotiated capability supports AVC420/AVC444 (H.264)
     avc_enabled: AtomicBool,
+    /// Whether the negotiated capability supports AVC444.
+    avc444_enabled: AtomicBool,
     /// Incremented each time on_ready fires; lets capture thread detect re-negotiation
     ready_generation: AtomicU32,
     /// Event sender for routing encoded frames to the RDP wire
     event_sender: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
     /// Surface size for auto-create in EGFX negotiation
     surface_size: Mutex<(u16, u16)>,
+    /// Flow-control window for latency/throughput tuning.
+    max_frames_in_flight: AtomicU32,
 }
 
 impl EgfxShared {
-    pub fn new() -> Self {
+    pub fn new(max_frames_in_flight: u32) -> Self {
         Self {
             handle: Mutex::new(None),
             ready: AtomicBool::new(false),
             avc_enabled: AtomicBool::new(false),
+            avc444_enabled: AtomicBool::new(false),
             ready_generation: AtomicU32::new(0),
             event_sender: Mutex::new(None),
             surface_size: Mutex::new((0, 0)),
+            max_frames_in_flight: AtomicU32::new(max_frames_in_flight.max(1)),
         }
     }
 
@@ -197,8 +265,16 @@ impl EgfxShared {
         self.surface_size.lock().map(|g| *g).unwrap_or((0, 0))
     }
 
+    fn max_frames_in_flight(&self) -> u32 {
+        self.max_frames_in_flight.load(Ordering::Acquire).max(1)
+    }
+
     pub fn is_avc_enabled(&self) -> bool {
         self.avc_enabled.load(Ordering::Acquire)
+    }
+
+    pub fn is_avc444_enabled(&self) -> bool {
+        self.avc444_enabled.load(Ordering::Acquire)
     }
 
     pub fn is_ready(&self) -> bool {
@@ -223,6 +299,7 @@ impl EgfxShared {
     pub fn reset_for_new_client(&self) {
         self.ready.store(false, Ordering::Release);
         self.avc_enabled.store(false, Ordering::Release);
+        self.avc444_enabled.store(false, Ordering::Release);
     }
 
     /// Prepare EGFX state for a resize (Deactivation-Reactivation).
@@ -243,7 +320,9 @@ impl EgfxShared {
         let dvc_messages;
         let channel_id;
         {
-            let Ok(mut server) = handle.lock() else { return };
+            let Ok(mut server) = handle.lock() else {
+                return;
+            };
             if !server.is_ready() {
                 return;
             }
@@ -282,7 +361,9 @@ impl EgfxShared {
         width: u16,
         height: u16,
     ) -> Option<u16> {
-        let Ok(mut server) = handle.lock() else { return None };
+        let Ok(mut server) = handle.lock() else {
+            return None;
+        };
 
         if !server.is_ready() {
             return None;
@@ -307,7 +388,10 @@ impl EgfxShared {
 
         // Drain and send all setup PDUs
         let dvc_messages = server.drain_output();
-        tracing::debug!(count = dvc_messages.len(), "EGFX: draining surface setup PDUs");
+        tracing::debug!(
+            count = dvc_messages.len(),
+            "EGFX: draining surface setup PDUs"
+        );
         drop(server); // Release lock before encoding
 
         if !dvc_messages.is_empty() {
@@ -332,6 +416,17 @@ impl EgfxShared {
         Some(sid)
     }
 
+    /// Return whether an EGFX frame can be queued now.
+    ///
+    /// This is checked before H.264 encoding so a frame that cannot be sent does
+    /// not advance the encoder reference chain.
+    pub fn can_send_frame(handle: &GfxServerHandle) -> bool {
+        let Ok(server) = handle.lock() else {
+            return false;
+        };
+        server.is_ready() && server.channel_id().is_some() && !server.should_backpressure()
+    }
+
     /// Send an encoded H.264 frame via EGFX.
     /// Surface must already be initialized via `init_surface`.
     #[allow(clippy::too_many_arguments)]
@@ -345,9 +440,37 @@ impl EgfxShared {
         timestamp_ms: u32,
         quality: u8,
     ) -> bool {
+        let regions = [rdpegfx_full_frame_region(width, height, quality)];
+        Self::send_frame_with_regions(
+            handle,
+            sender,
+            surface_id,
+            h264_data,
+            &regions,
+            timestamp_ms,
+        )
+    }
+
+    /// Send an encoded H.264 frame via EGFX using RDPEGFX AVC420 region metadata.
+    /// Surface must already be initialized via `init_surface`.
+    pub fn send_frame_with_regions(
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        surface_id: u16,
+        h264_data: &[u8],
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+    ) -> bool {
+        if regions.is_empty() {
+            tracing::debug!("send_frame_with_regions: no regions");
+            return false;
+        }
+
         // Lock, send frame, drain — minimize lock duration
         let (_frame_id, dvc_messages, channel_id) = {
-            let Ok(mut server) = handle.lock() else { return false };
+            let Ok(mut server) = handle.lock() else {
+                return false;
+            };
 
             if !server.is_ready() {
                 tracing::debug!("send_frame: server not ready");
@@ -369,9 +492,8 @@ impl EgfxShared {
                 }
             };
 
-            let regions = [Avc420Region::full_frame(width, height, quality)];
             let frame_id =
-                match server.send_avc420_frame(surface_id, h264_data, &regions, timestamp_ms) {
+                match server.send_avc420_frame(surface_id, h264_data, regions, timestamp_ms) {
                     Some(id) => id,
                     None => {
                         tracing::debug!("send_frame: send_avc420_frame returned None");
@@ -394,9 +516,15 @@ impl EgfxShared {
             ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
         ) {
             Ok(svc_messages) => {
-                let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                    messages: svc_messages,
-                }));
+                if sender
+                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages: svc_messages,
+                    }))
+                    .is_err()
+                {
+                    tracing::debug!("send_frame: EGFX event channel closed");
+                    return false;
+                }
             }
             Err(e) => {
                 tracing::error!("Failed to encode EGFX frame: {}", e);
@@ -407,12 +535,126 @@ impl EgfxShared {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_avc444_frame_with_regions(
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        surface_id: u16,
+        luma_data: &[u8],
+        luma_regions: &[Avc420Region],
+        chroma_data: Option<&[u8]>,
+        chroma_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> bool {
+        if luma_regions.is_empty() {
+            tracing::debug!("send_avc444_frame_with_regions: no regions");
+            return false;
+        }
+
+        let (_frame_id, dvc_messages, channel_id) = {
+            let Ok(mut server) = handle.lock() else {
+                return false;
+            };
+
+            if !server.is_ready() {
+                tracing::debug!("send_avc444_frame: server not ready");
+                return false;
+            }
+            if server.should_backpressure() {
+                tracing::debug!(
+                    in_flight = server.frames_in_flight(),
+                    "send_avc444_frame: backpressure"
+                );
+                return false;
+            }
+
+            let channel_id = match server.channel_id() {
+                Some(id) => id,
+                None => {
+                    tracing::debug!("send_avc444_frame: no channel_id");
+                    return false;
+                }
+            };
+
+            let frame_id = match server.send_avc444_frame(
+                surface_id,
+                luma_data,
+                luma_regions,
+                chroma_data,
+                chroma_regions,
+                timestamp_ms,
+            ) {
+                Some(id) => id,
+                None => {
+                    tracing::debug!("send_avc444_frame: send_avc444_frame returned None");
+                    return false;
+                }
+            };
+
+            let dvc_messages = server.drain_output();
+            (frame_id, dvc_messages, channel_id)
+        };
+
+        if dvc_messages.is_empty() {
+            return false;
+        }
+
+        match ironrdp_dvc::encode_dvc_messages(
+            channel_id,
+            dvc_messages,
+            ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+        ) {
+            Ok(svc_messages) => {
+                if sender
+                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages: svc_messages,
+                    }))
+                    .is_err()
+                {
+                    tracing::debug!("send_avc444_frame: EGFX event channel closed");
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to encode EGFX AVC444 frame: {}", e);
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
+pub(crate) fn rdpegfx_region_quality(qp: u8) -> u8 {
+    100u8.saturating_sub(qp & 0x3f)
+}
+
+pub(crate) fn rdpegfx_full_frame_region(width: u16, height: u16, qp: u8) -> Avc420Region {
+    // RDPGFX_RECT16 uses exclusive right/bottom bounds. Build the region
+    // explicitly to avoid depending on helper-specific bounds behavior.
+    Avc420Region::new(0, 0, width, height, qp, rdpegfx_region_quality(qp))
 }
 
 /// Factory for creating EGFX pipeline handlers.
 pub struct HyprGfxFactory {
     shared: Arc<EgfxShared>,
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_frame_region_uses_rdpegfx_exclusive_bounds() {
+        let region = rdpegfx_full_frame_region(1280, 720, 23);
+        assert_eq!(region.left, 0);
+        assert_eq!(region.top, 0);
+        assert_eq!(region.right, 1280);
+        assert_eq!(region.bottom, 720);
+        assert_eq!(region.quantization_parameter, 23);
+        assert_eq!(region.quality, 77);
+    }
 }
 
 impl HyprGfxFactory {
@@ -478,15 +720,27 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
         // V8_1 without SMALL_CACHE — iOS sends SMALL_CACHE but
         // intersect (AND) will clear it if server doesn't set it.
         vec![
-            CapabilitySet::V10_7 { flags: CapabilitiesV107Flags::empty() },
-            CapabilitySet::V8_1 { flags: CapabilitiesV81Flags::empty() },
-            CapabilitySet::V10 { flags: CapabilitiesV10Flags::empty() },
-            CapabilitySet::V8 { flags: CapabilitiesV8Flags::empty() },
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::empty(),
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty(),
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            },
         ]
     }
 
     fn max_frames_in_flight(&self) -> u32 {
-        10
+        self.shared.max_frames_in_flight()
+    }
+
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
+        tracing::info!(frame_id, queue_depth, "EGFX: frame acknowledged");
     }
 
     fn capabilities_advertise(&mut self, pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {
@@ -498,31 +752,52 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
         use ironrdp_egfx::pdu::*;
-        let avc = match cap {
-            CapabilitySet::V8 { .. } => false,
-            CapabilitySet::V8_1 { flags } => flags.contains(CapabilitiesV81Flags::AVC420_ENABLED),
-            CapabilitySet::V10 { flags } => !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
-            CapabilitySet::V10_1 => true,
-            CapabilitySet::V10_2 { flags } => !flags.contains(CapabilitiesV10Flags::AVC_DISABLED),
-            CapabilitySet::V10_3 { flags } => !flags.contains(CapabilitiesV103Flags::AVC_DISABLED),
-            CapabilitySet::V10_4 { flags } => !flags.contains(CapabilitiesV104Flags::AVC_DISABLED),
-            CapabilitySet::V10_5 { .. } | CapabilitySet::V10_6 { .. } | CapabilitySet::V10_6Err { .. } => true,
-            CapabilitySet::V10_7 { flags } => !flags.contains(CapabilitiesV107Flags::AVC_DISABLED),
-            CapabilitySet::Unknown(_) => false,
+        let (avc420, _avc444) = match cap {
+            CapabilitySet::V8 { .. } => (false, false),
+            CapabilitySet::V8_1 { flags } => {
+                (flags.contains(CapabilitiesV81Flags::AVC420_ENABLED), false)
+            }
+            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+                let enabled = !flags.contains(CapabilitiesV10Flags::AVC_DISABLED);
+                (enabled, enabled)
+            }
+            CapabilitySet::V10_1 => (true, true),
+            CapabilitySet::V10_3 { flags } => {
+                let enabled = !flags.contains(CapabilitiesV103Flags::AVC_DISABLED);
+                (enabled, enabled)
+            }
+            CapabilitySet::V10_4 { flags }
+            | CapabilitySet::V10_5 { flags }
+            | CapabilitySet::V10_6 { flags }
+            | CapabilitySet::V10_6Err { flags } => {
+                let enabled = !flags.contains(CapabilitiesV104Flags::AVC_DISABLED);
+                (enabled, enabled)
+            }
+            CapabilitySet::V10_7 { flags } => {
+                let enabled = !flags.contains(CapabilitiesV107Flags::AVC_DISABLED);
+                (enabled, enabled)
+            }
+            CapabilitySet::Unknown(_) => (false, false),
         };
+        let avc444 = false;
+        let avc = avc420 || avc444;
         self.shared.avc_enabled.store(avc, Ordering::Release);
+        self.shared.avc444_enabled.store(avc444, Ordering::Release);
 
         let was_ready = self.shared.ready.load(Ordering::Acquire);
         if was_ready {
-            tracing::info!(?cap, avc, "EGFX: client re-negotiated (keeping surface)");
+            tracing::info!(
+                ?cap,
+                avc420,
+                avc444,
+                "EGFX: client re-negotiated (keeping surface)"
+            );
         } else {
-            tracing::info!(?cap, avc, "EGFX: channel ready (first time)");
+            tracing::info!(?cap, avc420, avc444, "EGFX: channel ready (first time)");
             self.shared.ready_generation.fetch_add(1, Ordering::Release);
         }
         self.shared.ready.store(true, Ordering::Release);
     }
-
-    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32) {}
 
     fn on_close(&mut self) {
         tracing::info!("EGFX: channel closed");

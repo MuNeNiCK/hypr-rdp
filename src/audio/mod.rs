@@ -26,9 +26,7 @@ pub struct HyprSoundFactory {
 
 impl HyprSoundFactory {
     pub fn new() -> Self {
-        Self {
-            event_sender: None,
-        }
+        Self { event_sender: None }
     }
 }
 
@@ -81,7 +79,9 @@ impl RdpsndServerHandler for HyprSoundHandler {
         tracing::info!(
             client_formats = client_format.formats.len(),
             "Audio: starting capture ({}Hz, {}ch, {}bit)",
-            SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE
+            SAMPLE_RATE,
+            CHANNELS,
+            BITS_PER_SAMPLE
         );
 
         // Find our PCM format in the client's format list

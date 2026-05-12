@@ -8,7 +8,7 @@ use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
 use crate::audio::HyprSoundFactory;
 use crate::capture::{CaptureMode, HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
-use crate::egfx::{EgfxShared, HyprGfxFactory};
+use crate::egfx::{EgfxShared, H264RateControl, HyprGfxFactory};
 use crate::input::{HyprInputHandler, SharedOutputLayout};
 
 pub struct ServerContext {
@@ -27,12 +27,15 @@ pub async fn setup(
     capture_mode: CaptureMode,
     bitrate: u32,
     quality: u8,
+    rate_control: H264RateControl,
     fps: u32,
+    max_frames_in_flight: u32,
+    resolution_fixed: bool,
     output: Option<String>,
 ) -> Result<ServerContext> {
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
 
-    let egfx_shared = Arc::new(EgfxShared::new());
+    let egfx_shared = Arc::new(EgfxShared::new(max_frames_in_flight));
     let output_layout = Arc::new(SharedOutputLayout::new());
 
     let (display, display_handle, (rdp_width, rdp_height)) = HyprDisplay::new(
@@ -42,7 +45,9 @@ pub async fn setup(
         Arc::clone(&output_layout),
         bitrate,
         quality,
+        rate_control,
         fps,
+        resolution_fixed,
         output,
     )
     .await
@@ -64,13 +69,15 @@ pub async fn setup(
         (None, None) => {
             let (c, k) = auto_generate_tls().context("auto TLS certificate generation failed")?;
             tracing::info!("Using auto-generated TLS certificate");
-            (c.to_string_lossy().into_owned(), k.to_string_lossy().into_owned())
+            (
+                c.to_string_lossy().into_owned(),
+                k.to_string_lossy().into_owned(),
+            )
         }
     };
 
-    let tls_ctx =
-        TlsIdentityCtx::init_from_paths(Path::new(&cert_path), Path::new(&key_path))
-            .context("failed to load TLS certificates")?;
+    let tls_ctx = TlsIdentityCtx::init_from_paths(Path::new(&cert_path), Path::new(&key_path))
+        .context("failed to load TLS certificates")?;
     let acceptor = tls_ctx
         .make_acceptor()
         .context("failed to create TLS acceptor")?;
@@ -96,7 +103,10 @@ pub async fn setup(
 
     tracing::info!("RDP server configured for {}", addr);
 
-    Ok(ServerContext { server, display_handle })
+    Ok(ServerContext {
+        server,
+        display_handle,
+    })
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
@@ -113,16 +123,17 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     let key_path = config_dir.join("key.pem");
 
     if cert_path.exists() && key_path.exists() {
-        tracing::info!("Reusing existing TLS certificate from {}", config_dir.display());
+        tracing::info!(
+            "Reusing existing TLS certificate from {}",
+            config_dir.display()
+        );
         return Ok((cert_path, key_path));
     }
 
-    std::fs::create_dir_all(&config_dir)
-        .context("failed to create config directory")?;
+    std::fs::create_dir_all(&config_dir).context("failed to create config directory")?;
 
     let lock_path = config_dir.join(".tls.lock");
-    let lock_file = std::fs::File::create(&lock_path)
-        .context("failed to create TLS lock file")?;
+    let lock_file = std::fs::File::create(&lock_path).context("failed to create TLS lock file")?;
     let lock_fd = std::os::fd::AsRawFd::as_raw_fd(&lock_file);
     let ret = unsafe { libc::flock(lock_fd, libc::LOCK_EX) };
     if ret != 0 {
@@ -130,7 +141,10 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     }
 
     if cert_path.exists() && key_path.exists() {
-        tracing::info!("Reusing existing TLS certificate from {}", config_dir.display());
+        tracing::info!(
+            "Reusing existing TLS certificate from {}",
+            config_dir.display()
+        );
         return Ok((cert_path, key_path));
     }
 
@@ -153,14 +167,14 @@ fn auto_generate_tls() -> Result<(PathBuf, PathBuf)> {
     }
 
     let tmp_cert = config_dir.join(".cert.pem.tmp");
-    std::fs::write(&tmp_cert, cert.pem())
-        .context("failed to write cert.pem")?;
+    std::fs::write(&tmp_cert, cert.pem()).context("failed to write cert.pem")?;
 
-    std::fs::rename(&tmp_key, &key_path)
-        .context("failed to finalize key.pem")?;
-    std::fs::rename(&tmp_cert, &cert_path)
-        .context("failed to finalize cert.pem")?;
+    std::fs::rename(&tmp_key, &key_path).context("failed to finalize key.pem")?;
+    std::fs::rename(&tmp_cert, &cert_path).context("failed to finalize cert.pem")?;
 
-    tracing::info!("Generated self-signed TLS certificate in {}", config_dir.display());
+    tracing::info!(
+        "Generated self-signed TLS certificate in {}",
+        config_dir.display()
+    );
     Ok((cert_path, key_path))
 }

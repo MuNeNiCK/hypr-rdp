@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use ironrdp_cliprdr::backend::{CliprdrBackend, CliprdrBackendFactory, ClipboardMessage};
+use ironrdp_cliprdr::backend::{ClipboardMessage, CliprdrBackend, CliprdrBackendFactory};
 use ironrdp_cliprdr::pdu::{
     ClipboardFormat, ClipboardFormatId, ClipboardGeneralCapabilityFlags, FileContentsRequest,
     FileContentsResponse, FormatDataRequest, FormatDataResponse, LockDataId,
@@ -49,9 +49,7 @@ pub struct HyprCliprdrFactory {
 
 impl HyprCliprdrFactory {
     pub fn new() -> Self {
-        Self {
-            event_sender: None,
-        }
+        Self { event_sender: None }
     }
 }
 
@@ -156,9 +154,9 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
         if !formats.is_empty() {
             if let Some(ref sender) = self.event_sender {
-                let _ = sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiateCopy(formats),
-                ));
+                let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+                    formats,
+                )));
             }
         }
     }
@@ -200,9 +198,9 @@ impl CliprdrBackend for HyprCliprdrBackend {
         if let Some(fmt) = format {
             self.last_requested_format = Some(fmt);
             if let Some(ref sender) = self.event_sender {
-                let _ = sender.send(ServerEvent::Clipboard(
-                    ClipboardMessage::SendInitiatePaste(fmt),
-                ));
+                let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                    fmt,
+                )));
             }
         }
     }
@@ -230,9 +228,9 @@ impl CliprdrBackend for HyprCliprdrBackend {
         };
 
         if let Some(ref sender) = self.event_sender {
-            let _ = sender.send(ServerEvent::Clipboard(
-                ClipboardMessage::SendFormatData(response),
-            ));
+            let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendFormatData(
+                response,
+            )));
         }
     }
 
@@ -277,17 +275,15 @@ impl CliprdrBackend for HyprCliprdrBackend {
         } else if requested_format == Some(ClipboardFormatId::CF_DIB) {
             // Convert CF_DIB to PNG for Wayland
             // Try standard dib_to_png first, then fix BITFIELDS if needed
-            let png_result = ironrdp_cliprdr_format::bitmap::dib_to_png(data)
-                .or_else(|_| {
-                    // Windows often sends 32-bit BGRA with BI_BITFIELDS compression.
-                    // dib_to_png doesn't handle this, so strip the color masks and
-                    // convert to BI_RGB for a second attempt.
-                    let fixed = fix_bitfields_dib(data)
-                        .ok_or_else(|| ironrdp_cliprdr_format::bitmap::BitmapError::Unsupported(
-                            "cannot fix BITFIELDS",
-                        ))?;
-                    ironrdp_cliprdr_format::bitmap::dib_to_png(&fixed)
-                });
+            let png_result = ironrdp_cliprdr_format::bitmap::dib_to_png(data).or_else(|_| {
+                // Windows often sends 32-bit BGRA with BI_BITFIELDS compression.
+                // dib_to_png doesn't handle this, so strip the color masks and
+                // convert to BI_RGB for a second attempt.
+                let fixed = fix_bitfields_dib(data).ok_or_else(|| {
+                    ironrdp_cliprdr_format::bitmap::BitmapError::Unsupported("cannot fix BITFIELDS")
+                })?;
+                ironrdp_cliprdr_format::bitmap::dib_to_png(&fixed)
+            });
             match png_result {
                 Ok(png_data) => {
                     tracing::debug!(len = png_data.len(), "Clipboard: converted DIB to PNG");
@@ -627,21 +623,26 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 };
 
                 // Check for text MIME
-                let text_mime = mimes.iter().find(|m| {
-                    m.as_str() == TEXT_MIME
-                        || m.as_str() == UTF8_MIME
-                        || m.as_str() == TEXT_PLAIN_MIME
-                }).cloned();
+                let text_mime = mimes
+                    .iter()
+                    .find(|m| {
+                        m.as_str() == TEXT_MIME
+                            || m.as_str() == UTF8_MIME
+                            || m.as_str() == TEXT_PLAIN_MIME
+                    })
+                    .cloned();
 
                 // Check for image MIME
-                let image_mime = mimes.iter().find(|m| {
-                    m.as_str() == IMAGE_PNG_MIME
-                }).cloned();
+                let image_mime = mimes.iter().find(|m| m.as_str() == IMAGE_PNG_MIME).cloned();
 
                 if text_mime.is_none() && image_mime.is_none() {
                     // No supported MIME — clear stale caches
-                    if let Ok(mut g) = state.clipboard_data.lock() { *g = None; }
-                    if let Ok(mut g) = state.clipboard_image.lock() { *g = None; }
+                    if let Ok(mut g) = state.clipboard_data.lock() {
+                        *g = None;
+                    }
+                    if let Ok(mut g) = state.clipboard_image.lock() {
+                        *g = None;
+                    }
                     offer.destroy();
                     return;
                 }
@@ -693,7 +694,10 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                                     formats.push(ClipboardFormat::new(ClipboardFormatId::CF_DIB));
                                 }
                                 Err(e) => {
-                                    tracing::warn!("Clipboard: PNG to DIB conversion failed: {}", e);
+                                    tracing::warn!(
+                                        "Clipboard: PNG to DIB conversion failed: {}",
+                                        e
+                                    );
                                 }
                             }
                         }

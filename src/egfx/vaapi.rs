@@ -39,11 +39,7 @@ fn find_vaapi_device() -> Result<PathBuf> {
     let mut devices: Vec<PathBuf> = std::fs::read_dir(dri_path)
         .context("failed to read /dev/dri")?
         .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .starts_with("renderD")
-        })
+        .filter(|e| e.file_name().to_string_lossy().starts_with("renderD"))
         .map(|e| e.path())
         .collect();
     devices.sort();
@@ -497,7 +493,9 @@ impl VaapiEncoder {
             self.dmabuf_input_surface = Some(surface);
         }
 
-        let dmabuf_surface = self.dmabuf_input_surface.as_ref()
+        let dmabuf_surface = self
+            .dmabuf_input_surface
+            .as_ref()
             .expect("dmabuf_input_surface must be set before encode");
         let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
 
@@ -515,11 +513,7 @@ impl VaapiEncoder {
         // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
         let poc = ((self.frame_count * 2) % 256) as i32;
 
-        let mut picture = Picture::new(
-            self.frame_count,
-            Rc::clone(&self.context),
-            dmabuf_surface,
-        );
+        let mut picture = Picture::new(self.frame_count, Rc::clone(&self.context), dmabuf_surface);
 
         if is_idr {
             self.last_ref = None;
@@ -620,7 +614,7 @@ impl VaapiEncoder {
         Ok(data)
     }
 
-    /// Convert BGRA to NV12 (BT.709 limited range) directly into VA image buffer,
+    /// Convert BGRA to NV12 (BT.709 full range) directly into VA image buffer,
     /// respecting the image's pitch and plane offsets.
     #[allow(clippy::too_many_arguments)]
     fn bgra_to_nv12(
@@ -636,12 +630,13 @@ impl VaapiEncoder {
     ) {
         if bgra.len() < h * src_stride {
             tracing::warn!(
-                bgra_len = bgra.len(), expected = h * src_stride,
+                bgra_len = bgra.len(),
+                expected = h * src_stride,
                 "BGRA buffer too small, skipping conversion"
             );
             return;
         }
-        // Y plane (BT.709 limited range)
+        // Y plane (BT.709 full range).
         for row in 0..h {
             let dst_start = y_offset + row * y_pitch;
             for col in 0..w {
@@ -649,12 +644,12 @@ impl VaapiEncoder {
                 let b = bgra[idx] as i32;
                 let g = bgra[idx + 1] as i32;
                 let r = bgra[idx + 2] as i32;
-                let y = ((47 * r + 157 * g + 16 * b + 128) >> 8) + 16;
+                let y = (54 * r + 183 * g + 18 * b) >> 8;
                 dst[dst_start + col] = y.clamp(0, 255) as u8;
             }
         }
 
-        // UV plane (NV12 interleaved, BT.709 limited range, half resolution)
+        // UV plane (NV12 interleaved, BT.709 full range, half resolution)
         for row in 0..(h / 2) {
             let dst_start = uv_offset + row * uv_pitch;
             for col in 0..(w / 2) {
@@ -678,8 +673,8 @@ impl VaapiEncoder {
                 let g = g_sum / 4;
                 let b = b_sum / 4;
 
-                let u = ((-26 * r - 87 * g + 112 * b + 128) >> 8) + 128;
-                let v = ((112 * r - 102 * g - 10 * b + 128) >> 8) + 128;
+                let u = ((-29 * r - 99 * g + 128 * b) >> 8) + 128;
+                let v = ((128 * r - 116 * g - 12 * b) >> 8) + 128;
 
                 dst[dst_start + col * 2] = u.clamp(0, 255) as u8;
                 dst[dst_start + col * 2 + 1] = v.clamp(0, 255) as u8;
@@ -740,7 +735,7 @@ impl VaapiEncoder {
             IDR_INTERVAL,          // intra_period
             IDR_INTERVAL,          // intra_idr_period
             1,                     // ip_period
-            self.bitrate,           // bits_per_second
+            self.bitrate,          // bits_per_second
             1,                     // max_num_ref_frames
             mb_width,
             mb_height,
@@ -753,9 +748,9 @@ impl VaapiEncoder {
             [0; 256], // offset_for_ref_frame
             None,     // frame_crop
             Some(vui_fields),
-            0,  // aspect_ratio_idc
-            1,  // sar_width
-            1,  // sar_height
+            0,            // aspect_ratio_idc
+            1,            // sar_width
+            1,            // sar_height
             1,            // num_units_in_tick
             self.fps * 2, // time_scale (2 * fps for progressive)
         )
@@ -800,7 +795,11 @@ impl VaapiEncoder {
             0u8
         };
 
-        let transform_8x8 = if self.profile == VAProfile::VAProfileH264High { 1 } else { 0 };
+        let transform_8x8 = if self.profile == VAProfile::VAProfileH264High {
+            1
+        } else {
+            0
+        };
 
         let pic_fields = H264EncPicFields::new(
             if is_idr { 1 } else { 0 }, // idr_pic_flag
@@ -873,12 +872,12 @@ impl VaapiEncoder {
             num_macroblocks,
             VA_INVALID_ID, // macroblock_info
             slice_type,
-            0,                 // pic_parameter_set_id
-            frame_num,         // idr_pic_id
+            0,          // pic_parameter_set_id
+            frame_num,  // idr_pic_id
             poc as u16, // pic_order_cnt_lsb (already wrapped at call site)
-            0,                 // delta_pic_order_cnt_bottom
-            [0, 0],            // delta_pic_order_cnt
-            0,                 // direct_spatial_mv_pred_flag
+            0,          // delta_pic_order_cnt_bottom
+            [0, 0],     // delta_pic_order_cnt
+            0,          // direct_spatial_mv_pred_flag
             num_ref_override,
             num_ref_l0, // num_ref_idx_l0_active_minus1
             0,          // num_ref_idx_l1_active_minus1
@@ -1007,7 +1006,13 @@ impl VaapiEncoder {
         bs.write_bits(1, 1); // vui_parameters_present_flag
         bs.write_bits(0, 1); // aspect_ratio_info_present_flag
         bs.write_bits(0, 1); // overscan_info_present_flag
-        bs.write_bits(0, 1); // video_signal_type_present_flag
+        bs.write_bits(1, 1); // video_signal_type_present_flag
+        bs.write_bits(5, 3); // video_format: unspecified
+        bs.write_bits(1, 1); // video_full_range_flag
+        bs.write_bits(1, 1); // colour_description_present_flag
+        bs.write_bits(1, 8); // colour_primaries: BT.709
+        bs.write_bits(1, 8); // transfer_characteristics: BT.709
+        bs.write_bits(1, 8); // matrix_coefficients: BT.709
         bs.write_bits(0, 1); // chroma_loc_info_present_flag
         bs.write_bits(1, 1); // timing_info_present_flag
         bs.write_bits(1, 32); // num_units_in_tick
@@ -1100,7 +1105,7 @@ impl BitWriter {
     fn write_ue(&mut self, value: u32) {
         let value = value + 1;
         let bits = 32 - value.leading_zeros(); // number of significant bits
-        // Write (bits-1) leading zeros, then the value in `bits` bits
+                                               // Write (bits-1) leading zeros, then the value in `bits` bits
         for _ in 0..(bits - 1) {
             self.write_bits(0, 1);
         }
@@ -1121,7 +1126,7 @@ impl BitWriter {
 
     fn write_rbsp_trailing_bits(&mut self) {
         self.write_bits(1, 1); // rbsp_stop_one_bit
-        // Pad to byte boundary with zeros
+                               // Pad to byte boundary with zeros
         if self.bits_in_byte > 0 {
             let padding = 8 - self.bits_in_byte;
             self.write_bits(0, padding);

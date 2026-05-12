@@ -135,7 +135,10 @@ impl GbmBo {
                 format
             );
         }
-        Ok(Self { ptr, cached_fd: None })
+        Ok(Self {
+            ptr,
+            cached_fd: None,
+        })
     }
 
     /// Allocate a buffer object without modifiers (fallback).
@@ -150,7 +153,10 @@ impl GbmBo {
                 format
             );
         }
-        Ok(Self { ptr, cached_fd: None })
+        Ok(Self {
+            ptr,
+            cached_fd: None,
+        })
     }
 
     pub fn fd(&mut self) -> Result<RawFd> {

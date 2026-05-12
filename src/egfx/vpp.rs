@@ -14,10 +14,9 @@ use crate::capture::dmabuf::DmaBufInfo;
 use cros_libva::{
     vaBeginPicture, vaCreateBuffer, vaCreateConfig, vaCreateContext, vaCreateSurfaces,
     vaDestroyBuffer, vaDestroyConfig, vaDestroyContext, vaDestroySurfaces, vaEndPicture,
-    vaExportSurfaceHandle, vaGetDisplayDRM, vaInitialize, vaRenderPicture,
-    vaSyncSurface, vaTerminate, VABufferID, VABufferType, VAConfigID, VAContextID,
-    VADisplay, VADRMPRIMESurfaceDescriptor, VAEntrypoint, VAProfile, VARectangle, VAStatus,
-    VASurfaceAttrib, VASurfaceID,
+    vaExportSurfaceHandle, vaGetDisplayDRM, vaInitialize, vaRenderPicture, vaSyncSurface,
+    vaTerminate, VABufferID, VABufferType, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
+    VADisplay, VAEntrypoint, VAProfile, VARectangle, VAStatus, VASurfaceAttrib, VASurfaceID,
 };
 
 // Constants from VA-API headers
@@ -237,8 +236,7 @@ impl VppConverter {
         attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32;
 
         // External buffer descriptor attribute
-        attrs[1].type_ =
-            cros_libva::VASurfaceAttribType::VASurfaceAttribExternalBufferDescriptor;
+        attrs[1].type_ = cros_libva::VASurfaceAttribType::VASurfaceAttribExternalBufferDescriptor;
         attrs[1].flags = cros_libva::VA_SURFACE_ATTRIB_SETTABLE;
         attrs[1].value.type_ = cros_libva::VAGenericValueType::VAGenericValueTypePointer;
         attrs[1].value.value.p = &mut desc as *mut _ as *mut std::ffi::c_void;
@@ -400,7 +398,9 @@ impl VppConverter {
             Ok(())
         })();
 
-        unsafe { vaDestroyBuffer(self.va_display, buffer_id); }
+        unsafe {
+            vaDestroyBuffer(self.va_display, buffer_id);
+        }
 
         result
     }

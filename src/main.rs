@@ -13,6 +13,8 @@ use clap::Parser;
 use serde::Deserialize;
 use tracing_subscriber::EnvFilter;
 
+use crate::egfx::{H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+
 #[derive(Parser, Debug)]
 #[command(name = "hypr-rdp", version, about = "Native RDP server for Hyprland")]
 struct Args {
@@ -52,9 +54,17 @@ struct Args {
     #[arg(long)]
     quality: Option<u8>,
 
+    /// H.264 rate control mode: "vbr" (default) or "cqp"
+    #[arg(long)]
+    rate_control: Option<String>,
+
     /// Maximum capture frame rate
     #[arg(long)]
     fps: Option<u32>,
+
+    /// Maximum unacknowledged EGFX frames in flight
+    #[arg(long)]
+    max_frames_in_flight: Option<u32>,
 
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
@@ -76,7 +86,9 @@ struct Config {
     capture_mode: Option<String>,
     bitrate: Option<u32>,
     quality: Option<u8>,
+    rate_control: Option<String>,
     fps: Option<u32>,
+    max_frames_in_flight: Option<u32>,
     output: Option<String>,
 }
 
@@ -122,30 +134,53 @@ async fn main() -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hypr_rdp=info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hypr_rdp=info")),
+        )
         .init();
 
     let args = Args::parse();
     let config = Config::load(args.config.as_deref());
 
     // CLI args override config file, which overrides defaults
-    let bind = args.bind.or(config.bind).unwrap_or_else(|| "127.0.0.1:3389".into());
+    let bind = args
+        .bind
+        .or(config.bind)
+        .unwrap_or_else(|| "127.0.0.1:3389".into());
     let cert = args.cert.or(config.cert);
     let key = args.key.or(config.key);
     let username = args.username.or(config.username).unwrap_or_default();
     let password = args.password.or(config.password).unwrap_or_default();
 
     if username.is_empty() || password.is_empty() {
-        tracing::warn!("No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication.");
+        tracing::warn!(
+            "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
+        );
         if bind.starts_with("0.0.0.0") {
             tracing::warn!("Binding to all interfaces without credentials is a security risk.");
         }
     }
-    let resolution_str = args.resolution.or(config.resolution).unwrap_or_else(|| "1920x1080".into());
-    let capture_mode_str = args.capture_mode.or(config.capture_mode).unwrap_or_else(|| "wlr".into());
-    let bitrate = args.bitrate.or(config.bitrate).unwrap_or(5_000_000);
+    let resolution_fixed = args.resolution.is_some() || config.resolution.is_some();
+    let resolution_str = args
+        .resolution
+        .or(config.resolution)
+        .unwrap_or_else(|| "1920x1080".into());
+    let capture_mode_str = args
+        .capture_mode
+        .or(config.capture_mode)
+        .unwrap_or_else(|| "wlr".into());
+    let bitrate = args.bitrate.or(config.bitrate).unwrap_or(10_000_000);
     let quality = args.quality.or(config.quality).unwrap_or(23);
+    let rate_control_str = args
+        .rate_control
+        .or(config.rate_control)
+        .unwrap_or_else(|| "vbr".into());
+    let rate_control = parse_rate_control(&rate_control_str)?;
     let fps = args.fps.or(config.fps).unwrap_or(30);
+    let max_frames_in_flight = args
+        .max_frames_in_flight
+        .or(config.max_frames_in_flight)
+        .unwrap_or(DEFAULT_MAX_FRAMES_IN_FLIGHT);
     let output = args.output.or(config.output);
 
     let resolution = parse_resolution(&resolution_str)?;
@@ -161,6 +196,9 @@ async fn main() -> Result<()> {
     if fps == 0 {
         anyhow::bail!("fps must be > 0");
     }
+    if max_frames_in_flight == 0 {
+        anyhow::bail!("max-frames-in-flight must be > 0");
+    }
 
     tracing::info!("Starting hypr-rdp on {}", bind);
 
@@ -174,7 +212,10 @@ async fn main() -> Result<()> {
         capture_mode,
         bitrate,
         quality,
+        rate_control,
         fps,
+        max_frames_in_flight,
+        resolution_fixed,
         output,
     )
     .await?;
@@ -192,6 +233,14 @@ async fn main() -> Result<()> {
     ctx.display_handle.shutdown().await;
 
     result
+}
+
+fn parse_rate_control(s: &str) -> anyhow::Result<H264RateControl> {
+    match s {
+        "vbr" => Ok(H264RateControl::Vbr),
+        "cqp" => Ok(H264RateControl::Cqp),
+        other => anyhow::bail!("unknown rate control '{}', expected 'vbr' or 'cqp'", other),
+    }
 }
 
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
