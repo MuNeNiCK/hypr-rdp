@@ -576,7 +576,7 @@ impl EgfxShared {
                 }
             };
 
-            let frame_id = match server.send_avc444_frame(
+            let frame_id = match server.send_avc444v2_frame(
                 surface_id,
                 luma_data,
                 luma_regions,
@@ -586,7 +586,7 @@ impl EgfxShared {
             ) {
                 Some(id) => id,
                 None => {
-                    tracing::debug!("send_avc444_frame: send_avc444_frame returned None");
+                    tracing::debug!("send_avc444_frame: send_avc444v2_frame returned None");
                     return false;
                 }
             };
@@ -752,7 +752,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
         use ironrdp_egfx::pdu::*;
-        let (avc420, _avc444) = match cap {
+        let (avc420, avc444) = match cap {
             CapabilitySet::V8 { .. } => (false, false),
             CapabilitySet::V8_1 { flags } => {
                 (flags.contains(CapabilitiesV81Flags::AVC420_ENABLED), false)
@@ -779,7 +779,6 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
             }
             CapabilitySet::Unknown(_) => (false, false),
         };
-        let avc444 = false;
         let avc = avc420 || avc444;
         self.shared.avc_enabled.store(avc, Ordering::Release);
         self.shared.avc444_enabled.store(avc444, Ordering::Release);
