@@ -3,21 +3,17 @@ use super::*;
 /// Context for DMA-BUF capture (created during setup, passed to capture loop).
 #[cfg(feature = "vaapi")]
 pub(super) struct DmaBufCaptureContext {
-    #[allow(dead_code)]
-    gbm_device: crate::capture::dmabuf::GbmDevice,
-    /// Owns GBM BOs so exported DMA-BUF fds stay valid.
-    #[allow(dead_code)]
-    gbm_bos: Vec<crate::capture::dmabuf::GbmBo>,
-    /// Wayland buffers backed by DMA-BUFs
+    // Fields drop top-to-bottom; protocol/VA objects must release before GBM owners.
     wl_buffers: Vec<wl_buffer::WlBuffer>,
+    vpp: crate::egfx::VppConverter,
+    nv12_info: crate::egfx::VppDmaBufInfo,
+    drm_device_path: std::path::PathBuf,
     #[allow(dead_code)]
     dmabuf_infos: Vec<crate::capture::dmabuf::DmaBufInfo>,
-    /// VPP converter (XRGB -> NV12)
-    vpp: crate::egfx::vpp::VppConverter,
-    /// NV12 output DMA-BUF info (for encoder import)
-    nv12_info: crate::capture::dmabuf::DmaBufInfo,
-    /// DRM device path
-    drm_device_path: std::path::PathBuf,
+    #[allow(dead_code)]
+    gbm_bos: Vec<crate::capture::dmabuf::GbmBo>,
+    #[allow(dead_code)]
+    gbm_device: crate::capture::dmabuf::GbmDevice,
 }
 
 /// Try to set up DMA-BUF capture. Returns None if compositor doesn't support DMA-BUF,
@@ -169,7 +165,7 @@ fn setup_dmabuf_inner(
     }
 
     // Create VPP converter
-    let mut vpp = crate::egfx::vpp::VppConverter::new(&drm_device_path, width, height)?;
+    let mut vpp = crate::egfx::VppConverter::new(&drm_device_path, width, height)?;
 
     // Import the two XRGB DMA-BUFs as VPP input surfaces
     for (i, info) in dmabuf_infos.iter().enumerate() {
@@ -186,13 +182,13 @@ fn setup_dmabuf_inner(
     );
 
     Ok(DmaBufCaptureContext {
-        gbm_device,
-        gbm_bos,
         wl_buffers,
-        dmabuf_infos,
         vpp,
         nv12_info,
         drm_device_path,
+        dmabuf_infos,
+        gbm_bos,
+        gbm_device,
     })
 }
 

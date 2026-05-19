@@ -8,8 +8,6 @@ use std::path::Path;
 
 use anyhow::{bail, Context, Result};
 
-use crate::capture::dmabuf::DmaBufInfo;
-
 // Re-use the raw bindings from cros-libva
 use cros_libva::{
     vaBeginPicture, vaCreateBuffer, vaCreateConfig, vaCreateContext, vaCreateSurfaces,
@@ -28,6 +26,22 @@ const VA_EXPORT_SURFACE_READ_ONLY: u32 = cros_libva::VA_EXPORT_SURFACE_READ_ONLY
 const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = cros_libva::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 
 const VA_STATUS_SUCCESS: u32 = cros_libva::VA_STATUS_SUCCESS;
+const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
+const DRM_FORMAT_ARGB8888: u32 = 0x34324152;
+const DRM_FORMAT_NV12: u32 = 0x3231564E;
+
+#[derive(Debug, Clone)]
+pub(crate) struct VppDmaBufInfo {
+    pub(crate) fd: RawFd,
+    pub(crate) stride: u32,
+    pub(crate) offset: u32,
+    pub(crate) modifier: u64,
+    pub(crate) format: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
+    pub(crate) uv_stride: u32,
+    pub(crate) uv_offset: u32,
+}
 
 /// VAProcPipelineParameterBuffer — manually defined since bindgen doesn't always generate it.
 /// Layout verified against C sizeof on x86_64 (224 bytes).
@@ -206,8 +220,7 @@ impl VppConverter {
         format: u32,
     ) -> Result<usize> {
         let rt_format = match format {
-            crate::capture::dmabuf::DRM_FORMAT_XRGB8888
-            | crate::capture::dmabuf::DRM_FORMAT_ARGB8888 => VA_RT_FORMAT_RGB32,
+            DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => VA_RT_FORMAT_RGB32,
             _ => bail!("unsupported DRM format for VPP input: 0x{:08x}", format),
         };
 
@@ -270,7 +283,7 @@ impl VppConverter {
     }
 
     /// Export the NV12 output surface as a DMA-BUF.
-    pub fn export_nv12_output(&mut self) -> Result<DmaBufInfo> {
+    pub fn export_nv12_output(&mut self) -> Result<VppDmaBufInfo> {
         let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
         va_check(
             unsafe {
@@ -306,12 +319,12 @@ impl VppConverter {
             (y_stride, y_stride * self.height)
         };
 
-        Ok(DmaBufInfo {
+        Ok(VppDmaBufInfo {
             fd,
             stride: desc.layers[0].pitch[0],
             offset: desc.layers[0].offset[0],
             modifier: desc.objects[0].drm_format_modifier,
-            format: crate::capture::dmabuf::DRM_FORMAT_NV12,
+            format: DRM_FORMAT_NV12,
             width: self.width,
             height: self.height,
             uv_stride,
