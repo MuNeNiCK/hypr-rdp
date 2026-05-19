@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -38,6 +38,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     } = config;
 
     let addr: SocketAddr = bind.parse().context("invalid bind address")?;
+    TcpListener::bind(addr).with_context(|| format!("bind listen address {}", addr))?;
 
     let egfx_shared = Arc::new(EgfxShared::new(max_frames_in_flight));
     let output_layout = Arc::new(SharedOutputLayout::new());
