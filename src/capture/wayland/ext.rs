@@ -1,4 +1,17 @@
-use super::*;
+use std::os::fd::{AsFd, AsRawFd};
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{bail, Context, Result};
+use ironrdp_server::PixelFormat;
+use wayland_client::protocol::{wl_output, wl_shm};
+use wayland_client::{Connection, QueueHandle};
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
+
+use super::state::AppState;
+use super::{create_shm_fd, poll_dispatch, CaptureInfo, MmapRegion, POLL_TIMEOUT_MS};
+use crate::capture::frame::{FramePacer, FrameProcessor};
+use crate::egfx::{EgfxShared, H264RateControl};
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn capture_loop_ext(

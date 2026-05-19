@@ -1,16 +1,13 @@
 use std::io::ErrorKind;
-use std::os::fd::AsFd;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
 use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ironrdp_server::{DisplayUpdate, PixelFormat};
+use ironrdp_server::DisplayUpdate;
 use tokio::sync::mpsc;
 
-use super::frame::{FramePacer, FrameProcessor};
 use super::CaptureMode;
 use crate::egfx::{EgfxShared, H264RateControl};
 use crate::input::SharedOutputLayout;
@@ -18,21 +15,7 @@ pub(crate) use output::{
     create_headless_output, list_stale_headless_outputs, output_info, wait_for_output,
     HeadlessOutputGuard,
 };
-use wayland_client::protocol::{wl_buffer, wl_output, wl_registry, wl_shm, wl_shm_pool};
-use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle, WEnum};
-use wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1;
-use wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1;
-use wayland_protocols::ext::image_copy_capture::v1::client::{
-    ext_image_copy_capture_frame_v1, ext_image_copy_capture_manager_v1,
-    ext_image_copy_capture_session_v1,
-};
-#[cfg(feature = "vaapi")]
-use wayland_protocols::wp::linux_dmabuf::zv1::client::{
-    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
-};
-use wayland_protocols_wlr::screencopy::v1::client::{
-    zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
-};
+use wayland_client::Connection;
 
 #[cfg(feature = "vaapi")]
 mod dmabuf_capture;

@@ -1,4 +1,21 @@
-use super::*;
+use std::sync::Arc;
+use std::time::Instant;
+
+use anyhow::{bail, Context, Result};
+use ironrdp_server::DisplayUpdate;
+use wayland_client::protocol::wl_buffer;
+use wayland_client::{Connection, QueueHandle};
+use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
+use wayland_protocols::wp::linux_dmabuf::zv1::client::{
+    zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
+};
+
+use super::state::AppState;
+use super::{poll_dispatch, POLL_TIMEOUT_MS};
+use crate::capture::frame::FramePacer;
+use crate::egfx::{EgfxShared, H264RateControl};
+
+const MAX_ENCODE_FAILURES: u32 = 5;
 
 /// Context for DMA-BUF capture (created during setup, passed to capture loop).
 #[cfg(feature = "vaapi")]
