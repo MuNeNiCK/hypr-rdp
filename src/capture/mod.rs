@@ -1,5 +1,7 @@
+mod damage;
 #[cfg(feature = "vaapi")]
 pub mod dmabuf;
+mod frame;
 mod wayland;
 
 use std::sync::atomic::{AtomicBool, Ordering};
