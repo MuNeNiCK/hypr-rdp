@@ -270,7 +270,6 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 }
             }
         } else {
-            // Default: treat as unicode text
             let utf8 = utf16le_to_utf8(data);
             if utf8.is_empty() {
                 return;

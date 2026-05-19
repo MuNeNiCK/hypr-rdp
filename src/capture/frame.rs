@@ -193,8 +193,8 @@ impl FrameStats {
     }
 }
 
-/// Capture frame pacer using an absolute deadline, matching the reference
-/// server's frame-rate cap while tolerating compositor frame-time quantization.
+/// Capture frame pacer using an absolute deadline while tolerating compositor
+/// frame-time quantization.
 pub(super) struct FramePacer {
     frame_interval: Duration,
     next_send_at: Option<Instant>,

@@ -1,7 +1,5 @@
 use super::*;
 
-// --- Wayland state ---
-
 pub(super) struct AppState {
     pub(super) tx: mpsc::Sender<DisplayUpdate>,
     pub(super) target_output_name: String,
@@ -78,8 +76,6 @@ impl AppState {
     }
 }
 
-// --- Registry dispatch ---
-
 impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
     fn event(
         state: &mut Self,
@@ -122,8 +118,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for AppState {
     }
 }
 
-// --- Output dispatch (to get output name) ---
-
 impl Dispatch<wl_output::WlOutput, ()> for AppState {
     fn event(
         state: &mut Self,
@@ -150,8 +144,6 @@ impl Dispatch<wl_output::WlOutput, ()> for AppState {
         }
     }
 }
-
-// --- Session dispatch ---
 
 impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, ()> for AppState {
     fn event(
@@ -220,8 +212,6 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
     }
 }
 
-// --- Frame dispatch ---
-
 impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> for AppState {
     fn event(
         state: &mut Self,
@@ -251,8 +241,6 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
     }
 }
 
-// --- No-op dispatchers ---
-
 delegate_noop!(AppState: ignore wl_shm::WlShm);
 delegate_noop!(AppState: ignore wl_shm_pool::WlShmPool);
 delegate_noop!(AppState: ignore wl_buffer::WlBuffer);
@@ -264,8 +252,6 @@ delegate_noop!(AppState: ignore zwlr_screencopy_manager_v1::ZwlrScreencopyManage
 delegate_noop!(AppState: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
 #[cfg(feature = "vaapi")]
 delegate_noop!(AppState: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
-
-// --- wlr-screencopy frame dispatch ---
 
 impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for AppState {
     fn event(

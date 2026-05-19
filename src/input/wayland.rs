@@ -20,7 +20,7 @@ use super::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1}
 /// Shared state for sending input commands to the Wayland thread
 pub(super) struct InputState {
     conn: Connection,
-    #[allow(dead_code)] // Kept alive to maintain Wayland connection state
+    #[allow(dead_code)]
     event_queue: EventQueue<WlState>,
     #[allow(dead_code)]
     wl_state: WlState,
@@ -203,8 +203,6 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
         .context("failed to read Wayland keyboard keymap")?;
     Ok(data)
 }
-
-// --- Wayland state for binding globals ---
 
 #[derive(Default)]
 struct WlState {

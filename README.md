@@ -1,6 +1,6 @@
 # hypr-rdp
 
-Native RDP server for Hyprland. Connect to your Hyprland desktop from any RDP client (Windows Remote Desktop, FreeRDP, etc.).
+Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP client.
 
 ## Features
 

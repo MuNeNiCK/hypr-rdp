@@ -18,8 +18,6 @@ use wayland_protocols_wlr::data_control::v1::client::{
 
 use super::formats::{PendingWrite, IMAGE_PNG_MIME, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME};
 
-// --- Wayland clipboard thread ---
-
 pub(super) fn clipboard_thread(
     event_sender: mpsc::UnboundedSender<ServerEvent>,
     suppress: Arc<AtomicBool>,
@@ -152,8 +150,6 @@ pub(super) fn clipboard_thread(
     Ok(())
 }
 
-// --- Wayland state for clipboard thread ---
-
 #[derive(Clone, Copy)]
 enum SourceType {
     Text,
@@ -201,8 +197,6 @@ impl ClipState {
     }
 }
 
-// --- Registry dispatch ---
-
 impl Dispatch<wl_registry::WlRegistry, ()> for ClipState {
     fn event(
         state: &mut Self,
@@ -232,8 +226,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClipState {
         }
     }
 }
-
-// --- Data control device dispatch ---
 
 impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for ClipState {
     wayland_client::event_created_child!(ClipState, zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, [
@@ -284,7 +276,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     }
                 };
 
-                // Check for text MIME
                 let text_mime = mimes
                     .iter()
                     .find(|m| {
@@ -294,7 +285,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     })
                     .cloned();
 
-                // Check for image MIME
                 let image_mime = mimes.iter().find(|m| m.as_str() == IMAGE_PNG_MIME).cloned();
 
                 if text_mime.is_none() && image_mime.is_none() {
@@ -325,7 +315,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     }
                 }
 
-                // Read text content if available
                 if let Some(ref mime) = text_mime {
                     if let Some(data) = read_offer_data(&offer, mime, conn) {
                         if !data.is_empty() {
@@ -338,7 +327,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                     }
                 }
 
-                // Read image content if available
                 if let Some(ref mime) = image_mime {
                     if let Some(png_data) = read_offer_data(&offer, mime, conn) {
                         if !png_data.is_empty() {
@@ -424,8 +412,6 @@ fn read_offer_data(
     Some(data)
 }
 
-// --- Data control offer dispatch ---
-
 impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for ClipState {
     fn event(
         state: &mut Self,
@@ -442,8 +428,6 @@ impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for ClipSt
         }
     }
 }
-
-// --- Data control source dispatch ---
 
 impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for ClipState {
     fn event(
@@ -491,8 +475,6 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
         }
     }
 }
-
-// --- No-op dispatchers ---
 
 delegate_noop!(ClipState: ignore wl_seat::WlSeat);
 delegate_noop!(ClipState: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);

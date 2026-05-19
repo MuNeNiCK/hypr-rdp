@@ -3,15 +3,13 @@ use super::*;
 /// Context for DMA-BUF capture (created during setup, passed to capture loop).
 #[cfg(feature = "vaapi")]
 pub(super) struct DmaBufCaptureContext {
-    /// GBM device (must outlive gbm_bos)
     #[allow(dead_code)]
     gbm_device: crate::capture::dmabuf::GbmDevice,
-    /// GBM buffer objects (kept alive for DMA-BUF fd lifetime)
+    /// Owns GBM BOs so exported DMA-BUF fds stay valid.
     #[allow(dead_code)]
     gbm_bos: Vec<crate::capture::dmabuf::GbmBo>,
     /// Wayland buffers backed by DMA-BUFs
     wl_buffers: Vec<wl_buffer::WlBuffer>,
-    /// DMA-BUF info for each capture buffer (kept for reference)
     #[allow(dead_code)]
     dmabuf_infos: Vec<crate::capture::dmabuf::DmaBufInfo>,
     /// VPP converter (XRGB -> NV12)
@@ -137,7 +135,7 @@ fn setup_dmabuf_inner(
         let modifier_lo = (modifier & 0xFFFFFFFF) as u32;
 
         // Add the plane to params.
-        // SAFETY: fd is valid as long as the GBM bo is alive (which we keep in gbm_bos).
+        // SAFETY: `context.gbm_bos` owns the GBM BOs for the lifetime of these buffers.
         params.add(
             unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd) },
             0,
