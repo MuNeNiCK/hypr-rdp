@@ -80,6 +80,30 @@ impl FrameEncoder {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn avc444_luma_reference_y_for_test(&self) -> Option<&[u8]> {
+        match self {
+            Self::SoftwareAvc444(enc) => enc.luma_reference_y_for_test(),
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) | Self::Software(_) => None,
+            #[cfg(not(feature = "vaapi"))]
+            Self::Software(_) => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn avc444_last_reference_regions_for_test(
+        &self,
+    ) -> Option<(&[(i32, i32, i32, i32)], &[(i32, i32, i32, i32)])> {
+        match self {
+            Self::SoftwareAvc444(enc) => Some(enc.last_reference_regions_for_test()),
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) | Self::Software(_) => None,
+            #[cfg(not(feature = "vaapi"))]
+            Self::Software(_) => None,
+        }
+    }
+
     /// Encode from an NV12 DMA-BUF (zero-copy path). Only available with VA-API backend.
     #[cfg(feature = "vaapi")]
     #[allow(clippy::too_many_arguments)]
@@ -211,7 +235,7 @@ pub fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-use ironrdp_egfx::pdu::Avc420Region;
+use ironrdp_egfx::pdu::{Avc420Region, Codec1Type, Encoding};
 use ironrdp_egfx::server::{GraphicsPipelineHandler, GraphicsPipelineServer};
 use ironrdp_server::{
     EgfxServerMessage, GfxDvcBridge, GfxServerFactory, GfxServerHandle, ServerEvent,
@@ -220,6 +244,45 @@ use ironrdp_server::{
 use tokio::sync::mpsc;
 
 pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 120;
+
+fn avc444_disabled_by_env() -> bool {
+    std::env::var_os("HYPR_RDP_DISABLE_AVC444").is_some()
+}
+
+fn capability_avc_support(
+    cap: &ironrdp_egfx::pdu::CapabilitySet,
+    disable_avc444: bool,
+) -> (bool, bool) {
+    use ironrdp_egfx::pdu::*;
+    let (avc420, avc444) = match cap {
+        CapabilitySet::V8 { .. } => (false, false),
+        CapabilitySet::V8_1 { flags } => {
+            (flags.contains(CapabilitiesV81Flags::AVC420_ENABLED), false)
+        }
+        CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
+            let enabled = !flags.contains(CapabilitiesV10Flags::AVC_DISABLED);
+            (enabled, enabled)
+        }
+        CapabilitySet::V10_1 => (true, true),
+        CapabilitySet::V10_3 { flags } => {
+            let enabled = !flags.contains(CapabilitiesV103Flags::AVC_DISABLED);
+            (enabled, enabled)
+        }
+        CapabilitySet::V10_4 { flags }
+        | CapabilitySet::V10_5 { flags }
+        | CapabilitySet::V10_6 { flags }
+        | CapabilitySet::V10_6Err { flags } => {
+            let enabled = !flags.contains(CapabilitiesV104Flags::AVC_DISABLED);
+            (enabled, enabled)
+        }
+        CapabilitySet::V10_7 { flags } => {
+            let enabled = !flags.contains(CapabilitiesV107Flags::AVC_DISABLED);
+            (enabled, enabled)
+        }
+        CapabilitySet::Unknown(_) => (false, false),
+    };
+    (avc420, avc444 && !disable_avc444)
+}
 
 /// Shared EGFX state accessible from factory, handler, and capture thread.
 pub struct EgfxShared {
@@ -274,7 +337,7 @@ impl EgfxShared {
     }
 
     pub fn is_avc444_enabled(&self) -> bool {
-        self.avc444_enabled.load(Ordering::Acquire)
+        self.avc444_enabled.load(Ordering::Acquire) && !avc444_disabled_by_env()
     }
 
     pub fn is_ready(&self) -> bool {
@@ -306,8 +369,6 @@ impl EgfxShared {
     /// Deletes all old surfaces, sends ResetGraphics at the new dimensions,
     /// and bumps generation so the capture thread re-creates encoder/surface.
     pub fn prepare_for_resize(&self, width: u16, height: u16) {
-        self.ready_generation.fetch_add(1, Ordering::Release);
-
         let handle = match self.get_handle() {
             Some(h) => h,
             None => return,
@@ -341,14 +402,21 @@ impl EgfxShared {
                 ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
             ) {
                 Ok(svc_messages) => {
-                    let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                        messages: svc_messages,
-                    }));
+                    if sender
+                        .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                            messages: svc_messages,
+                        }))
+                        .is_ok()
+                    {
+                        self.ready_generation.fetch_add(1, Ordering::Release);
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to encode resize PDUs: {}", e);
                 }
             }
+        } else {
+            self.ready_generation.fetch_add(1, Ordering::Release);
         }
     }
 
@@ -361,6 +429,10 @@ impl EgfxShared {
         width: u16,
         height: u16,
     ) -> Option<u16> {
+        if sender.is_closed() {
+            return None;
+        }
+
         let Ok(mut server) = handle.lock() else {
             return None;
         };
@@ -388,7 +460,7 @@ impl EgfxShared {
 
         // Drain and send all setup PDUs
         let dvc_messages = server.drain_output();
-        tracing::debug!(
+        tracing::trace!(
             count = dvc_messages.len(),
             "EGFX: draining surface setup PDUs"
         );
@@ -401,9 +473,14 @@ impl EgfxShared {
                 ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
             ) {
                 Ok(svc_messages) => {
-                    let _ = sender.send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                        messages: svc_messages,
-                    }));
+                    if sender
+                        .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                            messages: svc_messages,
+                        }))
+                        .is_err()
+                    {
+                        return None;
+                    }
                 }
                 Err(e) => {
                     tracing::error!("Failed to encode surface setup PDUs: {}", e);
@@ -461,8 +538,13 @@ impl EgfxShared {
         regions: &[Avc420Region],
         timestamp_ms: u32,
     ) -> bool {
+        if sender.is_closed() {
+            tracing::trace!("send_frame: EGFX event channel already closed");
+            return false;
+        }
+
         if regions.is_empty() {
-            tracing::debug!("send_frame_with_regions: no regions");
+            tracing::trace!("send_frame_with_regions: no regions");
             return false;
         }
 
@@ -473,11 +555,11 @@ impl EgfxShared {
             };
 
             if !server.is_ready() {
-                tracing::debug!("send_frame: server not ready");
+                tracing::trace!("send_frame: server not ready");
                 return false;
             }
             if server.should_backpressure() {
-                tracing::debug!(
+                tracing::trace!(
                     in_flight = server.frames_in_flight(),
                     "send_frame: backpressure"
                 );
@@ -487,7 +569,7 @@ impl EgfxShared {
             let channel_id = match server.channel_id() {
                 Some(id) => id,
                 None => {
-                    tracing::debug!("send_frame: no channel_id");
+                    tracing::trace!("send_frame: no channel_id");
                     return false;
                 }
             };
@@ -496,7 +578,7 @@ impl EgfxShared {
                 match server.send_avc420_frame(surface_id, h264_data, regions, timestamp_ms) {
                     Some(id) => id,
                     None => {
-                        tracing::debug!("send_frame: send_avc420_frame returned None");
+                        tracing::trace!("send_frame: send_avc420_frame returned None");
                         return false;
                     }
                 };
@@ -522,7 +604,7 @@ impl EgfxShared {
                     }))
                     .is_err()
                 {
-                    tracing::debug!("send_frame: EGFX event channel closed");
+                    tracing::trace!("send_frame: EGFX event channel closed");
                     return false;
                 }
             }
@@ -536,58 +618,83 @@ impl EgfxShared {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn send_avc444_frame_with_regions(
+    fn queue_avc444_frame_with_regions(
         handle: &GfxServerHandle,
-        sender: &mpsc::UnboundedSender<ServerEvent>,
         surface_id: u16,
-        luma_data: &[u8],
-        luma_regions: &[Avc420Region],
-        chroma_data: Option<&[u8]>,
-        chroma_regions: Option<&[Avc420Region]>,
+        encoding: encoder::Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
         timestamp_ms: u32,
-    ) -> bool {
-        if luma_regions.is_empty() {
-            tracing::debug!("send_avc444_frame_with_regions: no regions");
-            return false;
+    ) -> Option<(u32, Vec<ironrdp_dvc::DvcMessage>, u32)> {
+        let has_stream2_data = stream2_data.is_some_and(|data| !data.is_empty());
+        let has_stream2_regions = stream2_regions.is_some_and(|regions| !regions.is_empty());
+        match encoding {
+            encoder::Avc444FrameEncoding::LumaAndChroma => {
+                if !has_stream2_data || !has_stream2_regions {
+                    tracing::trace!("send_avc444_frame_with_regions: LC=0 requires stream2");
+                    return None;
+                }
+            }
+            encoder::Avc444FrameEncoding::Luma | encoder::Avc444FrameEncoding::Chroma => {
+                if stream2_data.is_some() || stream2_regions.is_some() {
+                    tracing::trace!("send_avc444_frame_with_regions: LC=1/2 forbids stream2");
+                    return None;
+                }
+            }
         }
+
+        if stream1_regions.is_empty() {
+            tracing::trace!("send_avc444_frame_with_regions: no regions");
+            return None;
+        }
+
+        let encoding = match encoding {
+            encoder::Avc444FrameEncoding::LumaAndChroma => Encoding::LUMA_AND_CHROMA,
+            encoder::Avc444FrameEncoding::Luma => Encoding::LUMA,
+            encoder::Avc444FrameEncoding::Chroma => Encoding::CHROMA,
+        };
 
         let (_frame_id, dvc_messages, channel_id) = {
             let Ok(mut server) = handle.lock() else {
-                return false;
+                return None;
             };
 
             if !server.is_ready() {
-                tracing::debug!("send_avc444_frame: server not ready");
-                return false;
+                tracing::trace!("send_avc444_frame: server not ready");
+                return None;
             }
             if server.should_backpressure() {
-                tracing::debug!(
+                tracing::trace!(
                     in_flight = server.frames_in_flight(),
                     "send_avc444_frame: backpressure"
                 );
-                return false;
+                return None;
             }
 
             let channel_id = match server.channel_id() {
                 Some(id) => id,
                 None => {
-                    tracing::debug!("send_avc444_frame: no channel_id");
-                    return false;
+                    tracing::trace!("send_avc444_frame: no channel_id");
+                    return None;
                 }
             };
 
-            let frame_id = match server.send_avc444v2_frame(
+            let frame_id = match server.send_avc444_frame_with_encoding(
+                Codec1Type::Avc444v2,
                 surface_id,
-                luma_data,
-                luma_regions,
-                chroma_data,
-                chroma_regions,
+                encoding,
+                stream1_data,
+                stream1_regions,
+                stream2_data,
+                stream2_regions,
                 timestamp_ms,
             ) {
                 Some(id) => id,
                 None => {
-                    tracing::debug!("send_avc444_frame: send_avc444v2_frame returned None");
-                    return false;
+                    tracing::trace!("send_avc444_frame: send_avc444v2_frame returned None");
+                    return None;
                 }
             };
 
@@ -596,8 +703,41 @@ impl EgfxShared {
         };
 
         if dvc_messages.is_empty() {
+            return None;
+        }
+
+        Some((_frame_id, dvc_messages, channel_id))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_avc444_frame_with_regions(
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        surface_id: u16,
+        encoding: encoder::Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> bool {
+        if sender.is_closed() {
+            tracing::trace!("send_avc444_frame: EGFX event channel already closed");
             return false;
         }
+
+        let Some((_frame_id, dvc_messages, channel_id)) = Self::queue_avc444_frame_with_regions(
+            handle,
+            surface_id,
+            encoding,
+            stream1_data,
+            stream1_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        ) else {
+            return false;
+        };
 
         match ironrdp_dvc::encode_dvc_messages(
             channel_id,
@@ -611,7 +751,7 @@ impl EgfxShared {
                     }))
                     .is_err()
                 {
-                    tracing::debug!("send_avc444_frame: EGFX event channel closed");
+                    tracing::trace!("send_avc444_frame: EGFX event channel closed");
                     return false;
                 }
             }
@@ -644,6 +784,58 @@ pub struct HyprGfxFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_core::{encode_vec, Decode, Encode, ReadCursor};
+    use ironrdp_dvc::DvcProcessor as _;
+    use ironrdp_egfx::pdu::{
+        Avc420BitmapStream, Avc444BitmapStream, Codec1Type, Encoding, GfxPdu, PixelFormat,
+        QuantQuality, WireToSurface1Pdu,
+    };
+    use ironrdp_pdu::geometry::InclusiveRectangle;
+
+    const TEST_CHANNEL_ID: u32 = 1007;
+
+    fn ready_avc444_handle(width: u16, height: u16) -> (GfxServerHandle, u16) {
+        let shared = Arc::new(EgfxShared::new(DEFAULT_MAX_FRAMES_IN_FLIGHT));
+        shared.set_surface_size(width, height);
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
+        ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
+        let (mut bridge, handle) =
+            ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
+                .expect("EGFX server builds");
+        bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+
+        let caps =
+            GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
+                ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+                    flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+                },
+            ]));
+        let caps = encode_vec(&caps).expect("capabilities encode");
+        let _ = bridge
+            .process(TEST_CHANNEL_ID, &caps)
+            .expect("capabilities process");
+        assert!(shared.is_ready());
+        assert!(shared.is_avc444_enabled());
+
+        let surface_id =
+            EgfxShared::init_surface(&handle, &event_tx, width, height).expect("surface init");
+        (handle, surface_id)
+    }
+
+    fn decode_gfx_output(message: &ironrdp_dvc::DvcMessage) -> GfxPdu {
+        let wrapped = encode_vec(&**message).expect("DVC message encodes");
+        assert_eq!(&wrapped[0..2], &[0xe0, 0x04]);
+        let mut cursor = ReadCursor::new(&wrapped[2..]);
+        GfxPdu::decode(&mut cursor).expect("GFX PDU decodes")
+    }
+
+    fn decode_avc444_wire_to_surface(message: &ironrdp_dvc::DvcMessage) -> WireToSurface1Pdu {
+        match decode_gfx_output(message) {
+            GfxPdu::WireToSurface1(pdu) => pdu,
+            other => panic!("expected WireToSurface1, got {other:?}"),
+        }
+    }
 
     #[test]
     fn full_frame_region_uses_rdpegfx_exclusive_bounds() {
@@ -654,6 +846,430 @@ mod tests {
         assert_eq!(region.bottom, 720);
         assert_eq!(region.quantization_parameter, 23);
         assert_eq!(region.quality, 77);
+    }
+
+    #[test]
+    fn avc444_stream_info_encodes_lc_and_stream1_size() {
+        let rectangle = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 15,
+            bottom: 15,
+        };
+        let quant = QuantQuality {
+            quantization_parameter: 20,
+            progressive: false,
+            quality: 80,
+        };
+        let stream1 = Avc420BitmapStream {
+            rectangles: vec![rectangle.clone()],
+            quant_qual_vals: vec![quant.clone()],
+            data: &[1, 2, 3, 4],
+        };
+        let stream2 = Avc420BitmapStream {
+            rectangles: vec![rectangle],
+            quant_qual_vals: vec![quant],
+            data: &[5, 6, 7],
+        };
+        let stream1_size = stream1.size();
+        let avc444 = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1,
+            stream2: Some(stream2),
+        };
+
+        let encoded = encode_vec(&avc444).expect("AVC444 stream encodes");
+        let stream_info = u32::from_le_bytes(encoded[0..4].try_into().unwrap());
+
+        assert_eq!(stream_info & 0x3fff_ffff, stream1_size as u32);
+        assert_eq!(
+            stream_info >> 30,
+            u32::from(Encoding::LUMA_AND_CHROMA.bits())
+        );
+    }
+
+    #[test]
+    fn avc444_luma_only_decodes_stream1_without_stream2() {
+        let rectangle = InclusiveRectangle {
+            left: 2,
+            top: 4,
+            right: 18,
+            bottom: 20,
+        };
+        let quant = QuantQuality {
+            quantization_parameter: 18,
+            progressive: false,
+            quality: 82,
+        };
+        let avc444 = Avc444BitmapStream {
+            encoding: Encoding::LUMA,
+            stream1: Avc420BitmapStream {
+                rectangles: vec![rectangle.clone()],
+                quant_qual_vals: vec![quant.clone()],
+                data: &[1, 3, 5, 7],
+            },
+            stream2: None,
+        };
+
+        let encoded = encode_vec(&avc444).expect("AVC444 stream encodes");
+        let mut cursor = ReadCursor::new(&encoded);
+        let decoded = Avc444BitmapStream::decode(&mut cursor).expect("AVC444 stream decodes");
+
+        assert_eq!(decoded.encoding, Encoding::LUMA);
+        assert_eq!(decoded.stream1.rectangles, vec![rectangle]);
+        assert_eq!(decoded.stream1.quant_qual_vals, vec![quant]);
+        assert_eq!(decoded.stream1.data, &[1, 3, 5, 7]);
+        assert!(decoded.stream2.is_none());
+    }
+
+    #[test]
+    fn avc444_chroma_only_decodes_stream1_without_stream2() {
+        let rectangle = InclusiveRectangle {
+            left: 4,
+            top: 2,
+            right: 11,
+            bottom: 7,
+        };
+        let quant = QuantQuality {
+            quantization_parameter: 23,
+            progressive: false,
+            quality: 77,
+        };
+        let avc444 = Avc444BitmapStream {
+            encoding: Encoding::CHROMA,
+            stream1: Avc420BitmapStream {
+                rectangles: vec![rectangle.clone()],
+                quant_qual_vals: vec![quant.clone()],
+                data: &[9, 8, 7, 6],
+            },
+            stream2: None,
+        };
+
+        let encoded = encode_vec(&avc444).expect("AVC444 stream encodes");
+        let mut cursor = ReadCursor::new(&encoded);
+        let decoded = Avc444BitmapStream::decode(&mut cursor).expect("AVC444 stream decodes");
+
+        assert_eq!(decoded.encoding, Encoding::CHROMA);
+        assert_eq!(decoded.stream1.rectangles, vec![rectangle]);
+        assert_eq!(decoded.stream1.quant_qual_vals, vec![quant]);
+        assert_eq!(decoded.stream1.data, &[9, 8, 7, 6]);
+        assert!(decoded.stream2.is_none());
+    }
+
+    #[test]
+    fn wire_to_surface1_roundtrips_avc444v2_bitmap_payload() {
+        let rectangle = InclusiveRectangle {
+            left: 0,
+            top: 0,
+            right: 32,
+            bottom: 24,
+        };
+        let quant = QuantQuality {
+            quantization_parameter: 21,
+            progressive: false,
+            quality: 79,
+        };
+        let avc444 = Avc444BitmapStream {
+            encoding: Encoding::LUMA_AND_CHROMA,
+            stream1: Avc420BitmapStream {
+                rectangles: vec![rectangle.clone()],
+                quant_qual_vals: vec![quant.clone()],
+                data: &[0xaa, 0xbb, 0xcc],
+            },
+            stream2: Some(Avc420BitmapStream {
+                rectangles: vec![rectangle.clone()],
+                quant_qual_vals: vec![quant.clone()],
+                data: &[0x11, 0x22],
+            }),
+        };
+        let pdu = WireToSurface1Pdu {
+            surface_id: 7,
+            codec_id: Codec1Type::Avc444v2,
+            pixel_format: PixelFormat::ARgb,
+            destination_rectangle: rectangle.clone(),
+            bitmap_data: encode_vec(&avc444).expect("AVC444 stream encodes"),
+        };
+
+        let encoded = encode_vec(&pdu).expect("WireToSurface1 encodes");
+        let mut cursor = ReadCursor::new(&encoded);
+        let decoded = WireToSurface1Pdu::decode(&mut cursor).expect("WireToSurface1 decodes");
+        let mut bitmap_cursor = ReadCursor::new(&decoded.bitmap_data);
+        let bitmap =
+            Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
+
+        assert_eq!(decoded.surface_id, 7);
+        assert_eq!(decoded.codec_id, Codec1Type::Avc444v2);
+        assert_eq!(decoded.pixel_format, PixelFormat::ARgb);
+        assert_eq!(decoded.destination_rectangle, rectangle.clone());
+        assert_eq!(bitmap.encoding, Encoding::LUMA_AND_CHROMA);
+        assert_eq!(bitmap.stream1.rectangles, vec![rectangle.clone()]);
+        assert_eq!(bitmap.stream1.quant_qual_vals, vec![quant.clone()]);
+        assert_eq!(bitmap.stream1.data, &[0xaa, 0xbb, 0xcc]);
+        let stream2 = bitmap.stream2.expect("LC=0 carries stream2");
+        assert_eq!(stream2.rectangles, vec![rectangle]);
+        assert_eq!(stream2.quant_qual_vals, vec![quant]);
+        assert_eq!(stream2.data, &[0x11, 0x22]);
+    }
+
+    #[test]
+    fn avc444_send_wrapper_maps_luma_and_chroma_to_wire_payload() {
+        let (handle, surface_id) = ready_avc444_handle(64, 64);
+        let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
+        let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
+
+        let (_frame_id, dvc_messages, _channel_id) = EgfxShared::queue_avc444_frame_with_regions(
+            &handle,
+            surface_id,
+            encoder::Avc444FrameEncoding::LumaAndChroma,
+            &[1, 2, 3],
+            &stream1_regions,
+            Some(&[4, 5]),
+            Some(&stream2_regions),
+            123,
+        )
+        .expect("LC=0 AVC444v2 frame queues");
+
+        assert_eq!(dvc_messages.len(), 3);
+        assert!(matches!(
+            decode_gfx_output(&dvc_messages[0]),
+            GfxPdu::StartFrame(_)
+        ));
+        assert!(matches!(
+            decode_gfx_output(&dvc_messages[2]),
+            GfxPdu::EndFrame(_)
+        ));
+        let wire = decode_avc444_wire_to_surface(&dvc_messages[1]);
+        let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
+        let bitmap =
+            Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
+        let stream_info = u32::from_le_bytes(wire.bitmap_data[0..4].try_into().unwrap());
+
+        assert_eq!(wire.surface_id, surface_id);
+        assert_eq!(wire.codec_id, Codec1Type::Avc444v2);
+        assert_eq!(
+            stream_info >> 30,
+            u32::from(Encoding::LUMA_AND_CHROMA.bits())
+        );
+        assert_eq!(bitmap.encoding, Encoding::LUMA_AND_CHROMA);
+        assert_eq!(bitmap.stream1.data, &[1, 2, 3]);
+        assert_eq!(bitmap.stream1.rectangles[0].left, 0);
+        assert_eq!(bitmap.stream1.rectangles[0].right, 32);
+        let stream2 = bitmap.stream2.expect("LC=0 has stream2");
+        assert_eq!(stream2.data, &[4, 5]);
+        assert_eq!(stream2.rectangles[0].left, 16);
+        assert_eq!(stream2.rectangles[0].right, 64);
+        assert_eq!(wire.destination_rectangle.left, 0);
+        assert_eq!(wire.destination_rectangle.top, 0);
+        assert_eq!(wire.destination_rectangle.right, 64);
+        assert_eq!(wire.destination_rectangle.bottom, 48);
+    }
+
+    #[test]
+    fn avc444_send_wrapper_maps_luma_only_and_chroma_only_to_stream1() {
+        for (local_encoding, wire_encoding, payload) in [
+            (
+                encoder::Avc444FrameEncoding::Luma,
+                Encoding::LUMA,
+                &[0x10, 0x11][..],
+            ),
+            (
+                encoder::Avc444FrameEncoding::Chroma,
+                Encoding::CHROMA,
+                &[0x20, 0x21, 0x22][..],
+            ),
+        ] {
+            let (handle, surface_id) = ready_avc444_handle(64, 64);
+            let regions = [Avc420Region::new(4, 6, 20, 22, 18, 82)];
+            let (_frame_id, dvc_messages, _channel_id) =
+                EgfxShared::queue_avc444_frame_with_regions(
+                    &handle,
+                    surface_id,
+                    local_encoding,
+                    payload,
+                    &regions,
+                    None,
+                    None,
+                    123,
+                )
+                .expect("single-stream AVC444v2 frame queues");
+
+            assert_eq!(dvc_messages.len(), 3);
+            let wire = decode_avc444_wire_to_surface(&dvc_messages[1]);
+            let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
+            let bitmap =
+                Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
+            let stream_info = u32::from_le_bytes(wire.bitmap_data[0..4].try_into().unwrap());
+
+            assert_eq!(wire.surface_id, surface_id);
+            assert_eq!(wire.codec_id, Codec1Type::Avc444v2);
+            assert_eq!(stream_info >> 30, u32::from(wire_encoding.bits()));
+            assert_eq!(bitmap.encoding, wire_encoding);
+            assert_eq!(bitmap.stream1.data, payload);
+            assert_eq!(bitmap.stream1.rectangles[0].left, 4);
+            assert_eq!(bitmap.stream1.rectangles[0].right, 20);
+            assert!(bitmap.stream2.is_none());
+        }
+    }
+
+    #[test]
+    fn avc444_send_wrapper_rejects_stream2_for_single_stream_lc() {
+        let (handle, surface_id) = ready_avc444_handle(64, 64);
+        let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
+        let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
+
+        for encoding in [
+            encoder::Avc444FrameEncoding::Luma,
+            encoder::Avc444FrameEncoding::Chroma,
+        ] {
+            assert!(EgfxShared::queue_avc444_frame_with_regions(
+                &handle,
+                surface_id,
+                encoding,
+                &[1, 2, 3],
+                &stream1_regions,
+                Some(&[4, 5]),
+                Some(&stream2_regions),
+                123,
+            )
+            .is_none());
+        }
+    }
+
+    #[test]
+    fn avc444_send_wrapper_rejects_lc0_without_stream2() {
+        let (handle, surface_id) = ready_avc444_handle(64, 64);
+        let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
+
+        assert!(EgfxShared::queue_avc444_frame_with_regions(
+            &handle,
+            surface_id,
+            encoder::Avc444FrameEncoding::LumaAndChroma,
+            &[1, 2, 3],
+            &stream1_regions,
+            None,
+            None,
+            123,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
+        let (handle, surface_id) = ready_avc444_handle(64, 64);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        drop(event_rx);
+        let regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
+
+        assert!(!EgfxShared::send_avc444_frame_with_regions(
+            &handle,
+            &event_tx,
+            surface_id,
+            encoder::Avc444FrameEncoding::Luma,
+            &[1, 2, 3],
+            &regions,
+            None,
+            None,
+            123,
+        ));
+        let server = handle.lock().expect("server lock");
+        assert_eq!(server.frames_in_flight(), 0);
+    }
+
+    #[test]
+    fn resize_does_not_bump_generation_when_reset_cannot_be_sent() {
+        let shared = Arc::new(EgfxShared::new(DEFAULT_MAX_FRAMES_IN_FLIGHT));
+        shared.set_surface_size(64, 64);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
+        ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
+        let (mut bridge, handle) =
+            ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
+                .expect("EGFX server builds");
+        bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+
+        let caps =
+            GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
+                ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+                    flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+                },
+            ]));
+        let caps = encode_vec(&caps).expect("capabilities encode");
+        let _ = bridge
+            .process(TEST_CHANNEL_ID, &caps)
+            .expect("capabilities process");
+        let _ = EgfxShared::init_surface(&handle, &event_tx, 64, 64).expect("surface init");
+        let generation = shared.generation();
+
+        drop(event_rx);
+        shared.prepare_for_resize(64, 64);
+
+        assert_eq!(shared.generation(), generation);
+    }
+
+    #[test]
+    fn capability_support_respects_avc_disabled_flags_and_avc444_env_switch() {
+        use ironrdp_egfx::pdu::*;
+
+        assert_eq!(
+            capability_avc_support(
+                &CapabilitySet::V8_1 {
+                    flags: CapabilitiesV81Flags::AVC420_ENABLED,
+                },
+                false,
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            capability_avc_support(
+                &CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::empty(),
+                },
+                false,
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            capability_avc_support(
+                &CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::empty(),
+                },
+                true,
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            capability_avc_support(
+                &CapabilitySet::V10_7 {
+                    flags: CapabilitiesV107Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (false, false)
+        );
+        assert_eq!(
+            capability_avc_support(
+                &CapabilitySet::V10 {
+                    flags: CapabilitiesV10Flags::AVC_DISABLED,
+                },
+                false,
+            ),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn avc420_region_preserves_rect16_bounds_and_quant_quality() {
+        let region = Avc420Region::new(4, 6, 20, 22, 19, 81);
+        let rectangle = region.to_rectangle();
+        let quant = region.to_quant_quality();
+
+        assert_eq!(rectangle.left, 4);
+        assert_eq!(rectangle.top, 6);
+        assert_eq!(rectangle.right, 20);
+        assert_eq!(rectangle.bottom, 22);
+        assert_eq!(quant.quantization_parameter, 19);
+        assert!(!quant.progressive);
+        assert_eq!(quant.quality, 81);
     }
 }
 
@@ -739,46 +1355,17 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
         self.shared.max_frames_in_flight()
     }
 
-    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
-        tracing::info!(frame_id, queue_depth, "EGFX: frame acknowledged");
-    }
+    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32) {}
 
     fn capabilities_advertise(&mut self, pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {
-        tracing::info!(count = pdu.0.len(), "EGFX: client advertised capabilities");
+        tracing::trace!(count = pdu.0.len(), "EGFX: client advertised capabilities");
         for cap in &pdu.0 {
-            tracing::info!(?cap, "EGFX: client capability");
+            tracing::trace!(?cap, "EGFX: client capability");
         }
     }
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
-        use ironrdp_egfx::pdu::*;
-        let (avc420, avc444) = match cap {
-            CapabilitySet::V8 { .. } => (false, false),
-            CapabilitySet::V8_1 { flags } => {
-                (flags.contains(CapabilitiesV81Flags::AVC420_ENABLED), false)
-            }
-            CapabilitySet::V10 { flags } | CapabilitySet::V10_2 { flags } => {
-                let enabled = !flags.contains(CapabilitiesV10Flags::AVC_DISABLED);
-                (enabled, enabled)
-            }
-            CapabilitySet::V10_1 => (true, true),
-            CapabilitySet::V10_3 { flags } => {
-                let enabled = !flags.contains(CapabilitiesV103Flags::AVC_DISABLED);
-                (enabled, enabled)
-            }
-            CapabilitySet::V10_4 { flags }
-            | CapabilitySet::V10_5 { flags }
-            | CapabilitySet::V10_6 { flags }
-            | CapabilitySet::V10_6Err { flags } => {
-                let enabled = !flags.contains(CapabilitiesV104Flags::AVC_DISABLED);
-                (enabled, enabled)
-            }
-            CapabilitySet::V10_7 { flags } => {
-                let enabled = !flags.contains(CapabilitiesV107Flags::AVC_DISABLED);
-                (enabled, enabled)
-            }
-            CapabilitySet::Unknown(_) => (false, false),
-        };
+        let (avc420, avc444) = capability_avc_support(cap, avc444_disabled_by_env());
         let avc = avc420 || avc444;
         self.shared.avc_enabled.store(avc, Ordering::Release);
         self.shared.avc444_enabled.store(avc444, Ordering::Release);
@@ -799,7 +1386,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
     }
 
     fn on_close(&mut self) {
-        tracing::info!("EGFX: channel closed");
+        tracing::trace!("EGFX: channel closed");
         self.shared.ready.store(false, Ordering::Release);
     }
 }

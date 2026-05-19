@@ -15,16 +15,16 @@ vaapi = ["dep:cros-libva"]
 # VA-API hardware encoding (Intel/AMD)
 cros-libva = { version = "0.0.13", optional = true }
 # RDP server dependencies; pin a known revision for reproducible builds.
-ironrdp-server = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1", features = ["egfx", "helper"] }
-ironrdp-pdu = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-egfx = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-dvc = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-svc = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-cliprdr = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-rdpsnd = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-core = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-displaycontrol = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
-ironrdp-graphics = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
+ironrdp-server = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8", features = ["egfx", "helper"] }
+ironrdp-pdu = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-egfx = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-dvc = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-svc = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-cliprdr = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-rdpsnd = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-core = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-displaycontrol = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
+ironrdp-graphics = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
 
 # H.264 encoding (OpenH264 software encoder)
 openh264 = { version = "0.9", features = ["libloading"] }
@@ -51,7 +51,7 @@ libc = "0.2"
 rcgen = "0.13"
 
 # Clipboard image support (DIB/PNG conversion)
-ironrdp-cliprdr-format = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "fd78abd4da074403aa20cb5547bb72354338bbd1" }
+ironrdp-cliprdr-format = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "1a228bb080fdf44da94763377d2d347cff266ec8" }
 
 # Config file
 serde = { version = "1", features = ["derive"] }

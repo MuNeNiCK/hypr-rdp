@@ -168,7 +168,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
     }
 
     fn on_remote_copy(&mut self, available_formats: &[ClipboardFormat]) {
-        tracing::debug!(
+        tracing::trace!(
             formats = available_formats.len(),
             "Clipboard: remote clipboard updated"
         );
@@ -262,7 +262,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             // Convert CF_DIBV5 to PNG for Wayland
             match ironrdp_cliprdr_format::bitmap::dibv5_to_png(data) {
                 Ok(png_data) => {
-                    tracing::debug!(len = png_data.len(), "Clipboard: converted DIBV5 to PNG");
+                    tracing::trace!(len = png_data.len(), "Clipboard: converted DIBV5 to PNG");
                     self.suppress_watcher.store(true, Ordering::SeqCst);
                     if let Ok(mut guard) = self.pending_write.lock() {
                         *guard = Some(PendingWrite::Image(png_data));
@@ -286,7 +286,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             });
             match png_result {
                 Ok(png_data) => {
-                    tracing::debug!(len = png_data.len(), "Clipboard: converted DIB to PNG");
+                    tracing::trace!(len = png_data.len(), "Clipboard: converted DIB to PNG");
                     self.suppress_watcher.store(true, Ordering::SeqCst);
                     if let Ok(mut guard) = self.pending_write.lock() {
                         *guard = Some(PendingWrite::Image(png_data));
@@ -303,7 +303,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 return;
             }
 
-            tracing::debug!(len = utf8.len(), "Clipboard: received text from RDP client");
+            tracing::trace!(len = utf8.len(), "Clipboard: received text from RDP client");
             self.suppress_watcher.store(true, Ordering::SeqCst);
             if let Ok(mut guard) = self.pending_write.lock() {
                 *guard = Some(PendingWrite::Text(utf8.into_bytes()));
@@ -431,7 +431,7 @@ fn clipboard_thread(
             let source = manager.create_data_source(&qh, ());
             match &pending {
                 PendingWrite::Text(data) => {
-                    tracing::debug!(len = data.len(), "Clipboard: writing text to Wayland");
+                    tracing::trace!(len = data.len(), "Clipboard: writing text to Wayland");
                     source.offer(TEXT_MIME.to_string());
                     source.offer(UTF8_MIME.to_string());
                     source.offer(TEXT_PLAIN_MIME.to_string());
@@ -443,7 +443,7 @@ fn clipboard_thread(
                     }
                 }
                 PendingWrite::Image(data) => {
-                    tracing::debug!(len = data.len(), "Clipboard: writing image to Wayland");
+                    tracing::trace!(len = data.len(), "Clipboard: writing image to Wayland");
                     source.offer(IMAGE_PNG_MIME.to_string());
                     if let Ok(mut g) = state.source_data.lock() {
                         *g = Some(data.clone());
@@ -667,7 +667,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 if let Some(ref mime) = text_mime {
                     if let Some(data) = read_offer_data(&offer, mime, conn) {
                         if !data.is_empty() {
-                            tracing::debug!(len = data.len(), "Clipboard: read text data");
+                            tracing::trace!(len = data.len(), "Clipboard: read text data");
                             if let Ok(mut g) = state.clipboard_data.lock() {
                                 *g = Some(data);
                             }
@@ -683,7 +683,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                             // Convert PNG to CF_DIB for RDP clients
                             match ironrdp_cliprdr_format::bitmap::png_to_cf_dib(&png_data) {
                                 Ok(dib_data) => {
-                                    tracing::debug!(
+                                    tracing::trace!(
                                         png_len = png_data.len(),
                                         dib_len = dib_data.len(),
                                         "Clipboard: converted PNG to CF_DIB"

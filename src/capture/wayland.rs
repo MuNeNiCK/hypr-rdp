@@ -143,7 +143,7 @@ pub(crate) fn create_headless_output(
         if candidate.starts_with(HEADLESS_PREFIX) {
             break candidate;
         }
-        tracing::debug!(name = %candidate, "Ignoring unrelated monitoradded event");
+        tracing::trace!(name = %candidate, "Ignoring unrelated monitoradded event");
     };
 
     // Guard created immediately — any failure below will clean up the output
@@ -418,6 +418,10 @@ const DAMAGE_MERGE_DISTANCE: i32 = 16;
 /// Poll timeout (ms) for Wayland event dispatch. Controls shutdown responsiveness.
 const POLL_TIMEOUT_MS: i32 = 100;
 
+fn avc444_dimensions_supported(width: u32, height: u32) -> bool {
+    width != 0 && height != 0 && width.is_multiple_of(4) && height.is_multiple_of(2)
+}
+
 /// Poll-based Wayland event dispatch with timeout.
 ///
 /// Dispatches any already-queued events, then polls the Wayland fd for new events
@@ -518,7 +522,7 @@ impl EncodedEgfxFrame {
     fn len(&self) -> usize {
         match self {
             Self::Avc420(data) => data.len(),
-            Self::Avc444(frame) => frame.luma.len() + frame.chroma.len(),
+            Self::Avc444(frame) => frame.stream1.len() + frame.stream2.len(),
         }
     }
 
@@ -526,9 +530,9 @@ impl EncodedEgfxFrame {
         match self {
             Self::Avc420(data) => data.len() > 32,
             Self::Avc444(frame) => {
-                frame.luma.len() > 32
-                    && (frame.chroma_regions.is_empty() || frame.chroma.len() > 32)
-                    && (!frame.luma_regions.is_empty() || !frame.chroma_regions.is_empty())
+                frame.stream1.len() > 32
+                    && !frame.stream1_regions.is_empty()
+                    && (frame.stream2_regions.is_empty() || frame.stream2.len() > 32)
             }
         }
     }
@@ -536,7 +540,10 @@ impl EncodedEgfxFrame {
 
 struct FrameStats {
     window_start: Instant,
+    captured_frames: u32,
     sent_frames: u32,
+    skipped_no_damage: u32,
+    skipped_pacer: u32,
     skipped_backpressure: u32,
     bytes: u64,
     encode_us_total: u128,
@@ -544,17 +551,43 @@ struct FrameStats {
     damage_pixels: u64,
 }
 
+fn egfx_perf_logging_enabled() -> bool {
+    egfx_perf_logging_enabled_with(|name| std::env::var_os(name).is_some())
+}
+
+fn egfx_perf_logging_enabled_with(mut is_set: impl FnMut(&str) -> bool) -> bool {
+    is_set("HYPR_RDP_EGFX_PERF")
+}
+
 impl FrameStats {
     fn new() -> Self {
         Self {
             window_start: Instant::now(),
+            captured_frames: 0,
             sent_frames: 0,
+            skipped_no_damage: 0,
+            skipped_pacer: 0,
             skipped_backpressure: 0,
             bytes: 0,
             encode_us_total: 0,
             send_us_total: 0,
             damage_pixels: 0,
         }
+    }
+
+    fn record_capture(&mut self, width: u32, height: u32) {
+        self.captured_frames = self.captured_frames.saturating_add(1);
+        self.maybe_log(width, height);
+    }
+
+    fn record_no_damage_skip(&mut self, width: u32, height: u32) {
+        self.skipped_no_damage = self.skipped_no_damage.saturating_add(1);
+        self.maybe_log(width, height);
+    }
+
+    fn record_pacer_skip(&mut self, width: u32, height: u32) {
+        self.skipped_pacer = self.skipped_pacer.saturating_add(1);
+        self.maybe_log(width, height);
     }
 
     fn record_sent(
@@ -598,17 +631,66 @@ impl FrameStats {
             (self.damage_pixels as f64 * 100.0) / (frame_pixels as f64 * self.sent_frames as f64)
         };
 
-        tracing::info!(
-            fps = self.sent_frames as f64 / seconds,
-            mbps = (self.bytes as f64 * 8.0) / seconds / 1_000_000.0,
-            avg_encode_ms = self.encode_us_total as f64 / f64::from(frames) / 1000.0,
-            avg_send_ms = self.send_us_total as f64 / f64::from(frames) / 1000.0,
-            avg_damage_pct,
-            skipped_backpressure = self.skipped_backpressure,
-            "EGFX frame stats"
-        );
+        if egfx_perf_logging_enabled() {
+            tracing::info!(
+                target: "hypr_rdp::egfx_perf",
+                captured_fps = self.captured_frames as f64 / seconds,
+                fps = self.sent_frames as f64 / seconds,
+                mbps = (self.bytes as f64 * 8.0) / seconds / 1_000_000.0,
+                avg_encode_ms = self.encode_us_total as f64 / f64::from(frames) / 1000.0,
+                avg_send_ms = self.send_us_total as f64 / f64::from(frames) / 1000.0,
+                avg_damage_pct,
+                skipped_no_damage = self.skipped_no_damage,
+                skipped_pacer = self.skipped_pacer,
+                skipped_backpressure = self.skipped_backpressure,
+                "EGFX frame stats"
+            );
+        }
 
         *self = Self::new();
+    }
+}
+
+/// Capture frame pacer using an absolute deadline, matching the reference
+/// server's frame-rate cap while tolerating compositor frame-time quantization.
+struct FramePacer {
+    frame_interval: Duration,
+    next_send_at: Option<Instant>,
+}
+
+impl FramePacer {
+    const SEND_EARLY_FRACTION: f64 = 0.10;
+
+    fn new(target_fps: u32, now: Instant) -> Self {
+        let frame_interval = Duration::from_secs_f64(1.0 / f64::from(target_fps.max(1)));
+        Self {
+            frame_interval,
+            next_send_at: Some(now),
+        }
+    }
+
+    fn should_send(&mut self, now: Instant, sent_first_frame: bool, has_damage: bool) -> bool {
+        if !sent_first_frame {
+            self.next_send_at = Some(now + self.frame_interval);
+            return true;
+        }
+
+        if !has_damage {
+            return false;
+        }
+
+        let next_send_at = self.next_send_at.unwrap_or(now);
+        let send_early = self.frame_interval.mul_f64(Self::SEND_EARLY_FRACTION);
+        if now + send_early < next_send_at {
+            return false;
+        }
+
+        let mut next = next_send_at + self.frame_interval;
+        while next <= now {
+            next += self.frame_interval;
+        }
+        self.next_send_at = Some(next);
+        true
     }
 }
 
@@ -806,7 +888,9 @@ impl FrameProcessor {
             let egfx_ready = shared.is_ready();
             let avc_enabled = shared.is_avc_enabled();
             let ready = egfx_ready && avc_enabled;
-            let codec = if shared.is_avc444_enabled() {
+            let codec = if shared.is_avc444_enabled()
+                && avc444_dimensions_supported(self.width, self.height)
+            {
                 Some(EgfxCodec::Avc444)
             } else if avc_enabled {
                 Some(EgfxCodec::Avc420)
@@ -827,7 +911,7 @@ impl FrameProcessor {
                     self.sent_first_frame = false;
                     self.damage_detector.invalidate();
                     if !egfx_ready {
-                        tracing::info!("EGFX channel became unavailable");
+                        tracing::trace!("EGFX channel became unavailable");
                     }
                 }
             }
@@ -893,6 +977,7 @@ impl FrameProcessor {
             );
             if self.sent_first_frame && frame_damage_regions.is_empty() {
                 self.pending_damage_regions.clear();
+                self.stats.record_no_damage_skip(self.width, self.height);
                 return true;
             }
 
@@ -904,7 +989,7 @@ impl FrameProcessor {
                     && self.egfx_sender.is_some()
                 {
                     self.egfx_active = true;
-                    tracing::info!("EGFX transport ready, switching to H.264 encoding");
+                    tracing::trace!("EGFX transport ready, switching to H.264 encoding");
                 }
             }
 
@@ -927,7 +1012,7 @@ impl FrameProcessor {
                 if let Some(sid) = self.egfx_surface_id {
                     if let Some(handle) = &self.egfx_handle {
                         if !EgfxShared::can_send_frame(handle) {
-                            tracing::debug!("EGFX frame skipped before encode");
+                            tracing::trace!("EGFX frame skipped before encode");
                             self.stats.record_backpressure_skip(self.width, self.height);
                             return true;
                         }
@@ -982,38 +1067,29 @@ impl FrameProcessor {
                                         }
                                     }
                                     EncodedEgfxFrame::Avc444(frame) => {
-                                        let mut luma_regions = damage_regions_to_avc420(
-                                            &frame.luma_regions,
+                                        let stream1_regions = damage_regions_to_avc420(
+                                            &frame.stream1_regions,
                                             self.width as u16,
                                             self.height as u16,
                                             self.metadata_qp(),
                                         );
-                                        let chroma_regions = damage_regions_to_avc420(
-                                            &frame.chroma_regions,
+                                        let stream2_regions = damage_regions_to_avc420(
+                                            &frame.stream2_regions,
                                             self.width as u16,
                                             self.height as u16,
                                             self.metadata_qp(),
                                         );
-                                        for region in &chroma_regions {
-                                            if !luma_regions.iter().any(|existing| {
-                                                existing.left == region.left
-                                                    && existing.top == region.top
-                                                    && existing.right == region.right
-                                                    && existing.bottom == region.bottom
-                                            }) {
-                                                luma_regions.push(region.clone());
-                                            }
-                                        }
-                                        let chroma = (!chroma_regions.is_empty())
-                                            .then_some((&frame.chroma[..], &chroma_regions[..]));
+                                        let stream2 = (!stream2_regions.is_empty())
+                                            .then_some((&frame.stream2[..], &stream2_regions[..]));
                                         EgfxShared::send_avc444_frame_with_regions(
                                             handle,
                                             sender,
                                             sid,
-                                            &frame.luma,
-                                            &luma_regions,
-                                            chroma.map(|(data, _)| data),
-                                            chroma.map(|(_, regions)| regions),
+                                            frame.encoding,
+                                            &frame.stream1,
+                                            &stream1_regions,
+                                            stream2.map(|(data, _)| data),
+                                            stream2.map(|(_, regions)| regions),
                                             timestamp,
                                         )
                                     }
@@ -1048,7 +1124,15 @@ impl FrameProcessor {
                             }
                         }
                         Some(Ok(_)) => {
-                            self.encode_failures = 0;
+                            self.encode_failures += 1;
+                            tracing::trace!(
+                                failures = self.encode_failures,
+                                max = MAX_ENCODE_FAILURES,
+                                "H.264 encode produced no usable output"
+                            );
+                            if let Some(enc) = &mut self.h264_encoder {
+                                enc.force_idr();
+                            }
                         }
                         Some(Err(e)) => {
                             self.encode_failures += 1;
@@ -1104,7 +1188,7 @@ impl FrameProcessor {
             self.sent_first_frame = true;
             self.pending_damage_regions.clear();
             if let Some(size) = self.deferred_resize.take() {
-                tracing::info!(
+                tracing::trace!(
                     width = size.width,
                     height = size.height,
                     "Sending deferred resize"
@@ -1114,11 +1198,13 @@ impl FrameProcessor {
         }
 
         // Send bitmaps when EGFX is not active (not configured, or AVC disabled).
-        let egfx_active = self
+        let egfx_negotiated = self
             .egfx_shared
             .as_ref()
             .is_some_and(|s| s.is_ready() && s.is_avc_enabled());
-        if !sent_via_egfx && !egfx_active {
+        let egfx_runtime_available =
+            self.egfx_active && self.h264_encoder.is_some() && self.egfx_surface_id.is_some();
+        if !sent_via_egfx && (!egfx_negotiated || !egfx_runtime_available) {
             self.sent_first_frame = true;
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0,
@@ -1326,6 +1412,149 @@ fn damage_area_pixels(damage_regions: &[(i32, i32, i32, i32)], width: u32, heigh
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironrdp_core::{Decode, ReadCursor};
+    use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
+    use ironrdp_egfx::pdu::{Avc444BitmapStream, Codec1Type, Encoding, GfxPdu};
+    use ironrdp_server::EgfxServerMessage;
+
+    const TEST_CHANNEL_ID: u32 = 1007;
+
+    fn gradient_bgra_frame(width: usize, height: usize, stride: usize) -> Vec<u8> {
+        let mut frame = vec![0; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = y * stride + x * 4;
+                frame[offset] = (x * 11 + y * 3) as u8;
+                frame[offset + 1] = (x * 5 + y * 17) as u8;
+                frame[offset + 2] = (x * 19 + y * 7) as u8;
+                frame[offset + 3] = 255;
+            }
+        }
+        frame
+    }
+
+    fn negotiate_egfx(
+        width: u16,
+        height: u16,
+    ) -> (
+        Arc<EgfxShared>,
+        mpsc::UnboundedReceiver<ironrdp_server::ServerEvent>,
+    ) {
+        let shared = Arc::new(EgfxShared::new(crate::egfx::DEFAULT_MAX_FRAMES_IN_FLIGHT));
+        shared.set_surface_size(width, height);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let mut factory = crate::egfx::HyprGfxFactory::new(Arc::clone(&shared));
+        ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
+        let (mut bridge, _handle) =
+            ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
+                .expect("EGFX server builds");
+        ironrdp_dvc::DvcProcessor::start(&mut bridge, TEST_CHANNEL_ID).expect("channel starts");
+
+        let caps = ironrdp_egfx::pdu::GfxPdu::CapabilitiesAdvertise(
+            ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
+                ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+                    flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+                },
+            ]),
+        );
+        let caps = ironrdp_core::encode_vec(&caps).expect("capabilities encode");
+        let _ = ironrdp_dvc::DvcProcessor::process(&mut bridge, TEST_CHANNEL_ID, &caps)
+            .expect("capabilities process");
+
+        assert!(shared.is_ready());
+        assert!(shared.is_avc_enabled());
+        assert!(shared.is_avc444_enabled());
+
+        (shared, event_rx)
+    }
+
+    fn drain_gfx_pdus(
+        event_rx: &mut mpsc::UnboundedReceiver<ironrdp_server::ServerEvent>,
+    ) -> Vec<GfxPdu> {
+        let mut pdus = Vec::new();
+        let mut expected_fragment_len = 0usize;
+        let mut fragments = Vec::new();
+
+        while let Ok(event) = event_rx.try_recv() {
+            let ironrdp_server::ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) =
+                event
+            else {
+                continue;
+            };
+
+            for message in messages {
+                let encoded = message.encode_unframed_pdu().expect("DVC message encodes");
+                let mut cursor = ReadCursor::new(&encoded);
+                let dvc = DrdynvcServerPdu::decode(&mut cursor).expect("DVC message decodes");
+                let DrdynvcServerPdu::Data(data) = dvc else {
+                    continue;
+                };
+
+                let complete = match data {
+                    DrdynvcDataPdu::DataFirst(data_first) => {
+                        let total_len = data_first.length() as usize;
+                        if total_len == data_first.data().len() {
+                            Some(data_first.into_data())
+                        } else {
+                            expected_fragment_len = total_len;
+                            fragments = data_first.into_data();
+                            None
+                        }
+                    }
+                    DrdynvcDataPdu::Data(mut data) => {
+                        if expected_fragment_len == 0 {
+                            Some(data.into_data())
+                        } else {
+                            fragments.append(data.data_mut());
+                            if fragments.len() == expected_fragment_len {
+                                expected_fragment_len = 0;
+                                Some(std::mem::take(&mut fragments))
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                };
+
+                if let Some(gfx_bytes) = complete {
+                    let gfx_bytes = if gfx_bytes.starts_with(&[0xe0, 0x04]) {
+                        &gfx_bytes[2..]
+                    } else {
+                        &gfx_bytes
+                    };
+                    let mut cursor = ReadCursor::new(gfx_bytes);
+                    pdus.push(GfxPdu::decode(&mut cursor).expect("GFX PDU decodes"));
+                }
+            }
+        }
+
+        pdus
+    }
+
+    fn assert_sendable_avc444_wire_to_surface(pdus: &[GfxPdu], expected_encoding: Encoding) {
+        let wire = pdus
+            .iter()
+            .find_map(|pdu| match pdu {
+                GfxPdu::WireToSurface1(wire) => Some(wire),
+                _ => None,
+            })
+            .expect("AVC444 frame emits WireToSurface1");
+        assert_eq!(wire.codec_id, Codec1Type::Avc444v2);
+
+        let mut cursor = ReadCursor::new(&wire.bitmap_data);
+        let bitmap = Avc444BitmapStream::decode(&mut cursor).expect("AVC444 payload decodes");
+        assert_eq!(bitmap.encoding, expected_encoding);
+        assert!(!bitmap.stream1.data.is_empty());
+        assert!(!bitmap.stream1.rectangles.is_empty());
+
+        if expected_encoding == Encoding::LUMA_AND_CHROMA {
+            let stream2 = bitmap.stream2.expect("LC=0 carries stream2");
+            assert!(!stream2.data.is_empty());
+            assert!(!stream2.rectangles.is_empty());
+        } else {
+            assert!(bitmap.stream2.is_none());
+        }
+    }
 
     #[test]
     fn damage_regions_are_clamped_and_exclusive() {
@@ -1366,6 +1595,57 @@ mod tests {
     }
 
     #[test]
+    fn damage_regions_preserve_touching_and_disjoint_rectangles() {
+        let regions =
+            damage_regions_to_avc420(&[(0, 0, 10, 10), (10, 0, 5, 10), (30, 2, 4, 6)], 64, 64, 23);
+
+        assert_eq!(regions.len(), 3);
+        assert_eq!(
+            (
+                regions[0].left,
+                regions[0].top,
+                regions[0].right,
+                regions[0].bottom
+            ),
+            (0, 0, 10, 10)
+        );
+        assert_eq!(
+            (
+                regions[1].left,
+                regions[1].top,
+                regions[1].right,
+                regions[1].bottom
+            ),
+            (10, 0, 15, 10)
+        );
+        assert_eq!(
+            (
+                regions[2].left,
+                regions[2].top,
+                regions[2].right,
+                regions[2].bottom
+            ),
+            (30, 2, 34, 8)
+        );
+    }
+
+    #[test]
+    fn damage_region_clamp_handles_extreme_coordinates_without_overflow() {
+        assert_eq!(
+            clamp_damage_region(i32::MAX - 1, 0, 100, 10, 1280, 720),
+            None
+        );
+        assert_eq!(
+            clamp_damage_region(i32::MIN + 1, 0, 100, 10, 1280, 720),
+            None
+        );
+        assert_eq!(
+            clamp_damage_region(i32::MAX - 1, i32::MAX - 1, i32::MAX, i32::MAX, 1280, 720),
+            None
+        );
+    }
+
+    #[test]
     fn damage_region_clamp_and_merge_keeps_pending_union() {
         let mut pending = Vec::new();
         let first = clamp_damage_region(-10, 5, 30, 10, 1280, 720).unwrap();
@@ -1383,6 +1663,57 @@ mod tests {
             damage_area_pixels(&[(-10, -10, 20, 20), (1270, 710, 20, 20)], 1280, 720),
             200
         );
+    }
+
+    #[test]
+    fn egfx_perf_logging_is_opt_in() {
+        assert!(!egfx_perf_logging_enabled_with(|_| false));
+        assert!(egfx_perf_logging_enabled_with(
+            |name| name == "HYPR_RDP_EGFX_PERF"
+        ));
+    }
+
+    #[test]
+    fn avc444_dimension_gate_matches_local_packing_constraints() {
+        assert!(avc444_dimensions_supported(1920, 1200));
+        assert!(!avc444_dimensions_supported(18, 16));
+        assert!(!avc444_dimensions_supported(64, 15));
+        assert!(!avc444_dimensions_supported(0, 64));
+    }
+
+    #[test]
+    fn frame_pacer_keeps_30fps_on_quantized_60hz_events() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(30, start);
+
+        assert!(pacer.should_send(start, false, true));
+        assert!(!pacer.should_send(start + Duration::from_millis(16), true, true));
+        assert!(pacer.should_send(start + Duration::from_millis(32), true, true));
+        assert!(!pacer.should_send(start + Duration::from_millis(48), true, true));
+        assert!(pacer.should_send(start + Duration::from_millis(64), true, true));
+    }
+
+    #[test]
+    fn frame_pacer_does_not_burst_after_idle() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(30, start);
+
+        assert!(pacer.should_send(start, false, true));
+        assert!(!pacer.should_send(start + Duration::from_secs(1), true, false));
+        assert!(pacer.should_send(start + Duration::from_secs(1), true, true));
+        assert!(!pacer.should_send(start + Duration::from_secs(1), true, true));
+    }
+
+    #[test]
+    fn frame_pacer_keeps_30fps_on_quantized_50hz_events() {
+        let start = Instant::now();
+        let mut pacer = FramePacer::new(30, start);
+
+        let sends = (0..50)
+            .filter(|i| pacer.should_send(start + Duration::from_millis(i * 20), *i > 0, true))
+            .count();
+
+        assert_eq!(sends, 30);
     }
 
     #[test]
@@ -1464,6 +1795,254 @@ mod tests {
         );
 
         assert_eq!(regions, vec![(128, 0, 64, 64)]);
+    }
+
+    #[test]
+    fn frame_processor_selects_avc420_when_avc444_dimensions_are_unsupported() {
+        let width = 18;
+        let height = 16;
+        let stride = width * 4;
+        let (shared, _event_rx) = negotiate_egfx(width as u16, height as u16);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+            None,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+        assert!(processor.process(&frame, &display_tx));
+        assert_eq!(processor.egfx_codec, Some(EgfxCodec::Avc420));
+        assert!(processor.sent_first_frame);
+        assert!(processor.pending_damage_regions.is_empty());
+        assert!(display_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn frame_processor_sends_bitmap_when_negotiated_avc_encoder_is_unavailable() {
+        let width = 17;
+        let height = 16;
+        let stride = width * 4;
+        let (shared, _event_rx) = negotiate_egfx(width as u16, height as u16);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+            None,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+        assert!(processor.process(&frame, &display_tx));
+        assert!(processor.h264_encoder.is_none());
+        assert!(!processor.egfx_active);
+        assert!(processor.sent_first_frame);
+        assert!(processor.pending_damage_regions.is_empty());
+        match display_rx.try_recv() {
+            Ok(DisplayUpdate::Bitmap(update)) => {
+                assert_eq!(update.width.get(), width as u16);
+                assert_eq!(update.height.get(), height as u16);
+            }
+            other => {
+                panic!("expected bitmap fallback when AVC encoder is unavailable, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn frame_processor_emits_avc444_events_for_initial_and_followup_damage() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let (shared, mut event_rx) = negotiate_egfx(width as u16, height as u16);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        second[(16 * stride) + (16 * 4)] ^= 0x7f;
+        second[(17 * stride) + (17 * 4) + 1] ^= 0x3f;
+
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Cqp,
+            30,
+            None,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+        assert!(processor.process(&first, &display_tx));
+        assert_eq!(processor.egfx_codec, Some(EgfxCodec::Avc444));
+        assert!(processor.sent_first_frame);
+        assert!(processor.egfx_surface_id.is_some());
+        assert!(!processor.has_pending_damage());
+        assert!(display_rx.try_recv().is_err());
+
+        let initial_pdus = drain_gfx_pdus(&mut event_rx);
+        assert_sendable_avc444_wire_to_surface(&initial_pdus, Encoding::LUMA_AND_CHROMA);
+
+        processor.queue_damage(&[(16, 16, 2, 2)]);
+        assert!(processor.process(&second, &display_tx));
+        assert!(processor.sent_first_frame);
+        assert!(!processor.has_pending_damage());
+        assert!(display_rx.try_recv().is_err());
+
+        let followup_pdus = drain_gfx_pdus(&mut event_rx);
+        assert_sendable_avc444_wire_to_surface(&followup_pdus, Encoding::LUMA_AND_CHROMA);
+    }
+
+    #[test]
+    fn frame_processor_recovers_avc444_with_full_luma_and_chroma_after_send_failure() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let (shared, event_rx) = negotiate_egfx(width as u16, height as u16);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        second[4] = 0x40;
+
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Cqp,
+            30,
+            None,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+        assert!(processor.process(&first, &display_tx));
+        assert_eq!(processor.egfx_codec, Some(EgfxCodec::Avc444));
+        assert!(processor.sent_first_frame);
+        let committed_before = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_luma_reference_y_for_test)
+            .expect("AVC444 reference committed after successful send")
+            .to_vec();
+
+        drop(event_rx);
+        processor.queue_damage(&[(0, 0, 4, 2)]);
+        assert!(processor.process(&second, &display_tx));
+
+        let committed_after = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_luma_reference_y_for_test)
+            .expect("AVC444 reference remains available")
+            .to_vec();
+        assert_eq!(committed_after, committed_before);
+        assert!(processor.has_pending_damage());
+        assert!(display_rx.try_recv().is_err());
+
+        let (recovery_tx, mut recovery_rx) = mpsc::unbounded_channel();
+        processor.egfx_sender = Some(recovery_tx);
+        assert!(processor.process(&second, &display_tx));
+
+        let committed_recovered = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_luma_reference_y_for_test)
+            .expect("AVC444 reference committed after recovery send")
+            .to_vec();
+        assert_ne!(committed_recovered, committed_before);
+        let (last_luma_regions, last_chroma_regions) = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_last_reference_regions_for_test)
+            .expect("AVC444 region state exists");
+        let full_frame = [(0, 0, width as i32, height as i32)];
+        assert_eq!(last_luma_regions, full_frame);
+        assert_eq!(last_chroma_regions, full_frame);
+        assert!(!processor.has_pending_damage());
+        assert!(display_rx.try_recv().is_err());
+        assert!(recovery_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn frame_processor_recreates_avc444_state_after_egfx_generation_bump() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let (shared, _event_rx) = negotiate_egfx(width as u16, height as u16);
+        let deferred_resize = ironrdp_server::DesktopSize {
+            width: width as u16,
+            height: height as u16,
+        };
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        second[8] = 0x7f;
+
+        let mut processor = FrameProcessor::new(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Cqp,
+            30,
+            Some(deferred_resize),
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+        assert!(processor.process(&first, &display_tx));
+        assert_eq!(processor.egfx_codec, Some(EgfxCodec::Avc444));
+        assert!(processor.sent_first_frame);
+        assert!(processor.egfx_surface_id.is_some());
+        let first_generation = processor.egfx_generation;
+
+        shared.prepare_for_resize(width as u16, height as u16);
+        processor.queue_damage(&[(0, 0, 4, 2)]);
+        assert!(processor.process(&second, &display_tx));
+
+        assert!(processor.egfx_generation > first_generation);
+        assert_eq!(processor.egfx_generation, shared.generation());
+        assert_eq!(processor.egfx_codec, Some(EgfxCodec::Avc444));
+        assert!(processor.sent_first_frame);
+        assert!(processor.egfx_surface_id.is_some());
+        assert!(!processor.has_pending_damage());
+        let (last_luma_regions, last_chroma_regions) = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_last_reference_regions_for_test)
+            .expect("AVC444 region state exists after re-generation");
+        let full_frame = [(0, 0, width as i32, height as i32)];
+        assert_eq!(last_luma_regions, full_frame);
+        assert_eq!(last_chroma_regions, full_frame);
+
+        match display_rx.try_recv() {
+            Ok(DisplayUpdate::Resize(size)) => assert_eq!(size, deferred_resize),
+            other => panic!("expected deferred resize after recovered EGFX frame, got {other:?}"),
+        }
     }
 }
 
@@ -1626,8 +2205,7 @@ fn capture_loop_ext(
         fps,
         deferred_resize,
     );
-    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
-    let mut last_frame_time = Instant::now() - frame_interval;
+    let mut frame_pacer = FramePacer::new(fps, Instant::now());
 
     let buffers = [&buffer_0, &buffer_1];
     let mmaps = [&mmap_0, &mmap_1];
@@ -1687,17 +2265,22 @@ fn capture_loop_ext(
         proc.queue_damage(&completed_damage_regions);
 
         let data = mmaps[completed_idx].as_slice();
+        proc.stats.record_capture(width, height);
 
         // Always enforce frame rate limit. Without this, compositor animations
         // (window open, cursor blink) flood the client with 60fps H.264 frames,
         // overwhelming the decoder and building up a decode queue that delays
         // all subsequent frames (including keystroke updates) by seconds.
-        let elapsed = last_frame_time.elapsed();
-        if !proc.sent_first_frame || (elapsed >= frame_interval && proc.has_pending_damage()) {
-            last_frame_time = Instant::now();
+        let has_pending_damage = proc.has_pending_damage();
+        if !has_pending_damage && proc.sent_first_frame {
+            proc.stats.record_no_damage_skip(width, height);
+        } else if frame_pacer.should_send(Instant::now(), proc.sent_first_frame, has_pending_damage)
+        {
             if !proc.process(data, &state.tx) {
                 break;
             }
+        } else {
+            proc.stats.record_pacer_skip(width, height);
         }
     }
 
@@ -1758,13 +2341,13 @@ fn try_setup_dmabuf(
         match best {
             Some(entry) => (entry.0, &entry.1),
             None => {
-                tracing::debug!("No XRGB8888/ARGB8888 format in DMA-BUF formats");
+                tracing::trace!("No XRGB8888/ARGB8888 format in DMA-BUF formats");
                 return None;
             }
         }
     };
 
-    tracing::info!(
+    tracing::trace!(
         format = format!("0x{:08x}", chosen_format),
         num_modifiers = chosen_modifiers.len(),
         "Attempting DMA-BUF capture setup"
@@ -1798,7 +2381,7 @@ fn setup_dmabuf_inner(
     // Find DRM device path from dev_t
     let drm_device_path =
         drm_device_from_devt(dev).context("failed to find DRM device from dev_t")?;
-    tracing::info!(device = %drm_device_path.display(), "DMA-BUF: found DRM device");
+    tracing::trace!(device = %drm_device_path.display(), "DMA-BUF: found DRM device");
 
     // Open DRM device and create GBM device
     let drm_fd = open_drm_device(&drm_device_path)?;
@@ -1860,7 +2443,7 @@ fn setup_dmabuf_inner(
             (),
         );
 
-        tracing::debug!(
+        tracing::trace!(
             idx = i,
             fd,
             stride,
@@ -1885,7 +2468,7 @@ fn setup_dmabuf_inner(
 
     // Export the NV12 output surface as a DMA-BUF
     let nv12_info = vpp.export_nv12_output()?;
-    tracing::info!(
+    tracing::trace!(
         nv12_fd = nv12_info.fd,
         nv12_stride = nv12_info.stride,
         "DMA-BUF: VPP NV12 output exported"
@@ -1930,8 +2513,7 @@ fn capture_loop_ext_dmabuf(
         "Starting capture loop (zero-copy DMA-BUF)"
     );
 
-    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
-    let mut last_frame_time = Instant::now() - frame_interval;
+    let mut frame_pacer = FramePacer::new(fps, Instant::now());
     let mut cap_idx: usize = 0;
     let mut sent_first_frame = false;
     let mut deferred_resize = deferred_resize;
@@ -2000,11 +2582,8 @@ fn capture_loop_ext_dmabuf(
         }
 
         // Rate limit
-        let elapsed = last_frame_time.elapsed();
-        if !sent_first_frame || (elapsed >= frame_interval && has_damage) {
+        if frame_pacer.should_send(Instant::now(), sent_first_frame, has_damage) {
             // Process via DMA-BUF zero-copy pipeline
-            last_frame_time = Instant::now();
-
             // Update EGFX state
             if let Some(shared) = &egfx_shared {
                 let ready = shared.is_ready() && shared.is_avc_enabled();
@@ -2060,7 +2639,7 @@ fn capture_loop_ext_dmabuf(
                     egfx_sender = shared.get_event_sender();
                     if h264_encoder.is_some() && egfx_handle.is_some() && egfx_sender.is_some() {
                         egfx_active = true;
-                        tracing::info!("EGFX transport ready (DMA-BUF path)");
+                        tracing::trace!("EGFX transport ready (DMA-BUF path)");
                     }
                 }
 
@@ -2080,7 +2659,7 @@ fn capture_loop_ext_dmabuf(
                     if let Some(sid) = egfx_surface_id {
                         if let Some(handle) = &egfx_handle {
                             if !EgfxShared::can_send_frame(handle) {
-                                tracing::debug!("EGFX frame skipped before DMA-BUF encode");
+                                tracing::trace!("EGFX frame skipped before DMA-BUF encode");
                                 continue;
                             }
                         }
@@ -2130,7 +2709,7 @@ fn capture_loop_ext_dmabuf(
                                     if sent {
                                         sent_first_frame = true;
                                         if let Some(size) = deferred_resize.take() {
-                                            tracing::info!(
+                                            tracing::trace!(
                                                 width = size.width,
                                                 height = size.height,
                                                 "Sending deferred resize"
@@ -2292,8 +2871,7 @@ fn capture_loop_wlr(
         fps,
         deferred_resize,
     );
-    let frame_interval = Duration::from_secs_f64(1.0 / fps as f64);
-    let mut last_frame_time = Instant::now() - frame_interval;
+    let mut frame_pacer = FramePacer::new(fps, Instant::now());
 
     let buffers = [&buffer_0, &buffer_1];
     let mmaps = [&mmap_0, &mmap_1];
@@ -2347,12 +2925,20 @@ fn capture_loop_wlr(
         if !completed_failed {
             proc.queue_damage(&completed_damage_regions);
             let data = mmaps[completed_idx].as_slice();
-            let elapsed = last_frame_time.elapsed();
-            if !proc.sent_first_frame || (elapsed >= frame_interval && proc.has_pending_damage()) {
-                last_frame_time = Instant::now();
+            proc.stats.record_capture(width, height);
+            let has_pending_damage = proc.has_pending_damage();
+            if !has_pending_damage && proc.sent_first_frame {
+                proc.stats.record_no_damage_skip(width, height);
+            } else if frame_pacer.should_send(
+                Instant::now(),
+                proc.sent_first_frame,
+                has_pending_damage,
+            ) {
                 if !proc.process(data, &state.tx) {
                     break;
                 }
+            } else {
+                proc.stats.record_pacer_skip(width, height);
             }
         }
 
@@ -2535,7 +3121,7 @@ impl Dispatch<wl_output::WlOutput, ()> for AppState {
                 for (_, output) in &state.outputs {
                     if output.id().protocol_id() == proxy_id {
                         state.target_output = Some(output.clone());
-                        tracing::info!(name = %name, "Matched target output");
+                        tracing::trace!(name = %name, "Matched target output");
                         break;
                     }
                 }
@@ -2586,7 +3172,7 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
                             .try_into()
                             .unwrap(),
                     );
-                    tracing::info!(dev, "Session: DMA-BUF device advertised");
+                    tracing::trace!(dev, "Session: DMA-BUF device advertised");
                     state.dmabuf_device = Some(dev);
                 }
             }
@@ -2601,7 +3187,7 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
                     mods.push(m);
                     i += chunk_size;
                 }
-                tracing::debug!(
+                tracing::trace!(
                     format = format!("0x{:08x}", format),
                     num_modifiers = mods.len(),
                     "Session: DMA-BUF format advertised"

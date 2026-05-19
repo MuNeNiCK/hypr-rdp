@@ -17,6 +17,9 @@ use crate::input::SharedOutputLayout;
 
 pub(crate) use wayland::HeadlessOutputGuard;
 
+const OPENH264_MAX_LONG_DIMENSION: u32 = 3840;
+const OPENH264_MAX_SHORT_DIMENSION: u32 = 2160;
+
 #[derive(Clone, Copy, Debug)]
 pub enum CaptureMode {
     /// ext-image-copy-capture-v1
@@ -92,6 +95,28 @@ fn resize_headless_output(output_name: &str, width: u32, height: u32) -> Result<
     Ok(())
 }
 
+fn clamp_to_openh264_limits(width: u32, height: u32) -> (u32, u32) {
+    let width = width & !1;
+    let height = height & !1;
+    if width == 0 || height == 0 {
+        return (width, height);
+    }
+
+    let long = width.max(height);
+    let short = width.min(height);
+    if long <= OPENH264_MAX_LONG_DIMENSION && short <= OPENH264_MAX_SHORT_DIMENSION {
+        return (width, height);
+    }
+
+    let scale_by_long = OPENH264_MAX_LONG_DIMENSION as f64 / long as f64;
+    let scale_by_short = OPENH264_MAX_SHORT_DIMENSION as f64 / short as f64;
+    let scale = scale_by_long.min(scale_by_short).min(1.0);
+
+    let scaled_width = ((width as f64 * scale).floor() as u32).max(2) & !1;
+    let scaled_height = ((height as f64 * scale).floor() as u32).max(2) & !1;
+    (scaled_width, scaled_height)
+}
+
 /// RdpServerDisplay implementation that delegates to HyprDisplayInner.
 pub struct HyprDisplay {
     inner: Arc<Mutex<HyprDisplayInner>>,
@@ -112,6 +137,17 @@ impl HyprDisplay {
         output: Option<String>,
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
+        let requested_resolution = resolution;
+        let resolution = clamp_to_openh264_limits(resolution.0, resolution.1);
+        if resolution != requested_resolution {
+            tracing::warn!(
+                requested_w = requested_resolution.0,
+                requested_h = requested_resolution.1,
+                applied_w = resolution.0,
+                applied_h = resolution.1,
+                "Configured resolution exceeds OpenH264 software encoder limit; clamping"
+            );
+        }
 
         // Create or verify output up front, but defer Wayland capture until a
         // client subscribes to display updates. This keeps idle memory bounded.
@@ -198,12 +234,20 @@ impl RdpServerDisplay for HyprDisplay {
     }
 
     async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
-        let cw = client_size.width as u32;
-        let ch = client_size.height as u32;
+        let requested_w = client_size.width as u32;
+        let requested_h = client_size.height as u32;
 
         // H.264 requires even dimensions
-        let cw = cw & !1;
-        let ch = ch & !1;
+        let (cw, ch) = clamp_to_openh264_limits(requested_w, requested_h);
+        if cw != (requested_w & !1) || ch != (requested_h & !1) {
+            tracing::warn!(
+                requested_w,
+                requested_h,
+                applied_w = cw,
+                applied_h = ch,
+                "Client requested size exceeds OpenH264 software encoder limit; clamping"
+            );
+        }
 
         let mut inner = self.inner.lock().await;
         if cw > 0
@@ -213,8 +257,10 @@ impl RdpServerDisplay for HyprDisplay {
             && inner.output.is_none()
         {
             tracing::info!(
-                client_w = cw,
-                client_h = ch,
+                client_w = requested_w,
+                client_h = requested_h,
+                applied_w = cw,
+                applied_h = ch,
                 server_w = inner.width,
                 server_h = inner.height,
                 "Client requested initial size; resizing headless output"
@@ -236,8 +282,10 @@ impl RdpServerDisplay for HyprDisplay {
             }
         } else if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
             tracing::info!(
-                client_w = cw,
-                client_h = ch,
+                client_w = requested_w,
+                client_h = requested_h,
+                applied_w = cw,
+                applied_h = ch,
                 server_w = inner.width,
                 server_h = inner.height,
                 resolution_fixed = inner.resolution_fixed,
@@ -260,14 +308,14 @@ impl RdpServerDisplay for HyprDisplay {
             },
         };
 
-        let (mut w, mut h) = monitor.dimensions();
+        let (requested_w, requested_h) = monitor.dimensions();
         let desktop_scale = monitor.desktop_scale_factor();
         let device_scale = monitor.device_scale_factor();
         let physical = monitor.physical_dimensions();
 
         tracing::info!(
-            w,
-            h,
+            w = requested_w,
+            h = requested_h,
             ?desktop_scale,
             ?device_scale,
             ?physical,
@@ -275,13 +323,29 @@ impl RdpServerDisplay for HyprDisplay {
             "Client requested DisplayControl layout"
         );
 
-        if w == 0 || h == 0 || w > u16::MAX as u32 || h > u16::MAX as u32 {
-            tracing::warn!(w, h, "Ignoring invalid DisplayControl dimensions");
+        if requested_w == 0
+            || requested_h == 0
+            || requested_w > u16::MAX as u32
+            || requested_h > u16::MAX as u32
+        {
+            tracing::warn!(
+                w = requested_w,
+                h = requested_h,
+                "Ignoring invalid DisplayControl dimensions"
+            );
             return;
         }
 
-        w &= !1;
-        h &= !1;
+        let (w, h) = clamp_to_openh264_limits(requested_w, requested_h);
+        if w != (requested_w & !1) || h != (requested_h & !1) {
+            tracing::warn!(
+                requested_w,
+                requested_h,
+                applied_w = w,
+                applied_h = h,
+                "DisplayControl size exceeds OpenH264 software encoder limit; clamping"
+            );
+        }
 
         if w == 0 || h == 0 {
             tracing::warn!("Dimensions too small after even-rounding, ignoring");
@@ -407,5 +471,31 @@ struct HyprDisplayUpdates {
 impl RdpServerDisplayUpdates for HyprDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
         Ok(self.rx.recv().await)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openh264_limit_keeps_supported_landscape_size() {
+        assert_eq!(clamp_to_openh264_limits(1920, 1200), (1920, 1200));
+        assert_eq!(clamp_to_openh264_limits(3840, 2160), (3840, 2160));
+    }
+
+    #[test]
+    fn openh264_limit_scales_ultrawide_client_size() {
+        assert_eq!(clamp_to_openh264_limits(5120, 1440), (3840, 1080));
+    }
+
+    #[test]
+    fn openh264_limit_scales_portrait_size() {
+        assert_eq!(clamp_to_openh264_limits(1440, 5120), (1080, 3840));
+    }
+
+    #[test]
+    fn openh264_limit_rounds_to_even_dimensions() {
+        assert_eq!(clamp_to_openh264_limits(5121, 1441), (3840, 1080));
     }
 }

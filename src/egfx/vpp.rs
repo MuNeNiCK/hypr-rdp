@@ -260,7 +260,7 @@ impl VppConverter {
 
         let idx = self.input_surfaces.len();
         self.input_surfaces.push(surface_id);
-        tracing::debug!(
+        tracing::trace!(
             idx,
             surface_id,
             format = format!("0x{:08x}", format),

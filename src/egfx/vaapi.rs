@@ -52,7 +52,7 @@ fn find_vaapi_device() -> Result<PathBuf> {
         let display = match Display::open_drm_display(device) {
             Ok(d) => d,
             Err(e) => {
-                tracing::debug!(device = %device.display(), "Skipping VA-API device: {:?}", e);
+                tracing::trace!(device = %device.display(), "Skipping VA-API device: {:?}", e);
                 continue;
             }
         };
@@ -79,7 +79,7 @@ fn find_vaapi_device() -> Result<PathBuf> {
             let vendor = display
                 .query_vendor_string()
                 .unwrap_or_else(|_| "unknown".into());
-            tracing::info!(
+            tracing::trace!(
                 device = %device.display(),
                 vendor = %vendor,
                 profile = ?h264_profile,
@@ -406,7 +406,7 @@ impl VaapiEncoder {
                 self.cached_sps_pps = Some(sps_pps);
             } else {
                 // VA-API driver didn't include SPS/PPS — generate manually
-                tracing::debug!("VA-API IDR missing SPS/PPS, generating manually");
+                tracing::trace!("VA-API IDR missing SPS/PPS, generating manually");
                 let sps_pps = self.generate_sps_pps();
                 // Prepend to IDR frame
                 let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
@@ -486,7 +486,7 @@ impl VaapiEncoder {
                 .into_iter()
                 .next()
                 .context("VA-API returned no surfaces from DMA-BUF import")?;
-            tracing::info!(
+            tracing::trace!(
                 surface_id = surface.id(),
                 "Encoder: imported NV12 DMA-BUF surface"
             );
@@ -591,7 +591,7 @@ impl VaapiEncoder {
             if let Some(sps_pps) = super::extract_sps_pps(&data) {
                 self.cached_sps_pps = Some(sps_pps);
             } else {
-                tracing::debug!("VA-API IDR missing SPS/PPS, generating manually");
+                tracing::trace!("VA-API IDR missing SPS/PPS, generating manually");
                 let sps_pps = self.generate_sps_pps();
                 let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
                 combined.extend_from_slice(&sps_pps);

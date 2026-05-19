@@ -76,7 +76,7 @@ impl RdpsndServerHandler for HyprSoundHandler {
     }
 
     fn start(&mut self, client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu) -> Option<u16> {
-        tracing::info!(
+        tracing::trace!(
             client_formats = client_format.formats.len(),
             "Audio: starting capture ({}Hz, {}ch, {}bit)",
             SAMPLE_RATE,
@@ -134,12 +134,12 @@ impl RdpsndServerHandler for HyprSoundHandler {
             }
         }
 
-        tracing::info!(client_format_index, "Audio: PipeWire capture started");
+        tracing::trace!(client_format_index, "Audio: PipeWire capture started");
         Some(client_format_index)
     }
 
     fn stop(&mut self) {
-        tracing::info!("Audio: stopping capture");
+        tracing::trace!("Audio: stopping capture");
 
         if let Some(stop) = self.stop_signal.take() {
             stop.store(true, Ordering::SeqCst);
@@ -206,7 +206,7 @@ fn run_capture(
     let _listener = stream
         .add_local_listener_with_user_data(user_data)
         .state_changed(move |_stream, _data, old, new| {
-            tracing::debug!("Audio stream state: {:?} -> {:?}", old, new);
+            tracing::trace!("Audio stream state: {:?} -> {:?}", old, new);
             if let pw::stream::StreamState::Error(err) = new {
                 tracing::error!("Audio stream error: {}", err);
                 stop_for_state.store(true, Ordering::SeqCst);
@@ -240,7 +240,7 @@ fn run_capture(
             let rate = data.format.rate();
             let channels = data.format.channels();
             let format = data.format.format();
-            tracing::info!(
+            tracing::trace!(
                 "Audio format negotiated: rate={}, channels={}, format={:?}",
                 rate, channels, format
             );
@@ -361,13 +361,13 @@ fn run_capture(
         .connect(spa::utils::Direction::Input, None, flags, &mut [pod])
         .map_err(|_| anyhow::anyhow!("Failed to connect PipeWire stream"))?;
 
-    tracing::info!("Audio: PipeWire stream connected, entering main loop");
+    tracing::trace!("Audio: PipeWire stream connected, entering main loop");
 
     let loop_ref = mainloop.loop_();
     while !stop_signal.load(Ordering::Relaxed) {
         loop_ref.iterate(std::time::Duration::from_millis(100));
     }
 
-    tracing::info!("Audio: PipeWire capture stopped");
+    tracing::trace!("Audio: PipeWire capture stopped");
     Ok(())
 }
