@@ -1,3 +1,4 @@
+use std::fmt;
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,6 +13,21 @@ use super::state::AppState;
 use super::{create_shm_fd, poll_dispatch, CaptureInfo, MmapRegion, POLL_TIMEOUT_MS};
 use crate::capture::frame::{FramePacer, FrameProcessor};
 use crate::egfx::{EgfxShared, H264RateControl};
+
+#[derive(Debug)]
+pub(super) struct BufferParametersChanged;
+
+impl fmt::Display for BufferParametersChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("WLR buffer parameters changed")
+    }
+}
+
+impl std::error::Error for BufferParametersChanged {}
+
+pub(super) fn is_buffer_parameters_changed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<BufferParametersChanged>().is_some()
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn capture_loop_wlr(
@@ -221,7 +237,7 @@ pub(super) fn capture_loop_wlr(
                         "WLR: compositor changed buffer parameters, restarting capture"
                     );
                     frame.destroy();
-                    bail!("WLR buffer parameters changed, restarting capture");
+                    return Err(BufferParametersChanged.into());
                 }
                 frame.copy_with_damage(buffers[cap_idx]);
                 conn.flush().context("Wayland flush failed")?;

@@ -134,27 +134,51 @@ fn capture_thread(
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut info_tx = Some(info_tx);
-    let result = capture_thread_inner(
-        tx,
-        &mut info_tx,
-        capture_mode,
-        egfx_shared,
-        output_layout,
-        bitrate,
-        quality,
-        rate_control,
-        fps,
-        output_name,
-        deferred_resize,
-        stop_flag,
-    );
-    if let Err(err) = result {
-        if let Some(tx) = info_tx.take() {
-            let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
+    let mut restarts = 0u32;
+
+    loop {
+        let result = capture_thread_inner(
+            tx.clone(),
+            &mut info_tx,
+            capture_mode,
+            egfx_shared.clone(),
+            Arc::clone(&output_layout),
+            bitrate,
+            quality,
+            rate_control,
+            fps,
+            output_name.clone(),
+            deferred_resize,
+            Arc::clone(&stop_flag),
+        );
+
+        match result {
+            Ok(()) => return Ok(()),
+            Err(err)
+                if wlr::is_buffer_parameters_changed(&err)
+                    && !stop_flag.load(std::sync::atomic::Ordering::Acquire) =>
+            {
+                restarts = restarts.saturating_add(1);
+                tracing::warn!(
+                    restarts,
+                    "WLR capture buffer parameters changed; restarting capture thread"
+                );
+                if restarts >= 5 {
+                    if let Some(tx) = info_tx.take() {
+                        let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
+                    }
+                    return Err(err);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(err) => {
+                if let Some(tx) = info_tx.take() {
+                    let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
+                }
+                return Err(err);
+            }
         }
-        return Err(err);
     }
-    Ok(())
 }
 
 fn create_shm_fd(size: usize) -> Result<OwnedFd> {
