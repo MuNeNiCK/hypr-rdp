@@ -607,7 +607,7 @@ impl FrameProcessor {
             self.sent_first_frame = true;
             if let Some(size) = self.deferred_resize.take() {
                 tracing::info!(width = size.width, height = size.height, "Sending deferred resize");
-                let _ = tx.blocking_send(DisplayUpdate::Resize(size));
+                let _ = tx.try_send(DisplayUpdate::Resize(size));
             }
         }
 
@@ -615,7 +615,9 @@ impl FrameProcessor {
         let egfx_active = self.egfx_shared.as_ref()
             .is_some_and(|s| s.is_ready() && s.is_avc_enabled());
         if !sent_via_egfx && !egfx_active {
-            self.sent_first_frame = true;
+            if tx.capacity() == 0 {
+                return true;
+            }
             let update = DisplayUpdate::Bitmap(BitmapUpdate {
                 x: 0, y: 0,
                 width: NonZeroU16::new(self.width as u16).expect("width is non-zero"),
@@ -624,9 +626,15 @@ impl FrameProcessor {
                 data: Bytes::copy_from_slice(data),
                 stride: NonZeroUsize::new(self.stride as usize).expect("stride is non-zero"),
             });
-            if tx.blocking_send(update).is_err() {
-                tracing::info!("Display update channel closed");
-                return false;
+            match tx.try_send(update) {
+                Ok(()) => {
+                    self.sent_first_frame = true;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    tracing::info!("Display update channel closed");
+                    return false;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
             }
         }
         true
@@ -1198,7 +1206,7 @@ fn capture_loop_ext_dmabuf(
                                             );
                                             let _ = state
                                                 .tx
-                                                .blocking_send(DisplayUpdate::Resize(size));
+                                                .try_send(DisplayUpdate::Resize(size));
                                         }
                                     }
                                 }
