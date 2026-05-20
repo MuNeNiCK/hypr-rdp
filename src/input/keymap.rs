@@ -64,7 +64,17 @@ pub const BTN_EXTRA: u32 = 0x114; // Button5 (forward)
 
 #[cfg(test)]
 mod tests {
-    use super::xt_to_evdev;
+    use super::{xt_to_evdev, BTN_EXTRA, BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, BTN_SIDE};
+
+    #[test]
+    fn maps_base_modifiers_locks_and_common_keys() {
+        assert_eq!(xt_to_evdev(0x0f, false), Some(15)); // KEY_TAB
+        assert_eq!(xt_to_evdev(0x1d, false), Some(29)); // KEY_LEFTCTRL
+        assert_eq!(xt_to_evdev(0x38, false), Some(56)); // KEY_LEFTALT
+        assert_eq!(xt_to_evdev(0x3a, false), Some(58)); // KEY_CAPSLOCK
+        assert_eq!(xt_to_evdev(0x45, false), Some(69)); // KEY_NUMLOCK
+        assert_eq!(xt_to_evdev(0x46, false), Some(70)); // KEY_SCROLLLOCK
+    }
 
     #[test]
     fn maps_international_non_extended_keys() {
@@ -79,5 +89,37 @@ mod tests {
         assert_eq!(xt_to_evdev(0x20, true), Some(113));
         assert_eq!(xt_to_evdev(0x32, true), Some(172));
         assert_eq!(xt_to_evdev(0x6C, true), Some(155));
+    }
+
+    #[test]
+    fn maps_extended_navigation_and_right_modifiers() {
+        assert_eq!(xt_to_evdev(0x1c, true), Some(96)); // KEY_KPENTER
+        assert_eq!(xt_to_evdev(0x1d, true), Some(97)); // KEY_RIGHTCTRL
+        assert_eq!(xt_to_evdev(0x38, true), Some(100)); // KEY_RIGHTALT
+        assert_eq!(xt_to_evdev(0x47, true), Some(102)); // KEY_HOME
+        assert_eq!(xt_to_evdev(0x48, true), Some(103)); // KEY_UP
+        assert_eq!(xt_to_evdev(0x4b, true), Some(105)); // KEY_LEFT
+        assert_eq!(xt_to_evdev(0x4d, true), Some(106)); // KEY_RIGHT
+        assert_eq!(xt_to_evdev(0x50, true), Some(108)); // KEY_DOWN
+        assert_eq!(xt_to_evdev(0x53, true), Some(111)); // KEY_DELETE
+    }
+
+    #[test]
+    fn rejects_unmapped_scancodes() {
+        assert_eq!(xt_to_evdev(0x00, false), None);
+        assert_eq!(xt_to_evdev(0x54, false), None);
+        assert_eq!(xt_to_evdev(0x59, false), None);
+        assert_eq!(xt_to_evdev(0xff, false), None);
+        assert_eq!(xt_to_evdev(0x70, true), None);
+        assert_eq!(xt_to_evdev(0xff, true), None);
+    }
+
+    #[test]
+    fn mouse_button_constants_match_linux_evdev_button_range() {
+        assert_eq!(BTN_LEFT, 0x110);
+        assert_eq!(BTN_RIGHT, 0x111);
+        assert_eq!(BTN_MIDDLE, 0x112);
+        assert_eq!(BTN_SIDE, 0x113);
+        assert_eq!(BTN_EXTRA, 0x114);
     }
 }

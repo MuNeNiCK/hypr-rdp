@@ -469,6 +469,63 @@ mod tests {
     }
 
     #[test]
+    fn frame_diff_detector_handles_padded_stride() {
+        let width = 96;
+        let height = 96;
+        let stride = width * 4 + 16;
+        let reference = vec![0; stride * height];
+        let mut current = reference.clone();
+        current[(70 * stride) + (70 * 4)] = 1;
+
+        let mut detector = FrameDiffDamageDetector::new();
+        detector.update_reference(&reference, height as u32, stride);
+        let regions = detector.detect(
+            &current,
+            width as u32,
+            height as u32,
+            stride,
+            &[(0, 0, width as i32, height as i32)],
+        );
+
+        assert_eq!(regions, vec![(64, 64, 32, 32)]);
+    }
+
+    #[test]
+    fn reference_region_update_preserves_padding_and_unselected_pixels() {
+        let width = 4;
+        let height = 3;
+        let stride = width * 4 + 8;
+        let mut reference = vec![0x10; stride * height];
+        let mut current = reference.clone();
+
+        for row in 0..height {
+            let padding = row * stride + width * 4;
+            current[padding..padding + 8].fill(0x99);
+        }
+        for x in 1..3 {
+            let offset = stride + x * 4;
+            current[offset..offset + 4].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        }
+
+        let mut detector = FrameDiffDamageDetector::new();
+        detector.update_reference(&reference, height as u32, stride);
+        detector.update_reference_regions(
+            &current,
+            width as u32,
+            height as u32,
+            stride,
+            &[(1, 1, 2, 1)],
+        );
+
+        let updated = detector.reference_frame.as_ref().expect("reference exists");
+        for x in 1..3 {
+            let offset = stride + x * 4;
+            reference[offset..offset + 4].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
+        }
+        assert_eq!(updated, &reference);
+    }
+
+    #[test]
     fn frame_diff_detector_keeps_unsent_regions_dirty() {
         let width = 192;
         let height = 64;

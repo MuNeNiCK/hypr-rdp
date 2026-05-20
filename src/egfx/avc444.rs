@@ -1287,6 +1287,59 @@ mod tests {
     }
 
     #[test]
+    fn bgra_to_yuv_uses_bt709_full_range_reference_points() {
+        let tables = &*BGRA_TO_YUV_TABLES;
+        let colors: [(u8, u8, u8); 9] = [
+            (0, 0, 0),
+            (255, 255, 255),
+            (128, 128, 128),
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (255, 255, 0),
+            (0, 255, 255),
+            (255, 0, 255),
+        ];
+
+        for (r, g, b) in colors {
+            let actual =
+                bgra_components_to_yuv(tables, usize::from(r), usize::from(g), usize::from(b));
+            let expected = bt709_full_range_reference_yuv(r, g, b);
+
+            assert_yuv_close(actual, expected, (r, g, b));
+        }
+    }
+
+    fn bt709_full_range_reference_yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        let r = f64::from(r);
+        let g = f64::from(g);
+        let b = f64::from(b);
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let u = -0.114_572 * r - 0.385_428 * g + 0.5 * b + 128.0;
+        let v = 0.5 * r - 0.454_153 * g - 0.045_847 * b + 128.0;
+
+        (
+            y.round().clamp(0.0, 255.0) as u8,
+            u.round().clamp(0.0, 255.0) as u8,
+            v.round().clamp(0.0, 255.0) as u8,
+        )
+    }
+
+    fn assert_yuv_close(actual: (u8, u8, u8), expected: (u8, u8, u8), rgb: (u8, u8, u8)) {
+        for (channel, actual, expected) in [
+            ("Y", actual.0, expected.0),
+            ("U", actual.1, expected.1),
+            ("V", actual.2, expected.2),
+        ] {
+            let diff = actual.abs_diff(expected);
+            assert!(
+                diff <= 2,
+                "{channel} differs for RGB {rgb:?}: actual={actual} expected={expected}"
+            );
+        }
+    }
+
+    #[test]
     fn avc444_perf_logging_is_opt_in() {
         assert!(!avc444_perf_logging_enabled_with(|_| false));
         assert!(avc444_perf_logging_enabled_with(
@@ -1774,6 +1827,69 @@ mod tests {
         assert_eq!(actual_aux_y, expected_aux_y);
         assert_eq!(actual_aux_u, expected_aux_u);
         assert_eq!(actual_aux_v, expected_aux_v);
+    }
+
+    #[test]
+    fn avc444_v2_bgra_path_ignores_row_padding() {
+        let width = 8;
+        let height = 4;
+        let tight_stride = width * 4;
+        let padded_stride = tight_stride + 12;
+        let tight = gradient_bgra_frame(width, height, tight_stride);
+        let mut padded = vec![0xee; padded_stride * height];
+        for y in 0..height {
+            let tight_row = y * tight_stride;
+            let padded_row = y * padded_stride;
+            padded[padded_row..padded_row + tight_stride]
+                .copy_from_slice(&tight[tight_row..tight_row + tight_stride]);
+        }
+
+        let y_len = width * height;
+        let uv_len = (width / 2) * (height / 2);
+        let mut tight_y = vec![0; y_len];
+        let mut tight_main_u = vec![0; uv_len];
+        let mut tight_main_v = vec![0; uv_len];
+        let mut tight_aux_y = vec![0; y_len];
+        let mut tight_aux_u = vec![0; uv_len];
+        let mut tight_aux_v = vec![0; uv_len];
+        bgra_to_avc444_v2_planes(
+            width,
+            height,
+            &tight,
+            tight_stride,
+            &mut tight_y,
+            &mut tight_main_u,
+            &mut tight_main_v,
+            &mut tight_aux_y,
+            &mut tight_aux_u,
+            &mut tight_aux_v,
+        );
+
+        let mut padded_y = vec![0; y_len];
+        let mut padded_main_u = vec![0; uv_len];
+        let mut padded_main_v = vec![0; uv_len];
+        let mut padded_aux_y = vec![0; y_len];
+        let mut padded_aux_u = vec![0; uv_len];
+        let mut padded_aux_v = vec![0; uv_len];
+        bgra_to_avc444_v2_planes(
+            width,
+            height,
+            &padded,
+            padded_stride,
+            &mut padded_y,
+            &mut padded_main_u,
+            &mut padded_main_v,
+            &mut padded_aux_y,
+            &mut padded_aux_u,
+            &mut padded_aux_v,
+        );
+
+        assert_eq!(padded_y, tight_y);
+        assert_eq!(padded_main_u, tight_main_u);
+        assert_eq!(padded_main_v, tight_main_v);
+        assert_eq!(padded_aux_y, tight_aux_y);
+        assert_eq!(padded_aux_u, tight_aux_u);
+        assert_eq!(padded_aux_v, tight_aux_v);
     }
 
     #[test]

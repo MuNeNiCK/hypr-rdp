@@ -1,4 +1,4 @@
-use std::net::{SocketAddr, TcpListener};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -37,8 +37,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         output,
     } = config;
 
-    let addr: SocketAddr = bind.parse().context("invalid bind address")?;
-    TcpListener::bind(addr).with_context(|| format!("bind listen address {}", addr))?;
+    let addr = parse_bind_addr(&bind)?;
 
     let egfx_shared = Arc::new(EgfxShared::new(max_frames_in_flight));
     let output_layout = Arc::new(SharedOutputLayout::new());
@@ -84,15 +83,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_sound_factory(Some(Box::new(sound_factory)))
         .build();
 
-    if username.is_empty() && password.is_empty() {
-        server.set_credentials(None);
-    } else {
-        server.set_credentials(Some(Credentials {
-            username: username.to_string(),
-            password: password.to_string(),
-            domain: None,
-        }));
-    }
+    server.set_credentials(credentials_from_config(&username, &password));
 
     tracing::info!("RDP server configured for {}", addr);
 
@@ -104,4 +95,53 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
     ctx.server.run().await
+}
+
+fn credentials_from_config(username: &str, password: &str) -> Option<Credentials> {
+    if username.is_empty() && password.is_empty() {
+        None
+    } else {
+        Some(Credentials {
+            username: username.to_string(),
+            password: password.to_string(),
+            domain: None,
+        })
+    }
+}
+
+fn parse_bind_addr(bind: &str) -> Result<SocketAddr> {
+    bind.parse().context("invalid bind address")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_username_and_password_disable_authentication() {
+        assert!(credentials_from_config("", "").is_none());
+    }
+
+    #[test]
+    fn non_empty_username_or_password_enables_authentication() {
+        let with_both = credentials_from_config("user", "pass").expect("credentials");
+        assert_eq!(with_both.username, "user");
+        assert_eq!(with_both.password, "pass");
+        assert_eq!(with_both.domain, None);
+
+        let with_username = credentials_from_config("user", "").expect("credentials");
+        assert_eq!(with_username.username, "user");
+        assert_eq!(with_username.password, "");
+
+        let with_password = credentials_from_config("", "pass").expect("credentials");
+        assert_eq!(with_password.username, "");
+        assert_eq!(with_password.password, "pass");
+    }
+
+    #[test]
+    fn invalid_bind_address_is_rejected_before_server_setup() {
+        let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
+
+        assert!(format!("{error:#}").contains("invalid bind address"));
+    }
 }

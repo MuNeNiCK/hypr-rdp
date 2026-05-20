@@ -1419,6 +1419,7 @@ dependencies = [
  "libc",
  "openh264",
  "pipewire",
+ "png",
  "rcgen",
  "rustls",
  "serde",

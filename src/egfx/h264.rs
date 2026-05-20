@@ -170,12 +170,7 @@ impl H264Encoder {
     /// SPS/PPS from IDR frames are cached and prepended to P-frames.
     /// `stride` is the byte stride of each row in the BGRA buffer.
     pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
-        anyhow::ensure!(
-            bgra.len() >= self.height * stride,
-            "BGRA buffer too small: {} < {}",
-            bgra.len(),
-            self.height * stride,
-        );
+        validate_bgra_buffer(self.width, self.height, stride, bgra.len())?;
         self.bgra_to_yuv420(bgra, stride)?;
 
         let yuv = YuvRef {
@@ -256,6 +251,28 @@ impl H264Encoder {
         )
         .context("BGRA to YUV420 conversion failed")
     }
+}
+
+fn validate_bgra_buffer(width: usize, height: usize, stride: usize, len: usize) -> Result<()> {
+    let minimum_stride = width
+        .checked_mul(4)
+        .context("BGRA stride calculation overflow")?;
+    anyhow::ensure!(
+        stride >= minimum_stride,
+        "BGRA stride too small: {} < {}",
+        stride,
+        minimum_stride
+    );
+    let required_len = height
+        .checked_mul(stride)
+        .context("BGRA buffer length calculation overflow")?;
+    anyhow::ensure!(
+        len >= required_len,
+        "BGRA buffer too small: {} < {}",
+        len,
+        required_len,
+    );
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -351,20 +368,38 @@ fn encode_yuv_source_with_options(
         return Ok(EncodedH264 { data, frame_type });
     }
 
+    apply_sps_pps_cache(
+        frame_type,
+        &mut data,
+        cached_sps_pps,
+        prepend_cached_sps_pps,
+    );
+
+    Ok(EncodedH264 { data, frame_type })
+}
+
+fn apply_sps_pps_cache(
+    frame_type: FrameType,
+    data: &mut Vec<u8>,
+    cached_sps_pps: &mut Option<Vec<u8>>,
+    prepend_cached_sps_pps: bool,
+) {
+    if data.is_empty() {
+        return;
+    }
+
     if is_h264_keyframe(frame_type) {
-        if let Some(sps_pps) = extract_sps_pps(&data) {
+        if let Some(sps_pps) = extract_sps_pps(data) {
             *cached_sps_pps = Some(sps_pps);
         }
     } else if prepend_cached_sps_pps {
         if let Some(sps_pps) = cached_sps_pps {
             let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
             combined.extend_from_slice(sps_pps);
-            combined.extend_from_slice(&data);
-            data = combined;
+            combined.extend_from_slice(data);
+            *data = combined;
         }
     }
-
-    Ok(EncodedH264 { data, frame_type })
 }
 
 pub(super) fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
@@ -421,5 +456,205 @@ impl YUVSource for YuvRef<'_> {
 
     fn v(&self) -> &[u8] {
         self.v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gradient_bgra(width: usize, height: usize, stride: usize, seed: u8) -> Vec<u8> {
+        let mut bgra = vec![0; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = y * stride + x * 4;
+                bgra[offset] = seed.wrapping_add((x * 17 + y * 3) as u8);
+                bgra[offset + 1] = seed.wrapping_add((x * 5 + y * 29) as u8);
+                bgra[offset + 2] = seed.wrapping_add((x * 11 + y * 7) as u8);
+                bgra[offset + 3] = 255;
+            }
+        }
+        bgra
+    }
+
+    fn test_h264_encoder(width: u32, height: u32) -> std::result::Result<H264Encoder, String> {
+        H264Encoder::new(width, height, 1_000_000, 30, 23, H264RateControl::Cqp)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    #[test]
+    fn extract_sps_pps_keeps_parameter_sets_and_drops_other_nals() {
+        let stream = [
+            0x99, 0x88, // leading bytes before Annex B data
+            0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, // SPS, 3-byte start code
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xcc, // PPS, 4-byte start code
+            0x00, 0x00, 0x01, 0x65, 0xdd, 0xee, // IDR, not copied
+        ];
+
+        let extracted = extract_sps_pps(&stream).expect("SPS/PPS are present");
+
+        assert_eq!(
+            extracted,
+            vec![0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, 0x00, 0x00, 0x00, 0x01, 0x68, 0xcc,]
+        );
+    }
+
+    #[test]
+    fn extract_sps_pps_ignores_non_parameter_and_incomplete_nals() {
+        assert_eq!(extract_sps_pps(&[]), None);
+        assert_eq!(extract_sps_pps(&[0x00, 0x00, 0x01]), None);
+        assert_eq!(
+            extract_sps_pps(&[
+                0x00, 0x00, 0x01, 0x65, 0x11, 0x22, // IDR
+                0x00, 0x00, 0x01, 0x61, 0x33, 0x44, // non-IDR slice
+            ]),
+            None
+        );
+    }
+
+    #[test]
+    fn annex_b_nal_types_handles_mixed_start_codes_and_trailing_start() {
+        let stream = [
+            0x00, 0x00, 0x01, 0x67, 0xaa, // SPS
+            0x00, 0x00, 0x00, 0x01, 0x68, 0xbb, // PPS
+            0x00, 0x00, 0x01, 0x65, 0xcc, // IDR
+            0x00, 0x00, 0x01, // incomplete trailing start code
+        ];
+
+        assert_eq!(annex_b_nal_types(&stream), vec![7, 8, 5]);
+    }
+
+    #[test]
+    fn sps_pps_cache_is_updated_from_idr_and_prepended_to_delta_without_openh264() {
+        let mut cached = None;
+        let mut idr = vec![
+            0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, // SPS
+            0x00, 0x00, 0x01, 0x68, 0xcc, 0xdd, // PPS
+            0x00, 0x00, 0x01, 0x65, 0xee, 0xff, // IDR
+        ];
+
+        apply_sps_pps_cache(FrameType::IDR, &mut idr, &mut cached, true);
+
+        let expected_parameter_sets = vec![
+            0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, 0x00, 0x00, 0x01, 0x68, 0xcc, 0xdd,
+        ];
+        assert_eq!(cached, Some(expected_parameter_sets.clone()));
+
+        let mut delta = vec![0x00, 0x00, 0x01, 0x41, 0x11, 0x22];
+        apply_sps_pps_cache(FrameType::P, &mut delta, &mut cached, true);
+
+        assert!(delta.starts_with(&expected_parameter_sets));
+        assert_eq!(annex_b_nal_types(&delta), vec![7, 8, 1]);
+    }
+
+    #[test]
+    fn sps_pps_cache_does_not_prepend_when_disabled_or_missing() {
+        let mut cached = Some(vec![0x00, 0x00, 0x01, 0x67, 0xaa]);
+        let original = vec![0x00, 0x00, 0x01, 0x41, 0x11, 0x22];
+        let mut delta = original.clone();
+
+        apply_sps_pps_cache(FrameType::P, &mut delta, &mut cached, false);
+        assert_eq!(delta, original);
+
+        let mut missing_cache = None;
+        apply_sps_pps_cache(FrameType::P, &mut delta, &mut missing_cache, true);
+        assert_eq!(delta, original);
+    }
+
+    #[test]
+    fn h264_encoder_rejects_zero_and_odd_dimensions_before_loading_openh264() {
+        for (width, height) in [(0, 64), (64, 0), (63, 64), (64, 63)] {
+            let err = match H264Encoder::new(width, height, 1_000_000, 30, 23, H264RateControl::Cqp)
+            {
+                Ok(_) => panic!("invalid dimensions must fail: {width}x{height}"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string()
+                    .contains("dimensions must be non-zero and even"),
+                "{width}x{height} returned unexpected error: {err:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn bgra_buffer_validation_rejects_short_buffer_and_too_narrow_stride() {
+        let short = validate_bgra_buffer(16, 16, 64, 1023).expect_err("short buffer fails");
+        assert!(short.to_string().contains("BGRA buffer too small"));
+
+        let narrow_stride =
+            validate_bgra_buffer(16, 16, 63, 1024).expect_err("narrow stride fails");
+        assert!(narrow_stride.to_string().contains("BGRA stride too small"));
+
+        validate_bgra_buffer(16, 16, 76, 76 * 16).expect("padded stride is accepted");
+    }
+
+    #[test]
+    fn h264_encoder_rejects_short_bgra_buffer_and_accepts_padded_stride() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4 + 12;
+        let mut encoder = match test_h264_encoder(width as u32, height as u32) {
+            Ok(encoder) => encoder,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("H.264 encoder initialization failed: {error}"),
+        };
+        let valid = gradient_bgra(width, height, stride, 0);
+
+        let error = encoder
+            .encode(&valid[..valid.len() - 1], stride)
+            .expect_err("short BGRA buffer must fail");
+        assert!(
+            error.to_string().contains("BGRA buffer too small"),
+            "unexpected short-buffer error: {error:#}"
+        );
+
+        let encoded = encoder
+            .encode(&valid, stride)
+            .expect("padded-stride BGRA frame encodes");
+        assert!(!encoded.is_empty());
+    }
+
+    #[test]
+    fn h264_encoder_prepends_cached_sps_pps_to_delta_frames() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let mut encoder = match test_h264_encoder(width as u32, height as u32) {
+            Ok(encoder) => encoder,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("H.264 encoder initialization failed: {error}"),
+        };
+
+        let first = gradient_bgra(width, height, stride, 0);
+        let first_encoded = encoder.encode(&first, stride).expect("first frame encodes");
+        assert!(annex_b_nal_types(&first_encoded).contains(&5));
+        let cached = encoder
+            .cached_sps_pps
+            .clone()
+            .expect("IDR frame caches SPS/PPS");
+        assert_eq!(annex_b_nal_types(&cached), vec![7, 8]);
+
+        for seed in 1..=8 {
+            let next = gradient_bgra(width, height, stride, seed);
+            let encoded = encoder.encode(&next, stride).expect("delta frame encodes");
+            if encoded.is_empty() {
+                continue;
+            }
+            let nal_types = annex_b_nal_types(&encoded);
+            if !nal_types.contains(&5) {
+                assert!(
+                    encoded.starts_with(&cached),
+                    "delta frame did not start with cached SPS/PPS; NAL types: {nal_types:?}"
+                );
+                assert!(
+                    nal_types.iter().skip(2).any(|nal_type| *nal_type == 1),
+                    "expected a non-IDR slice after cached SPS/PPS; NAL types: {nal_types:?}"
+                );
+                return;
+            }
+        }
+
+        panic!("OpenH264 did not produce a delta frame within the test sequence");
     }
 }

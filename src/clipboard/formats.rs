@@ -49,3 +49,77 @@ pub(super) fn utf16le_to_utf8(data: &[u8]) -> String {
     let end = u16s.iter().position(|&c| c == 0).unwrap_or(u16s.len());
     String::from_utf16_lossy(&u16s[..end])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utf16le(units: &[u16]) -> Vec<u8> {
+        units.iter().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn utf16le_to_utf8_stops_at_nul_and_ignores_trailing_odd_byte() {
+        let mut data = utf16le(&['h' as u16, 'i' as u16, 0, 'x' as u16]);
+        data.push(0xff);
+
+        assert_eq!(utf16le_to_utf8(&data), "hi");
+    }
+
+    #[test]
+    fn utf16le_to_utf8_handles_missing_nul_and_surrogates() {
+        let data = utf16le(&['A' as u16, 0xd83d, 0xde00, 'Z' as u16]);
+
+        assert_eq!(utf16le_to_utf8(&data), "A😀Z");
+    }
+
+    #[test]
+    fn utf16le_to_utf8_replaces_invalid_surrogates() {
+        let data = utf16le(&['A' as u16, 0xd83d, 'B' as u16]);
+
+        assert_eq!(utf16le_to_utf8(&data), "A�B");
+    }
+
+    #[test]
+    fn fix_bitfields_dib_rewrites_32bpp_bitfields_to_bi_rgb() {
+        let mut dib = vec![0; 40];
+        dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+        dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+        dib[16..20].copy_from_slice(&3u32.to_le_bytes());
+        dib.extend_from_slice(&0x00ff_0000u32.to_le_bytes());
+        dib.extend_from_slice(&0x0000_ff00u32.to_le_bytes());
+        dib.extend_from_slice(&0x0000_00ffu32.to_le_bytes());
+        dib.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+
+        let fixed = fix_bitfields_dib(&dib).expect("BITFIELDS DIB is fixable");
+
+        assert_eq!(fixed.len(), dib.len() - 12);
+        assert_eq!(&fixed[0..4], &40u32.to_le_bytes());
+        assert_eq!(&fixed[14..16], &32u16.to_le_bytes());
+        assert_eq!(&fixed[16..20], &0u32.to_le_bytes());
+        assert_eq!(&fixed[40..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn fix_bitfields_dib_rejects_non_matching_headers() {
+        assert_eq!(fix_bitfields_dib(&[0; 51]), None);
+
+        let mut wrong_header_size = vec![0; 52];
+        wrong_header_size[0..4].copy_from_slice(&108u32.to_le_bytes());
+        wrong_header_size[14..16].copy_from_slice(&32u16.to_le_bytes());
+        wrong_header_size[16..20].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(fix_bitfields_dib(&wrong_header_size), None);
+
+        let mut wrong_bpp = vec![0; 52];
+        wrong_bpp[0..4].copy_from_slice(&40u32.to_le_bytes());
+        wrong_bpp[14..16].copy_from_slice(&24u16.to_le_bytes());
+        wrong_bpp[16..20].copy_from_slice(&3u32.to_le_bytes());
+        assert_eq!(fix_bitfields_dib(&wrong_bpp), None);
+
+        let mut not_bitfields = vec![0; 52];
+        not_bitfields[0..4].copy_from_slice(&40u32.to_le_bytes());
+        not_bitfields[14..16].copy_from_slice(&32u16.to_le_bytes());
+        not_bitfields[16..20].copy_from_slice(&0u32.to_le_bytes());
+        assert_eq!(fix_bitfields_dib(&not_bitfields), None);
+    }
+}
