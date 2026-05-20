@@ -5,14 +5,14 @@ use std::os::unix::io::OwnedFd;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use ironrdp_server::DisplayUpdate;
+use ironrdp_server::{DesktopSize, DisplayUpdate};
 use tokio::sync::mpsc;
 
 use super::CaptureMode;
 use crate::egfx::{EgfxShared, H264RateControl};
 use crate::input::SharedOutputLayout;
 pub(crate) use output::{
-    create_headless_output, list_stale_headless_outputs, output_info, wait_for_output,
+    create_headless_output, list_stale_headless_outputs, output_info, wait_for_output_size,
     HeadlessOutputGuard,
 };
 use wayland_client::Connection;
@@ -88,7 +88,7 @@ pub async fn start_capture(
     rate_control: H264RateControl,
     fps: u32,
     output_name: String,
-    deferred_resize: Option<ironrdp_server::DesktopSize>,
+    pending_initial_resize: Option<DesktopSize>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(CaptureInfo, std::thread::JoinHandle<()>)> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
@@ -107,7 +107,7 @@ pub async fn start_capture(
                 rate_control,
                 fps,
                 output_name,
-                deferred_resize,
+                pending_initial_resize,
                 stop_flag,
             ) {
                 tracing::error!("Capture thread error: {:#}", e);
@@ -130,7 +130,7 @@ fn capture_thread(
     rate_control: H264RateControl,
     fps: u32,
     output_name: String,
-    deferred_resize: Option<ironrdp_server::DesktopSize>,
+    pending_initial_resize: Option<DesktopSize>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     let mut info_tx = Some(info_tx);
@@ -148,7 +148,7 @@ fn capture_thread(
             rate_control,
             fps,
             output_name.clone(),
-            deferred_resize,
+            pending_initial_resize,
             Arc::clone(&stop_flag),
         );
 
@@ -206,7 +206,7 @@ fn capture_thread_inner(
     rate_control: H264RateControl,
     fps: u32,
     output_name: String,
-    deferred_resize: Option<ironrdp_server::DesktopSize>,
+    pending_initial_resize: Option<DesktopSize>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     verify_output_exists(&output_name)?;
@@ -259,7 +259,7 @@ fn capture_thread_inner(
             quality,
             rate_control,
             fps,
-            deferred_resize,
+            pending_initial_resize,
         ),
         CaptureMode::Wlr => {
             let screencopy_mgr = state
@@ -282,7 +282,7 @@ fn capture_thread_inner(
                 quality,
                 rate_control,
                 fps,
-                deferred_resize,
+                pending_initial_resize,
             )
         }
     }

@@ -179,4 +179,14 @@ impl FrameEncoder {
             Self::SoftwareAvc444(enc) => enc.force_idr(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn force_idr_requests_for_test(&self) -> Option<u32> {
+        match self {
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) => None,
+            Self::Software(enc) => Some(enc.force_idr_requests_for_test()),
+            Self::SoftwareAvc444(enc) => Some(enc.force_idr_requests_for_test()),
+        }
+    }
 }

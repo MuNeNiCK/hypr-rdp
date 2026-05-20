@@ -1,3 +1,4 @@
+mod avc420;
 mod avc444;
 mod backend;
 pub mod encoder;
@@ -10,14 +11,14 @@ mod vaapi;
 #[cfg(feature = "vaapi")]
 mod vpp;
 
+#[cfg(test)]
+pub(crate) use avc420::avc420_full_frame_region;
 pub use backend::{FrameEncoder, H264RateControl};
 pub use factory::HyprGfxFactory;
 #[cfg(feature = "vaapi")]
 pub(crate) use h264::extract_sps_pps;
-#[cfg(test)]
-pub(crate) use rdpegfx::rdpegfx_full_frame_region;
-pub(crate) use rdpegfx::rdpegfx_region_quality;
-pub use shared::{EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+pub(crate) use shared::EgfxFrameReadiness;
+pub use shared::{EgfxCodecPolicy, EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 #[cfg(feature = "vaapi")]
 pub(crate) use vpp::{VppConverter, VppDmaBufInfo};
 

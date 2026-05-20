@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ironrdp_server::PixelFormat;
+use ironrdp_server::{DesktopSize, PixelFormat};
 use wayland_client::protocol::{wl_output, wl_shm};
 use wayland_client::{Connection, QueueHandle};
 use wayland_protocols_wlr::screencopy::v1::client::zwlr_screencopy_manager_v1;
@@ -45,7 +45,7 @@ pub(super) fn capture_loop_wlr(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
-    deferred_resize: Option<ironrdp_server::DesktopSize>,
+    pending_initial_resize: Option<DesktopSize>,
 ) -> Result<()> {
     // First capture to get buffer dimensions
     let probe = screencopy_mgr.capture_output(0, output, qh, ());
@@ -141,8 +141,8 @@ pub(super) fn capture_loop_wlr(
         quality,
         rate_control,
         fps,
-        deferred_resize,
     );
+    proc.set_pending_initial_resize(pending_initial_resize);
     let mut frame_pacer = FramePacer::new(fps, Instant::now());
 
     let buffers = [&buffer_0, &buffer_1];

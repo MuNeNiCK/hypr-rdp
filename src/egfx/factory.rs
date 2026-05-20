@@ -7,12 +7,13 @@ use ironrdp_server::{
 };
 use tokio::sync::mpsc;
 
-use super::shared::avc444_disabled_by_env;
+use super::shared::{avc444_disabled_by_env, EgfxCodecPolicy};
 use super::EgfxShared;
 
 pub(super) fn capability_avc_support(
     cap: &ironrdp_egfx::pdu::CapabilitySet,
     disable_avc444: bool,
+    codec_policy: EgfxCodecPolicy,
 ) -> (bool, bool) {
     use ironrdp_egfx::pdu::*;
     let (avc420, avc444) = match cap {
@@ -42,7 +43,47 @@ pub(super) fn capability_avc_support(
         }
         CapabilitySet::Unknown(_) => (false, false),
     };
-    (avc420, avc444 && !disable_avc444)
+    let avc444 = match codec_policy {
+        EgfxCodecPolicy::Auto | EgfxCodecPolicy::Avc444 => avc444 && !disable_avc444,
+        EgfxCodecPolicy::Avc420 => false,
+    };
+    (avc420, avc444)
+}
+
+pub(super) fn preferred_capabilities_for_policy(
+    codec_policy: EgfxCodecPolicy,
+) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
+    use ironrdp_egfx::pdu::*;
+    match codec_policy {
+        EgfxCodecPolicy::Auto | EgfxCodecPolicy::Avc420 => vec![
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty(),
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            },
+        ],
+        EgfxCodecPolicy::Avc444 => vec![
+            CapabilitySet::V10_7 {
+                flags: CapabilitiesV107Flags::empty(),
+            },
+            CapabilitySet::V10 {
+                flags: CapabilitiesV10Flags::empty(),
+            },
+            CapabilitySet::V8_1 {
+                flags: CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+            CapabilitySet::V8 {
+                flags: CapabilitiesV8Flags::empty(),
+            },
+        ],
+    }
 }
 
 /// Factory for creating EGFX pipeline handlers.
@@ -77,6 +118,8 @@ impl GfxServerFactory for HyprGfxFactory {
     }
 
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
+        self.shared.reset_for_new_client();
+
         let handler = Box::new(HyprGraphicsHandler {
             shared: Arc::clone(&self.shared),
         });
@@ -110,61 +153,92 @@ struct HyprGraphicsHandler {
 
 impl GraphicsPipelineHandler for HyprGraphicsHandler {
     fn preferred_capabilities(&self) -> Vec<ironrdp_egfx::pdu::CapabilitySet> {
-        use ironrdp_egfx::pdu::*;
-        // V8_1 without SMALL_CACHE — iOS sends SMALL_CACHE but
-        // intersect (AND) will clear it if server doesn't set it.
-        vec![
-            CapabilitySet::V10_7 {
-                flags: CapabilitiesV107Flags::empty(),
-            },
-            CapabilitySet::V8_1 {
-                flags: CapabilitiesV81Flags::empty(),
-            },
-            CapabilitySet::V10 {
-                flags: CapabilitiesV10Flags::empty(),
-            },
-            CapabilitySet::V8 {
-                flags: CapabilitiesV8Flags::empty(),
-            },
-        ]
+        let policy = self.shared.codec_policy();
+        let caps = preferred_capabilities_for_policy(policy);
+        tracing::info!(
+            ?policy,
+            caps = ?caps,
+            "EGFX: server preferred capabilities"
+        );
+        caps
     }
 
     fn max_frames_in_flight(&self) -> u32 {
         self.shared.max_frames_in_flight()
     }
 
-    fn on_frame_ack(&mut self, _frame_id: u32, _queue_depth: u32) {}
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
+        self.shared.record_frame_ack(frame_id, queue_depth);
+        tracing::trace!(
+            frame_id,
+            queue_depth,
+            in_flight = self.shared.frames_in_flight(),
+            "EGFX: frame acknowledged"
+        );
+    }
 
     fn capabilities_advertise(&mut self, pdu: &ironrdp_egfx::pdu::CapabilitiesAdvertisePdu) {
-        tracing::trace!(count = pdu.0.len(), "EGFX: client advertised capabilities");
+        tracing::info!(
+            count = pdu.0.len(),
+            caps = ?pdu.0,
+            "EGFX: client advertised capabilities"
+        );
+        if self.shared.is_ready() {
+            self.shared.request_full_frame();
+            tracing::info!("EGFX: client repeated capabilities; requesting full-frame refresh");
+        }
         for cap in &pdu.0 {
             tracing::trace!(?cap, "EGFX: client capability");
         }
     }
 
     fn on_ready(&mut self, cap: &ironrdp_egfx::pdu::CapabilitySet) {
-        let (avc420, avc444) = capability_avc_support(cap, avc444_disabled_by_env());
+        let (avc420, avc444) =
+            capability_avc_support(cap, avc444_disabled_by_env(), self.shared.codec_policy());
         let avc = avc420 || avc444;
+        let was_ready = self.shared.ready.load(Ordering::Acquire);
+        let previous_avc = self.shared.avc_enabled.load(Ordering::Acquire);
+        let previous_avc444 = self.shared.avc444_enabled.load(Ordering::Acquire);
+
         self.shared.avc_enabled.store(avc, Ordering::Release);
         self.shared.avc444_enabled.store(avc444, Ordering::Release);
 
-        let was_ready = self.shared.ready.load(Ordering::Acquire);
         if was_ready {
-            tracing::info!(
-                ?cap,
-                avc420,
-                avc444,
-                "EGFX: client re-negotiated; reinitializing surface"
-            );
+            if previous_avc == avc && previous_avc444 == avc444 {
+                tracing::info!(
+                    ?cap,
+                    avc420,
+                    avc444,
+                    "EGFX: client repeated compatible capabilities; keeping surface"
+                );
+            } else {
+                tracing::info!(
+                    ?cap,
+                    avc420,
+                    avc444,
+                    "EGFX: client capability changed; reinitializing surface"
+                );
+            }
         } else {
             tracing::info!(?cap, avc420, avc444, "EGFX: channel ready (first time)");
         }
-        self.shared.ready_generation.fetch_add(1, Ordering::Release);
+        if !avc {
+            tracing::warn!(
+                ?cap,
+                policy = ?self.shared.codec_policy(),
+                "EGFX: negotiated capability has no AVC support; using bitmap fallback"
+            );
+        }
+        self.shared.clear_frame_queue();
+        if !was_ready || previous_avc != avc || previous_avc444 != avc444 {
+            self.shared.ready_generation.fetch_add(1, Ordering::Release);
+        }
         self.shared.ready.store(true, Ordering::Release);
     }
 
     fn on_close(&mut self) {
         tracing::trace!("EGFX: channel closed");
         self.shared.ready.store(false, Ordering::Release);
+        self.shared.clear_frame_queue();
     }
 }

@@ -2,10 +2,14 @@ use anyhow::{bail, Result};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
+use ironrdp_egfx::pdu::{Avc420Region, Codec1Type, Encoding};
+use ironrdp_server::{EgfxServerMessage, ServerEvent};
+
 use super::h264::{
     annex_b_nal_types, avc444_h264_encoder_options, is_h264_keyframe, EncodedH264, H264Encoder,
+    H264EncoderOptions,
 };
-use super::H264RateControl;
+use super::{avc420, EgfxShared, H264RateControl};
 
 pub struct Avc444EncodedFrame {
     pub encoding: Avc444FrameEncoding,
@@ -22,7 +26,240 @@ pub enum Avc444FrameEncoding {
     Chroma,
 }
 
-const DEFAULT_AVC444_MIN_CHROMA_INTERVAL: u32 = 0;
+impl EgfxShared {
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_tracked_avc444_frame_with_regions(
+        &self,
+        handle: &ironrdp_server::GfxServerHandle,
+        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+        surface_id: u16,
+        encoding: Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> bool {
+        if sender.is_closed() {
+            tracing::trace!("send_avc444_frame: EGFX event channel already closed");
+            return false;
+        }
+
+        if !self.can_send_frame(handle) {
+            return false;
+        }
+
+        let Some((frame_id, dvc_messages, channel_id)) = Self::queue_avc444_frame_with_regions(
+            handle,
+            surface_id,
+            encoding,
+            stream1_data,
+            stream1_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        ) else {
+            return false;
+        };
+
+        if Self::send_avc444_dvc_messages(sender, channel_id, dvc_messages) {
+            self.record_frame_queued(frame_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_tracked_avc444_frame_with_damage(
+        &self,
+        handle: &ironrdp_server::GfxServerHandle,
+        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+        surface_id: u16,
+        encoding: Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_damage_regions: &[(i32, i32, i32, i32)],
+        stream2_data: Option<&[u8]>,
+        stream2_damage_regions: Option<&[(i32, i32, i32, i32)]>,
+        timestamp_ms: u32,
+        width: u16,
+        height: u16,
+        quality: u8,
+    ) -> bool {
+        let stream1_regions =
+            avc420::damage_regions_to_avc420(stream1_damage_regions, width, height, quality);
+        let stream2_regions = stream2_damage_regions
+            .map(|regions| avc420::damage_regions_to_avc420(regions, width, height, quality));
+
+        self.send_tracked_avc444_frame_with_regions(
+            handle,
+            sender,
+            surface_id,
+            encoding,
+            stream1_data,
+            &stream1_regions,
+            stream2_data,
+            stream2_regions.as_deref(),
+            timestamp_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn queue_avc444_frame_with_regions(
+        handle: &ironrdp_server::GfxServerHandle,
+        surface_id: u16,
+        encoding: Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Option<(u32, Vec<ironrdp_dvc::DvcMessage>, u32)> {
+        let has_stream2_data = stream2_data.is_some();
+        let has_stream2_regions = stream2_regions.is_some_and(|regions| !regions.is_empty());
+        match encoding {
+            Avc444FrameEncoding::LumaAndChroma => {
+                if !has_stream2_data || !has_stream2_regions {
+                    tracing::trace!("send_avc444_frame_with_regions: LC=0 requires stream2");
+                    return None;
+                }
+            }
+            Avc444FrameEncoding::Luma | Avc444FrameEncoding::Chroma => {
+                if stream2_data.is_some() || stream2_regions.is_some() {
+                    tracing::trace!("send_avc444_frame_with_regions: LC=1/2 forbids stream2");
+                    return None;
+                }
+            }
+        }
+
+        if stream1_regions.is_empty() {
+            tracing::trace!("send_avc444_frame_with_regions: no regions");
+            return None;
+        }
+
+        let encoding = match encoding {
+            Avc444FrameEncoding::LumaAndChroma => Encoding::LUMA_AND_CHROMA,
+            Avc444FrameEncoding::Luma => Encoding::LUMA,
+            Avc444FrameEncoding::Chroma => Encoding::CHROMA,
+        };
+
+        let (_frame_id, dvc_messages, channel_id) = {
+            let Ok(mut server) = handle.lock() else {
+                return None;
+            };
+
+            if !server.is_ready() {
+                tracing::trace!("send_avc444_frame: server not ready");
+                return None;
+            }
+            if server.should_backpressure() {
+                tracing::trace!(
+                    in_flight = server.frames_in_flight(),
+                    "send_avc444_frame: backpressure"
+                );
+                return None;
+            }
+
+            let channel_id = match server.channel_id() {
+                Some(id) => id,
+                None => {
+                    tracing::trace!("send_avc444_frame: no channel_id");
+                    return None;
+                }
+            };
+
+            let frame_id = match server.send_avc444_frame_with_encoding(
+                Codec1Type::Avc444v2,
+                surface_id,
+                encoding,
+                stream1_data,
+                stream1_regions,
+                stream2_data,
+                stream2_regions,
+                timestamp_ms,
+            ) {
+                Some(id) => id,
+                None => {
+                    tracing::trace!("send_avc444_frame: send_avc444v2_frame returned None");
+                    return None;
+                }
+            };
+
+            let dvc_messages = server.drain_output();
+            (frame_id, dvc_messages, channel_id)
+        };
+
+        if dvc_messages.is_empty() {
+            return None;
+        }
+
+        Some((_frame_id, dvc_messages, channel_id))
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_avc444_frame_with_regions(
+        handle: &ironrdp_server::GfxServerHandle,
+        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+        surface_id: u16,
+        encoding: Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> bool {
+        if sender.is_closed() {
+            tracing::trace!("send_avc444_frame: EGFX event channel already closed");
+            return false;
+        }
+
+        let Some((_frame_id, dvc_messages, channel_id)) = Self::queue_avc444_frame_with_regions(
+            handle,
+            surface_id,
+            encoding,
+            stream1_data,
+            stream1_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        ) else {
+            return false;
+        };
+
+        Self::send_avc444_dvc_messages(sender, channel_id, dvc_messages)
+    }
+
+    fn send_avc444_dvc_messages(
+        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
+        channel_id: u32,
+        dvc_messages: Vec<ironrdp_dvc::DvcMessage>,
+    ) -> bool {
+        match ironrdp_dvc::encode_dvc_messages(
+            channel_id,
+            dvc_messages,
+            ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+        ) {
+            Ok(svc_messages) => {
+                if sender
+                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages: svc_messages,
+                    }))
+                    .is_err()
+                {
+                    tracing::trace!("send_avc444_frame: EGFX event channel closed");
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to encode EGFX AVC444 frame: {}", e);
+                return false;
+            }
+        }
+
+        true
+    }
+}
 
 pub struct Avc444Encoder {
     encoder: H264Encoder,
@@ -40,7 +277,6 @@ pub struct Avc444Encoder {
     last_luma_reference_regions: Regions,
     last_chroma_reference_regions: Regions,
     frame_index: u64,
-    frames_since_chroma: u32,
     force_chroma_on_next_frame: bool,
     perf_stats: Avc444PerfStats,
 }
@@ -53,6 +289,26 @@ impl Avc444Encoder {
         fps: u32,
         qp: u8,
         rate_control: H264RateControl,
+    ) -> Result<Self> {
+        Self::new_with_h264_options(
+            width,
+            height,
+            bitrate,
+            fps,
+            qp,
+            rate_control,
+            avc444_h264_encoder_options(),
+        )
+    }
+
+    fn new_with_h264_options(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        qp: u8,
+        rate_control: H264RateControl,
+        h264_options: H264EncoderOptions,
     ) -> Result<Self> {
         if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(2) {
             bail!(
@@ -69,7 +325,7 @@ impl Avc444Encoder {
             fps,
             qp,
             rate_control,
-            avc444_h264_encoder_options(),
+            h264_options,
         )?;
 
         let w = width as usize;
@@ -93,7 +349,6 @@ impl Avc444Encoder {
             last_luma_reference_regions: Vec::new(),
             last_chroma_reference_regions: Vec::new(),
             frame_index: 0,
-            frames_since_chroma: DEFAULT_AVC444_MIN_CHROMA_INTERVAL,
             force_chroma_on_next_frame: true,
             perf_stats: Avc444PerfStats::new(),
         })
@@ -124,12 +379,14 @@ impl Avc444Encoder {
         } else {
             candidate_regions
         };
-        bgra_to_avc444_v2_plane_regions(
+        bgra_to_avc444_v2_plane_regions_selective(
             self.width,
             self.height,
             bgra,
             stride,
             &candidate_regions,
+            true,
+            true,
             &mut self.y444,
             &mut self.main_u,
             &mut self.main_v,
@@ -137,7 +394,6 @@ impl Avc444Encoder {
             &mut self.aux_u,
             &mut self.aux_v,
         );
-        let convert_elapsed = total_start.elapsed();
 
         let mut luma_regions = detect_yuv420_regions(
             self.width,
@@ -161,6 +417,7 @@ impl Avc444Encoder {
         if force_full_frame {
             luma_regions = vec![(0, 0, self.width as i32, self.height as i32)];
         }
+        let convert_elapsed = total_start.elapsed();
         let detected_chroma_regions = if force_full_frame {
             vec![(0, 0, self.width as i32, self.height as i32)]
         } else {
@@ -172,12 +429,7 @@ impl Avc444Encoder {
             detected_chroma_protocol_regions
         };
         let chroma_changed = !detected_chroma_protocol_regions.is_empty();
-        let encode_chroma = should_encode_avc444_v2_chroma(
-            chroma_changed,
-            force_full_frame,
-            self.frames_since_chroma,
-            avc444_min_chroma_interval(),
-        );
+        let encode_chroma = chroma_changed;
         let (chroma_regions, chroma_protocol_regions) = if encode_chroma {
             (detected_chroma_regions, detected_chroma_protocol_regions)
         } else {
@@ -185,9 +437,6 @@ impl Avc444Encoder {
         };
 
         if luma_regions.is_empty() && chroma_protocol_regions.is_empty() {
-            if chroma_changed {
-                self.frames_since_chroma = self.frames_since_chroma.saturating_add(1);
-            }
             self.last_chroma_encoded = false;
             self.last_luma_reference_regions.clear();
             self.last_chroma_reference_regions.clear();
@@ -217,21 +466,7 @@ impl Avc444Encoder {
                 .encoder
                 .encode_yuv420_raw(&self.y444, &self.main_u, &self.main_v)?;
             let stream1_encode_elapsed = stream1_encode_start.elapsed();
-            if luma.data.is_empty() {
-                self.last_chroma_encoded = false;
-                self.last_luma_reference_regions.clear();
-                self.last_chroma_reference_regions.clear();
-                return Ok(Avc444EncodedFrame {
-                    encoding: Avc444FrameEncoding::Luma,
-                    stream1: Vec::new(),
-                    stream2: Vec::new(),
-                    stream1_regions: Vec::new(),
-                    stream2_regions: Vec::new(),
-                });
-            }
-
             if chroma_protocol_regions.is_empty() {
-                self.frames_since_chroma = self.frames_since_chroma.saturating_add(1);
                 self.last_chroma_encoded = false;
                 self.debug_log_frame(&luma, &EncodedH264::empty(), &luma_regions, &[]);
                 (
@@ -249,12 +484,7 @@ impl Avc444Encoder {
                     self.encoder
                         .encode_yuv420_raw(&self.aux_y, &self.aux_u, &self.aux_v)?;
                 let stream2_encode_elapsed = stream2_encode_start.elapsed();
-                self.last_chroma_encoded = !chroma.data.is_empty();
-                if self.last_chroma_encoded {
-                    self.frames_since_chroma = 0;
-                } else {
-                    self.frames_since_chroma = self.frames_since_chroma.saturating_add(1);
-                }
+                self.last_chroma_encoded = true;
                 self.debug_log_frame(&luma, &chroma, &luma_regions, &chroma_protocol_regions);
                 (
                     Avc444FrameEncoding::LumaAndChroma,
@@ -272,12 +502,7 @@ impl Avc444Encoder {
                 .encoder
                 .encode_yuv420_raw(&self.aux_y, &self.aux_u, &self.aux_v)?;
             let stream1_encode_elapsed = stream1_encode_start.elapsed();
-            self.last_chroma_encoded = !chroma.data.is_empty();
-            if self.last_chroma_encoded {
-                self.frames_since_chroma = 0;
-            } else {
-                self.frames_since_chroma = self.frames_since_chroma.saturating_add(1);
-            }
+            self.last_chroma_encoded = true;
             self.debug_log_frame(
                 &EncodedH264::empty(),
                 &chroma,
@@ -295,13 +520,15 @@ impl Avc444Encoder {
             )
         };
 
-        let stream1_is_keyframe = is_h264_keyframe(stream1.frame_type);
-        let stream2_is_keyframe = is_h264_keyframe(stream2.frame_type);
+        let stream1_is_intra = is_h264_keyframe(stream1.frame_type);
+        let stream2_is_intra = is_h264_keyframe(stream2.frame_type);
+        let stream1_is_idr = annex_b_nal_types(&stream1.data).contains(&5);
+        let stream2_is_idr = annex_b_nal_types(&stream2.data).contains(&5);
 
-        let frame = if stream1.data.is_empty() {
+        let frame = if stream1_regions.is_empty()
+            || (encoding == Avc444FrameEncoding::LumaAndChroma && stream2_regions.is_empty())
+        {
             self.last_chroma_encoded = false;
-            self.last_luma_reference_regions.clear();
-            self.last_chroma_reference_regions.clear();
             Avc444EncodedFrame {
                 encoding: Avc444FrameEncoding::Luma,
                 stream1: Vec::new(),
@@ -309,23 +536,7 @@ impl Avc444Encoder {
                 stream1_regions: Vec::new(),
                 stream2_regions: Vec::new(),
             }
-        } else if encoding == Avc444FrameEncoding::LumaAndChroma && stream2.data.is_empty() {
-            self.last_chroma_encoded = false;
-            self.force_chroma_on_next_frame = true;
-            self.last_chroma_reference_regions.clear();
-            Avc444EncodedFrame {
-                encoding: Avc444FrameEncoding::LumaAndChroma,
-                stream1: Vec::new(),
-                stream2: Vec::new(),
-                stream1_regions: Vec::new(),
-                stream2_regions: Vec::new(),
-            }
         } else {
-            let stream2_regions = if stream2.data.is_empty() {
-                Vec::new()
-            } else {
-                stream2_regions
-            };
             Avc444EncodedFrame {
                 encoding,
                 stream1: stream1.data,
@@ -338,16 +549,20 @@ impl Avc444Encoder {
         let total_elapsed = total_start.elapsed();
         self.perf_stats.record(
             frame.encoding,
-            candidate_regions.len(),
-            frame.stream1_regions.len(),
-            frame.stream2_regions.len(),
+            self.width,
+            self.height,
+            &candidate_regions,
+            &frame.stream1_regions,
+            &frame.stream2_regions,
             frame.stream1.len(),
             frame.stream2.len(),
             convert_elapsed,
             stream1_encode_elapsed,
             stream2_encode_elapsed,
-            stream1_is_keyframe,
-            stream2_is_keyframe,
+            stream1_is_intra,
+            stream2_is_intra,
+            stream1_is_idr,
+            stream2_is_idr,
             total_elapsed,
         );
 
@@ -406,6 +621,11 @@ impl Avc444Encoder {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn force_idr_requests_for_test(&self) -> u32 {
+        self.encoder.force_idr_requests_for_test()
+    }
+
     pub fn force_idr(&mut self) {
         self.encoder.force_idr();
         self.force_chroma_on_next_frame = true;
@@ -448,12 +668,17 @@ struct Avc444PerfStats {
     candidate_regions: u64,
     stream1_regions: u64,
     stream2_regions: u64,
+    candidate_area_pixels: u64,
+    stream1_area_pixels: u64,
+    stream2_area_pixels: u64,
     convert_us_total: u128,
     stream1_encode_us_total: u128,
     stream2_encode_us_total: u128,
     total_us_total: u128,
-    stream1_keyframes: u64,
-    stream2_keyframes: u64,
+    stream1_intra_frames: u64,
+    stream2_intra_frames: u64,
+    stream1_idr_frames: u64,
+    stream2_idr_frames: u64,
 }
 
 impl Avc444PerfStats {
@@ -469,12 +694,17 @@ impl Avc444PerfStats {
             candidate_regions: 0,
             stream1_regions: 0,
             stream2_regions: 0,
+            candidate_area_pixels: 0,
+            stream1_area_pixels: 0,
+            stream2_area_pixels: 0,
             convert_us_total: 0,
             stream1_encode_us_total: 0,
             stream2_encode_us_total: 0,
             total_us_total: 0,
-            stream1_keyframes: 0,
-            stream2_keyframes: 0,
+            stream1_intra_frames: 0,
+            stream2_intra_frames: 0,
+            stream1_idr_frames: 0,
+            stream2_idr_frames: 0,
         }
     }
 
@@ -482,16 +712,20 @@ impl Avc444PerfStats {
     fn record(
         &mut self,
         encoding: Avc444FrameEncoding,
-        candidate_regions: usize,
-        stream1_regions: usize,
-        stream2_regions: usize,
+        width: usize,
+        height: usize,
+        candidate_regions: &[Region],
+        stream1_regions: &[Region],
+        stream2_regions: &[Region],
         stream1_bytes: usize,
         stream2_bytes: usize,
         convert_elapsed: Duration,
         stream1_encode_elapsed: Duration,
         stream2_encode_elapsed: Duration,
-        stream1_is_keyframe: bool,
-        stream2_is_keyframe: bool,
+        stream1_is_intra: bool,
+        stream2_is_intra: bool,
+        stream1_is_idr: bool,
+        stream2_is_idr: bool,
         total_elapsed: Duration,
     ) {
         if !avc444_perf_logging_enabled() {
@@ -514,9 +748,26 @@ impl Avc444PerfStats {
         self.stream2_bytes = self.stream2_bytes.saturating_add(stream2_bytes as u64);
         self.candidate_regions = self
             .candidate_regions
-            .saturating_add(candidate_regions as u64);
-        self.stream1_regions = self.stream1_regions.saturating_add(stream1_regions as u64);
-        self.stream2_regions = self.stream2_regions.saturating_add(stream2_regions as u64);
+            .saturating_add(candidate_regions.len() as u64);
+        self.stream1_regions = self
+            .stream1_regions
+            .saturating_add(stream1_regions.len() as u64);
+        self.stream2_regions = self
+            .stream2_regions
+            .saturating_add(stream2_regions.len() as u64);
+        self.candidate_area_pixels = self
+            .candidate_area_pixels
+            .saturating_add(region_area_pixels(candidate_regions, width, height));
+        self.stream1_area_pixels = self.stream1_area_pixels.saturating_add(region_area_pixels(
+            stream1_regions,
+            width,
+            height,
+        ));
+        self.stream2_area_pixels = self.stream2_area_pixels.saturating_add(region_area_pixels(
+            stream2_regions,
+            width,
+            height,
+        ));
         self.convert_us_total = self
             .convert_us_total
             .saturating_add(convert_elapsed.as_micros());
@@ -529,11 +780,17 @@ impl Avc444PerfStats {
         self.total_us_total = self
             .total_us_total
             .saturating_add(total_elapsed.as_micros());
-        if stream1_is_keyframe {
-            self.stream1_keyframes = self.stream1_keyframes.saturating_add(1);
+        if stream1_is_intra {
+            self.stream1_intra_frames = self.stream1_intra_frames.saturating_add(1);
         }
-        if stream2_is_keyframe {
-            self.stream2_keyframes = self.stream2_keyframes.saturating_add(1);
+        if stream2_is_intra {
+            self.stream2_intra_frames = self.stream2_intra_frames.saturating_add(1);
+        }
+        if stream1_is_idr {
+            self.stream1_idr_frames = self.stream1_idr_frames.saturating_add(1);
+        }
+        if stream2_is_idr {
+            self.stream2_idr_frames = self.stream2_idr_frames.saturating_add(1);
         }
 
         let elapsed = self.window_start.elapsed();
@@ -543,6 +800,8 @@ impl Avc444PerfStats {
 
         let frames = self.frames.max(1);
         let seconds = elapsed.as_secs_f64();
+        let frame_pixels = (width as u64).saturating_mul(height as u64).max(1);
+        let window_pixels = frame_pixels.saturating_mul(frames);
         tracing::info!(
             target: "hypr_rdp::avc444_perf",
             fps = self.frames as f64 / seconds,
@@ -557,11 +816,19 @@ impl Avc444PerfStats {
             avg_candidate_regions = self.candidate_regions as f64 / frames as f64,
             avg_stream1_regions = self.stream1_regions as f64 / frames as f64,
             avg_stream2_regions = self.stream2_regions as f64 / frames as f64,
+            avg_candidate_area_pct =
+                self.candidate_area_pixels as f64 * 100.0 / window_pixels as f64,
+            avg_stream1_area_pct =
+                self.stream1_area_pixels as f64 * 100.0 / window_pixels as f64,
+            avg_stream2_area_pct =
+                self.stream2_area_pixels as f64 * 100.0 / window_pixels as f64,
             luma_and_chroma = self.luma_and_chroma,
             luma_only = self.luma_only,
             chroma_only = self.chroma_only,
-            stream1_keyframes = self.stream1_keyframes,
-            stream2_keyframes = self.stream2_keyframes,
+            stream1_intra_frames = self.stream1_intra_frames,
+            stream2_intra_frames = self.stream2_intra_frames,
+            stream1_idr_frames = self.stream1_idr_frames,
+            stream2_idr_frames = self.stream2_idr_frames,
             "AVC444v2 perf"
         );
 
@@ -577,23 +844,6 @@ fn avc444_perf_logging_enabled_with(mut is_set: impl FnMut(&str) -> bool) -> boo
     is_set("HYPR_RDP_AVC444_PERF")
 }
 
-fn avc444_min_chroma_interval() -> u32 {
-    std::env::var("HYPR_RDP_AVC444_MIN_CHROMA_INTERVAL")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .map(|value| value.min(120))
-        .unwrap_or(DEFAULT_AVC444_MIN_CHROMA_INTERVAL)
-}
-
-fn should_encode_avc444_v2_chroma(
-    chroma_changed: bool,
-    force_full_frame: bool,
-    frames_since_chroma: u32,
-    min_chroma_interval: u32,
-) -> bool {
-    chroma_changed && (force_full_frame || frames_since_chroma >= min_chroma_interval)
-}
-
 struct Yuv420Reference {
     y: Vec<u8>,
     u: Vec<u8>,
@@ -602,6 +852,18 @@ struct Yuv420Reference {
 
 type Region = (i32, i32, i32, i32);
 type Regions = Vec<Region>;
+
+fn region_area_pixels(regions: &[Region], width: usize, height: usize) -> u64 {
+    regions
+        .iter()
+        .filter_map(|&(x, y, w, h)| {
+            let (left, top, right, bottom) = clamp_region(x, y, w, h, width, height)?;
+            Some(
+                u64::try_from(right - left).unwrap_or(0) * u64::try_from(bottom - top).unwrap_or(0),
+            )
+        })
+        .sum()
+}
 
 fn copy_yuv420_reference(
     reference: &mut Option<Yuv420Reference>,
@@ -695,6 +957,7 @@ fn copy_plane_region(
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn bgra_to_avc444_v2_plane_regions(
     width: usize,
@@ -702,6 +965,39 @@ fn bgra_to_avc444_v2_plane_regions(
     bgra: &[u8],
     bgra_stride: usize,
     regions: &[(i32, i32, i32, i32)],
+    y444: &mut [u8],
+    main_u: &mut [u8],
+    main_v: &mut [u8],
+    aux_y: &mut [u8],
+    aux_u: &mut [u8],
+    aux_v: &mut [u8],
+) {
+    bgra_to_avc444_v2_plane_regions_selective(
+        width,
+        height,
+        bgra,
+        bgra_stride,
+        regions,
+        true,
+        true,
+        y444,
+        main_u,
+        main_v,
+        aux_y,
+        aux_u,
+        aux_v,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bgra_to_avc444_v2_plane_regions_selective(
+    width: usize,
+    height: usize,
+    bgra: &[u8],
+    bgra_stride: usize,
+    regions: &[(i32, i32, i32, i32)],
+    convert_luma: bool,
+    convert_chroma: bool,
     y444: &mut [u8],
     main_u: &mut [u8],
     main_v: &mut [u8],
@@ -738,29 +1034,33 @@ fn bgra_to_avc444_v2_plane_regions(
                 let (yc, uc, vc) = bgra_row_pixel_to_yuv(tables, odd_row, x);
                 let (yd, ud, vd) = bgra_row_pixel_to_yuv(tables, odd_row, x + 1);
 
-                y444[y_even_base + x] = ya;
-                y444[y_even_base + x + 1] = yb;
-                y444[y_odd_base + x] = yc;
-                y444[y_odd_base + x + 1] = yd;
+                if convert_luma {
+                    y444[y_even_base + x] = ya;
+                    y444[y_even_base + x + 1] = yb;
+                    y444[y_odd_base + x] = yc;
+                    y444[y_odd_base + x + 1] = yd;
 
-                let dst = main_base + cx;
-                main_u[dst] = avg4_floor(ua, ub, uc, ud);
-                main_v[dst] = avg4_floor(va, vb, vc, vd);
+                    let dst = main_base + cx;
+                    main_u[dst] = avg4_floor(ua, ub, uc, ud);
+                    main_v[dst] = avg4_floor(va, vb, vc, vd);
+                }
 
-                let aux_y_even = y_even_base + cx;
-                let aux_y_odd = y_odd_base + cx;
-                aux_y[aux_y_even] = ub;
-                aux_y[aux_y_even + chroma_w] = vb;
-                aux_y[aux_y_odd] = ud;
-                aux_y[aux_y_odd + chroma_w] = vd;
+                if convert_chroma {
+                    let aux_y_even = y_even_base + cx;
+                    let aux_y_odd = y_odd_base + cx;
+                    aux_y[aux_y_even] = ub;
+                    aux_y[aux_y_even + chroma_w] = vb;
+                    aux_y[aux_y_odd] = ud;
+                    aux_y[aux_y_odd + chroma_w] = vd;
 
-                let aux_x = cx / 2;
-                if cx.is_multiple_of(2) {
-                    aux_u[main_base + aux_x] = uc;
-                    aux_u[main_base + aux_x + quarter_w] = vc;
-                } else {
-                    aux_v[main_base + aux_x] = uc;
-                    aux_v[main_base + aux_x + quarter_w] = vc;
+                    let aux_x = cx / 2;
+                    if cx.is_multiple_of(2) {
+                        aux_u[main_base + aux_x] = uc;
+                        aux_u[main_base + aux_x + quarter_w] = vc;
+                    } else {
+                        aux_v[main_base + aux_x] = uc;
+                        aux_v[main_base + aux_x + quarter_w] = vc;
+                    }
                 }
             }
         }
@@ -910,6 +1210,64 @@ fn pack_avc444_v2_planes(
     }
 }
 
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn combine_avc444_v2_planes(
+    width: usize,
+    height: usize,
+    y444: &[u8],
+    main_u: &[u8],
+    main_v: &[u8],
+    aux_y: &[u8],
+    aux_u: &[u8],
+    aux_v: &[u8],
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let chroma_w = width / 2;
+    let chroma_h = height / 2;
+    let quarter_w = width / 4;
+    let y = y444.to_vec();
+    let mut u = vec![0; width * height];
+    let mut v = vec![0; width * height];
+
+    for cy in 0..chroma_h {
+        for cx in 0..chroma_w {
+            let src = cy * chroma_w + cx;
+            let x = cx * 2;
+            let row0 = (cy * 2) * width;
+            let row1 = row0 + width;
+            for dst in [row0 + x, row0 + x + 1, row1 + x, row1 + x + 1] {
+                u[dst] = main_u[src];
+                v[dst] = main_v[src];
+            }
+        }
+    }
+
+    for row in 0..height {
+        let aux_base = row * width;
+        let out_base = row * width;
+        for cx in 0..chroma_w {
+            let x = cx * 2 + 1;
+            u[out_base + x] = aux_y[aux_base + cx];
+            v[out_base + x] = aux_y[aux_base + cx + chroma_w];
+        }
+    }
+
+    for cy in 0..chroma_h {
+        let aux_base = cy * chroma_w;
+        let out_base = (cy * 2 + 1) * width;
+        for qx in 0..quarter_w {
+            let src = aux_base + qx;
+            let x = qx * 4;
+            u[out_base + x] = aux_u[src];
+            v[out_base + x] = aux_u[src + quarter_w];
+            u[out_base + x + 2] = aux_v[src];
+            v[out_base + x + 2] = aux_v[src + quarter_w];
+        }
+    }
+
+    (y, u, v)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[cfg(test)]
 fn bgra_to_avc444_v2_planes(
@@ -1039,24 +1397,11 @@ fn detect_avc444_v2_chroma_regions(
 
         for region in changed {
             merge_region(&mut packed_regions, region);
-        }
-        if let Some((left, top, right, bottom)) = clamp_region(
-            candidate.0,
-            candidate.1,
-            candidate.2,
-            candidate.3,
-            width,
-            height,
-        ) {
-            merge_region(
-                &mut protocol_regions,
-                (
-                    left as i32,
-                    top as i32,
-                    (right - left) as i32,
-                    (bottom - top) as i32,
-                ),
-            );
+            for protocol_region in
+                avc444_v2_chroma_packed_region_to_protocol_regions(width, height, region)
+            {
+                merge_region(&mut protocol_regions, protocol_region);
+            }
         }
     }
 
@@ -1150,6 +1495,51 @@ fn avc444_v2_chroma_packed_candidates(
             (bottom - top) as i32,
         ),
     ]
+}
+
+fn avc444_v2_chroma_packed_region_to_protocol_regions(
+    width: usize,
+    height: usize,
+    region: (i32, i32, i32, i32),
+) -> Vec<(i32, i32, i32, i32)> {
+    let Some((left, top, right, bottom)) =
+        clamp_region(region.0, region.1, region.2, region.3, width, height)
+    else {
+        return Vec::new();
+    };
+    let half_width = width / 2;
+    if half_width == 0 {
+        return Vec::new();
+    }
+
+    let mut regions = Vec::new();
+    for (half_left, half_right, x_offset) in [(0, half_width, 0), (half_width, width, half_width)] {
+        let segment_left = left.max(half_left);
+        let segment_right = right.min(half_right);
+        if segment_right <= segment_left {
+            continue;
+        }
+
+        let packed_left = segment_left - x_offset;
+        let packed_right = segment_right - x_offset;
+        let protocol_left = align_down((packed_left * 2) as i32, 4);
+        let protocol_top = align_down(top as i32, 2);
+        let protocol_right = align_up((packed_right * 2) as i32, 4).clamp(0, width as i32);
+        let protocol_bottom = align_up(bottom as i32, 2).clamp(0, height as i32);
+        if protocol_right > protocol_left && protocol_bottom > protocol_top {
+            merge_region(
+                &mut regions,
+                (
+                    protocol_left,
+                    protocol_top,
+                    protocol_right - protocol_left,
+                    protocol_bottom - protocol_top,
+                ),
+            );
+        }
+    }
+
+    regions
 }
 
 fn clamp_region(
@@ -1246,44 +1636,19 @@ fn union_region(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openh264::encoder::UsageType;
+    use openh264::encoder::{Complexity, UsageType};
 
     #[test]
-    fn avc444_v2_encoder_options_require_non_empty_payloads() {
+    fn avc444_v2_encoder_options_follow_freerdp_vbr_frame_skip() {
         let options = avc444_h264_encoder_options();
 
-        assert!(matches!(
-            options.usage_type,
-            UsageType::ScreenContentRealTime
-        ));
+        assert!(matches!(options.usage_type, UsageType::CameraVideoRealTime));
+        assert!(matches!(options.complexity, Complexity::Medium));
         assert!(options.scene_change_detect);
+        assert!(options.adaptive_quantization);
+        assert!(options.background_detection);
         assert!(!options.long_term_reference);
-        assert!(!options.frame_skip);
-    }
-
-    #[test]
-    fn avc444_v2_chroma_encoding_follows_change_detection_by_default() {
-        assert!(should_encode_avc444_v2_chroma(
-            true,
-            false,
-            0,
-            DEFAULT_AVC444_MIN_CHROMA_INTERVAL
-        ));
-        assert!(!should_encode_avc444_v2_chroma(
-            false,
-            false,
-            0,
-            DEFAULT_AVC444_MIN_CHROMA_INTERVAL
-        ));
-    }
-
-    #[test]
-    fn avc444_v2_chroma_encoding_can_be_rate_limited() {
-        assert!(should_encode_avc444_v2_chroma(true, true, 0, 10));
-        assert!(!should_encode_avc444_v2_chroma(false, true, 10, 10));
-        assert!(!should_encode_avc444_v2_chroma(true, false, 9, 10));
-        assert!(should_encode_avc444_v2_chroma(true, false, 10, 10));
-        assert!(should_encode_avc444_v2_chroma(true, false, 0, 0));
+        assert!(options.frame_skip);
     }
 
     #[test]
@@ -1299,6 +1664,29 @@ mod tests {
             (255, 255, 0),
             (0, 255, 255),
             (255, 0, 255),
+        ];
+
+        for (r, g, b) in colors {
+            let actual =
+                bgra_components_to_yuv(tables, usize::from(r), usize::from(g), usize::from(b));
+            let expected = bt709_full_range_reference_yuv(r, g, b);
+
+            assert_yuv_close(actual, expected, (r, g, b));
+        }
+    }
+
+    #[test]
+    fn bgra_to_yuv_keeps_mid_tone_colors_within_bt709_tolerance() {
+        let tables = &*BGRA_TO_YUV_TABLES;
+        let colors: [(u8, u8, u8); 8] = [
+            (16, 32, 48),
+            (48, 96, 144),
+            (80, 40, 200),
+            (120, 200, 32),
+            (160, 128, 96),
+            (192, 64, 16),
+            (224, 180, 72),
+            (240, 20, 220),
         ];
 
         for (r, g, b) in colors {
@@ -1363,12 +1751,7 @@ mod tests {
         assert_eq!(luma_regions, vec![(0, 0, 16, 16)]);
         assert_eq!(chroma_regions, vec![(0, 0, 16, 16)]);
         assert_eq!(chroma_protocol_regions, vec![(0, 0, 16, 16)]);
-        assert!(should_encode_avc444_v2_chroma(
-            !chroma_protocol_regions.is_empty(),
-            false,
-            DEFAULT_AVC444_MIN_CHROMA_INTERVAL,
-            DEFAULT_AVC444_MIN_CHROMA_INTERVAL
-        ));
+        assert!(!chroma_protocol_regions.is_empty());
     }
 
     #[test]
@@ -1480,6 +1863,436 @@ mod tests {
         );
     }
 
+    #[test]
+    fn avc444_v2_vbr_large_first_frame_produces_sendable_luma_and_chroma_payloads() {
+        let width = 1920;
+        let height = 1200;
+        let stride = width * 4;
+        let mut bgra = vec![0; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = y * stride + x * 4;
+                bgra[offset] = ((x / 7 + y / 3) & 0xff) as u8;
+                bgra[offset + 1] = ((x / 5 + y / 11) & 0xff) as u8;
+                bgra[offset + 2] = ((x / 13 + y / 17) & 0xff) as u8;
+                bgra[offset + 3] = 255;
+            }
+        }
+
+        let mut encoder = match Avc444Encoder::new(
+            width as u32,
+            height as u32,
+            10_000_000,
+            30,
+            23,
+            H264RateControl::Vbr,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        let frame = encoder
+            .encode(&bgra, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("large VBR first frame encodes");
+
+        assert_eq!(frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        assert!(
+            frame.stream1.len() > 32,
+            "stream1 is not sendable: {} bytes",
+            frame.stream1.len()
+        );
+        assert!(
+            frame.stream2.len() > 32,
+            "stream2 is not sendable: {} bytes",
+            frame.stream2.len()
+        );
+        assert_eq!(
+            frame.stream1_regions,
+            vec![(0, 0, width as i32, height as i32)]
+        );
+        assert_eq!(
+            frame.stream2_regions,
+            vec![(0, 0, width as i32, height as i32)]
+        );
+    }
+
+    #[test]
+    fn avc444_v2_encoder_luma_only_change_uses_luma_stream_role() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let mut first = vec![0; stride * height];
+        let mut second = first.clone();
+        for y in 0..height {
+            for x in 0..width {
+                write_bgra_pixel(&mut first, stride, x, y, 128, 128, 128);
+                write_bgra_pixel(&mut second, stride, x, y, 128, 128, 128);
+            }
+        }
+        for y in 0..2 {
+            for x in 0..4 {
+                write_bgra_pixel(&mut second, stride, x, y, 192, 192, 192);
+            }
+        }
+
+        let mut encoder = match Avc444Encoder::new(
+            width as u32,
+            height as u32,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        let first_frame = encoder
+            .encode(&first, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("first frame encodes");
+        assert_eq!(first_frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        encoder.commit_reference();
+
+        let second_frame = encoder
+            .encode(&second, stride, &[(0, 0, 4, 2)])
+            .expect("second frame encodes");
+
+        assert_eq!(second_frame.encoding, Avc444FrameEncoding::Luma);
+        assert!(!second_frame.stream1.is_empty());
+        assert!(second_frame.stream2.is_empty());
+        assert_eq!(second_frame.stream1_regions, vec![(0, 0, 4, 2)]);
+        assert!(second_frame.stream2_regions.is_empty());
+    }
+
+    #[test]
+    fn avc444_v2_encoder_luma_and_chroma_change_sends_both_streams_immediately() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let mut first = vec![0; stride * height];
+        let mut second = first.clone();
+        for y in 0..height {
+            for x in 0..width {
+                write_bgra_pixel(&mut first, stride, x, y, 64, 64, 64);
+                write_bgra_pixel(&mut second, stride, x, y, 64, 64, 64);
+            }
+        }
+        for y in 0..2 {
+            for x in 0..4 {
+                write_bgra_pixel(&mut second, stride, x, y, 255, 0, 255);
+            }
+        }
+
+        let mut encoder = match Avc444Encoder::new(
+            width as u32,
+            height as u32,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        let first_frame = encoder
+            .encode(&first, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("first frame encodes");
+        assert_eq!(first_frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        encoder.commit_reference();
+
+        let second_frame = encoder
+            .encode(&second, stride, &[(0, 0, 4, 2)])
+            .expect("second frame encodes");
+
+        assert_eq!(second_frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        assert!(!second_frame.stream1.is_empty());
+        assert!(!second_frame.stream2.is_empty());
+        assert_eq!(second_frame.stream1_regions, vec![(0, 0, 4, 2)]);
+        assert_eq!(second_frame.stream2_regions, vec![(0, 0, 4, 2)]);
+    }
+
+    #[test]
+    fn avc444_commit_reference_updates_only_sent_partial_luma_regions() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        for y in 4..6 {
+            for x in 4..8 {
+                write_bgra_pixel(&mut second, stride, x, y, 255, 255, 255);
+            }
+        }
+
+        let mut encoder = match new_test_avc444_encoder(width, height) {
+            Ok(encoder) => encoder,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
+        };
+
+        let first_frame = encoder
+            .encode(&first, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("first frame encodes");
+        assert_eq!(first_frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        encoder.commit_reference();
+
+        let before = encoder
+            .luma_reference_y_for_test()
+            .expect("initial reference is committed")
+            .to_vec();
+        let second_frame = encoder
+            .encode(&second, stride, &[(4, 4, 4, 2)])
+            .expect("partial frame encodes");
+        assert!(!second_frame.stream1_regions.is_empty());
+        let luma_regions = encoder.last_reference_regions_for_test().0.to_vec();
+        assert_eq!(second_frame.stream1_regions, luma_regions);
+
+        encoder.commit_reference();
+
+        let after = encoder
+            .luma_reference_y_for_test()
+            .expect("partial reference is committed");
+        let mut changed_inside_sent_region = false;
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * width + x;
+                if region_list_contains_point(&luma_regions, x, y) {
+                    changed_inside_sent_region |= before[index] != after[index];
+                } else {
+                    assert_eq!(
+                        before[index], after[index],
+                        "reference changed outside sent region at ({x}, {y})"
+                    );
+                }
+            }
+        }
+        assert!(
+            changed_inside_sent_region,
+            "partial reference commit did not update any pixel inside the sent luma region"
+        );
+    }
+
+    #[test]
+    fn avc444_v2_encoder_maps_full_candidate_to_changed_stream_regions() {
+        let width = 256;
+        let height = 128;
+        let stride = width * 4;
+        let mut first = vec![0; stride * height];
+        let mut second = first.clone();
+        for y in 0..height {
+            for x in 0..width {
+                write_bgra_pixel(&mut first, stride, x, y, 64, 64, 64);
+                write_bgra_pixel(&mut second, stride, x, y, 64, 64, 64);
+            }
+        }
+        for y in 10..12 {
+            for x in 40..44 {
+                write_bgra_pixel(&mut second, stride, x, y, 255, 0, 255);
+            }
+        }
+
+        let mut encoder = match Avc444Encoder::new(
+            width as u32,
+            height as u32,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        let first_frame = encoder
+            .encode(&first, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("first frame encodes");
+        assert_eq!(first_frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        encoder.commit_reference();
+
+        let second_frame = encoder
+            .encode(&second, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("second frame encodes");
+
+        assert_eq!(second_frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        assert_eq!(second_frame.stream1_regions, vec![(0, 0, 64, 64)]);
+        assert_eq!(second_frame.stream2_regions, vec![(0, 0, 128, 64)]);
+    }
+
+    #[test]
+    fn avc444_v2_force_idr_targets_single_h264_sequence() {
+        let mut encoder = match Avc444Encoder::new(16, 16, 1_000_000, 30, 23, H264RateControl::Cqp)
+        {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        encoder.force_idr();
+
+        assert_eq!(encoder.force_idr_requests_for_test(), 1);
+    }
+
+    #[derive(Debug)]
+    struct Avc444WireProfile {
+        encoding: Avc444FrameEncoding,
+        stream1_len: usize,
+        stream2_len: usize,
+        stream1_nals: Vec<u8>,
+        stream2_nals: Vec<u8>,
+        stream1_regions: Vec<(i32, i32, i32, i32)>,
+        stream2_regions: Vec<(i32, i32, i32, i32)>,
+    }
+
+    impl From<Avc444EncodedFrame> for Avc444WireProfile {
+        fn from(frame: Avc444EncodedFrame) -> Self {
+            Self {
+                encoding: frame.encoding,
+                stream1_len: frame.stream1.len(),
+                stream2_len: frame.stream2.len(),
+                stream1_nals: annex_b_nal_types(&frame.stream1),
+                stream2_nals: annex_b_nal_types(&frame.stream2),
+                stream1_regions: frame.stream1_regions,
+                stream2_regions: frame.stream2_regions,
+            }
+        }
+    }
+
+    fn avc444_profiles_for_complexity(
+        complexity: Complexity,
+    ) -> std::result::Result<Vec<Avc444WireProfile>, String> {
+        let mut options = avc444_h264_encoder_options();
+        options.complexity = complexity;
+        avc444_profiles_with_options(options)
+    }
+
+    fn avc444_profiles_with_options(
+        options: H264EncoderOptions,
+    ) -> std::result::Result<Vec<Avc444WireProfile>, String> {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let mut first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        let mut third = second.clone();
+        for y in 0..2 {
+            for x in 0..4 {
+                write_bgra_pixel(&mut second, stride, x, y, 192, 192, 192);
+                write_bgra_pixel(&mut third, stride, x, y, 224, 224, 224);
+            }
+        }
+        for y in 2..4 {
+            for x in 4..8 {
+                write_bgra_pixel(&mut third, stride, x, y, 64, 192, 64);
+            }
+        }
+        first[3] = 255;
+
+        let mut encoder = Avc444Encoder::new_with_h264_options(
+            width as u32,
+            height as u32,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Vbr,
+            options,
+        )
+        .map_err(|error| format!("{error:#}"))?;
+
+        let first_frame = encoder
+            .encode(&first, stride, &[(0, 0, width as i32, height as i32)])
+            .map_err(|error| format!("{error:#}"))?;
+        encoder.commit_reference();
+        let second_frame = encoder
+            .encode(&second, stride, &[(0, 0, 4, 2)])
+            .map_err(|error| format!("{error:#}"))?;
+        encoder.commit_reference();
+        let third_frame = encoder
+            .encode(&third, stride, &[(0, 0, 8, 4)])
+            .map_err(|error| format!("{error:#}"))?;
+
+        Ok(vec![
+            first_frame.into(),
+            second_frame.into(),
+            third_frame.into(),
+        ])
+    }
+
+    #[test]
+    fn avc444_v2_complexity_variants_preserve_basic_wire_shape() {
+        let medium = match avc444_profiles_for_complexity(Complexity::Medium) {
+            Ok(profiles) => profiles,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 medium encoder failed: {error}"),
+        };
+        let low = match avc444_profiles_for_complexity(Complexity::Low) {
+            Ok(profiles) => profiles,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 low encoder failed: {error}"),
+        };
+
+        assert_eq!(medium.len(), low.len());
+        for (medium, low) in medium.iter().zip(low.iter()) {
+            assert_eq!(medium.encoding, low.encoding);
+            assert_eq!(medium.stream1_regions, low.stream1_regions);
+            assert_eq!(medium.stream2_regions, low.stream2_regions);
+            assert_eq!(medium.stream1_len > 32, low.stream1_len > 32);
+            assert_eq!(medium.stream2_len > 32, low.stream2_len > 32);
+            assert_eq!(
+                medium.stream1_nals.contains(&5),
+                low.stream1_nals.contains(&5)
+            );
+            assert_eq!(
+                medium.stream2_nals.contains(&5),
+                low.stream2_nals.contains(&5)
+            );
+        }
+    }
+
+    #[test]
+    fn avc444_v2_configured_encoder_uses_delta_slices_after_initial_frame() {
+        let profiles = match avc444_profiles_with_options(avc444_h264_encoder_options()) {
+            Ok(profiles) => profiles,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder failed: {error}"),
+        };
+
+        assert!(
+            profiles[0].stream1_nals.contains(&5),
+            "initial luma stream must start with an IDR: {:?}",
+            profiles[0].stream1_nals
+        );
+        assert!(
+            profiles.iter().skip(1).all(|profile| {
+                !profile.stream1_nals.contains(&5) && !profile.stream2_nals.contains(&5)
+            }),
+            "steady AVC444 streams must remain in the same H.264 sequence without per-frame IDR: {profiles:?}"
+        );
+    }
+
+    #[test]
+    fn avc444_v2_configured_encoder_keeps_initial_payload_sendable() {
+        let profiles = match avc444_profiles_with_options(avc444_h264_encoder_options()) {
+            Ok(profiles) => profiles,
+            Err(error) if error.contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder failed: {error}"),
+        };
+
+        let profile = &profiles[0];
+        assert!(
+            profile.stream1_len > 32 && !profile.stream1_regions.is_empty(),
+            "initial AVC444 frame must produce a sendable stream1 payload: {profiles:?}"
+        );
+        assert!(
+            profile.stream2_regions.is_empty() || profile.stream2_len > 32,
+            "initial AVC444 frame must produce sendable stream2 payload when stream2 regions are present: {profiles:?}"
+        );
+    }
+
     fn write_bgra_pixel(bgra: &mut [u8], stride: usize, x: usize, y: usize, r: u8, g: u8, b: u8) {
         let offset = y * stride + x * 4;
         bgra[offset] = b;
@@ -1500,6 +2313,14 @@ mod tests {
             }
         }
         bgra
+    }
+
+    fn region_list_contains_point(regions: &[Region], x: usize, y: usize) -> bool {
+        regions.iter().any(|&(left, top, width, height)| {
+            let right = left.saturating_add(width);
+            let bottom = top.saturating_add(height);
+            left <= x as i32 && (x as i32) < right && top <= y as i32 && (y as i32) < bottom
+        })
     }
 
     fn new_test_avc444_encoder(
@@ -1755,6 +2576,45 @@ mod tests {
     }
 
     #[test]
+    fn avc444_v2_packing_combines_to_expected_client_yuv444_layout() {
+        let width = 4;
+        let height = 4;
+        let y444: Vec<u8> = (200..216).map(|v| v as u8).collect();
+        let u444: Vec<u8> = (0..16).map(|v| v as u8).collect();
+        let v444: Vec<u8> = (100..116).map(|v| v as u8).collect();
+        let mut main_u = vec![0; 4];
+        let mut main_v = vec![0; 4];
+        let mut aux_y = vec![0; 16];
+        let mut aux_u = vec![0; 4];
+        let mut aux_v = vec![0; 4];
+
+        pack_avc444_v2_planes(
+            width,
+            height,
+            &u444,
+            &v444,
+            &mut main_u,
+            &mut main_v,
+            &mut aux_y,
+            &mut aux_u,
+            &mut aux_v,
+        );
+        let (actual_y, actual_u, actual_v) = combine_avc444_v2_planes(
+            width, height, &y444, &main_u, &main_v, &aux_y, &aux_u, &aux_v,
+        );
+
+        assert_eq!(actual_y, y444);
+        assert_eq!(
+            actual_u,
+            vec![2, 1, 4, 3, 4, 5, 6, 7, 10, 9, 12, 11, 12, 13, 14, 15]
+        );
+        assert_eq!(
+            actual_v,
+            vec![102, 101, 104, 103, 104, 105, 106, 107, 110, 109, 112, 111, 112, 113, 114, 115]
+        );
+    }
+
+    #[test]
     fn avc444_v2_bgra_path_matches_plane_packing() {
         let width = 8;
         let height = 4;
@@ -1991,6 +2851,69 @@ mod tests {
     }
 
     #[test]
+    fn avc444_v2_selective_bgra_conversion_updates_only_requested_planes() {
+        let width = 8;
+        let height = 4;
+        let stride = width * 4;
+        let bgra = gradient_bgra_frame(width, height, stride);
+        let y_len = width * height;
+        let uv_len = (width / 2) * (height / 2);
+
+        let mut y = vec![11; y_len];
+        let mut main_u = vec![22; uv_len];
+        let mut main_v = vec![33; uv_len];
+        let mut aux_y = vec![44; y_len];
+        let mut aux_u = vec![55; uv_len];
+        let mut aux_v = vec![66; uv_len];
+        bgra_to_avc444_v2_plane_regions_selective(
+            width,
+            height,
+            &bgra,
+            stride,
+            &[(0, 0, width as i32, height as i32)],
+            true,
+            false,
+            &mut y,
+            &mut main_u,
+            &mut main_v,
+            &mut aux_y,
+            &mut aux_u,
+            &mut aux_v,
+        );
+        assert_ne!(y, vec![11; y_len]);
+        assert_ne!(main_u, vec![22; uv_len]);
+        assert_ne!(main_v, vec![33; uv_len]);
+        assert_eq!(aux_y, vec![44; y_len]);
+        assert_eq!(aux_u, vec![55; uv_len]);
+        assert_eq!(aux_v, vec![66; uv_len]);
+
+        let luma_y = y.clone();
+        let luma_main_u = main_u.clone();
+        let luma_main_v = main_v.clone();
+        bgra_to_avc444_v2_plane_regions_selective(
+            width,
+            height,
+            &bgra,
+            stride,
+            &[(0, 0, width as i32, height as i32)],
+            false,
+            true,
+            &mut y,
+            &mut main_u,
+            &mut main_v,
+            &mut aux_y,
+            &mut aux_u,
+            &mut aux_v,
+        );
+        assert_eq!(y, luma_y);
+        assert_eq!(main_u, luma_main_u);
+        assert_eq!(main_v, luma_main_v);
+        assert_ne!(aux_y, vec![44; y_len]);
+        assert_ne!(aux_u, vec![55; uv_len]);
+        assert_ne!(aux_v, vec![66; uv_len]);
+    }
+
+    #[test]
     fn yuv420_region_detection_uses_candidate_area() {
         let width = 128;
         let height = 64;
@@ -2081,5 +3004,35 @@ mod tests {
 
         assert_eq!(packed_regions, vec![(54, 100, 2, 2)]);
         assert_eq!(protocol_regions, vec![(108, 100, 4, 2)]);
+    }
+
+    #[test]
+    fn avc444_v2_chroma_detection_maps_changed_packed_tiles_not_whole_candidate() {
+        let width = 256;
+        let height = 128;
+        let y = vec![128; width * height];
+        let u = vec![128; (width / 2) * (height / 2)];
+        let v = vec![128; (width / 2) * (height / 2)];
+        let reference = Yuv420Reference {
+            y: y.clone(),
+            u: u.clone(),
+            v: v.clone(),
+        };
+
+        let mut changed_y = y;
+        changed_y[10 * width + 20] = 127;
+        let candidates = align_avc444_v2_protocol_regions(width, height, &[(0, 0, 256, 128)]);
+        let (packed_regions, protocol_regions) = detect_avc444_v2_chroma_regions(
+            width,
+            height,
+            &changed_y,
+            &u,
+            &v,
+            Some(&reference),
+            &candidates,
+        );
+
+        assert_eq!(packed_regions, vec![(0, 0, 64, 64)]);
+        assert_eq!(protocol_regions, vec![(0, 0, 128, 64)]);
     }
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use ironrdp_server::PixelFormat;
+use ironrdp_server::{DesktopSize, PixelFormat};
 use wayland_client::protocol::{wl_output, wl_shm};
 use wayland_client::{Connection, QueueHandle};
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
@@ -28,7 +28,7 @@ pub(super) fn capture_loop_ext(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
-    deferred_resize: Option<ironrdp_server::DesktopSize>,
+    pending_initial_resize: Option<DesktopSize>,
 ) -> Result<()> {
     let capture_mgr = state
         .capture_manager
@@ -91,7 +91,7 @@ pub(super) fn capture_loop_ext(
                         quality,
                         rate_control,
                         fps,
-                        deferred_resize,
+                        pending_initial_resize,
                     ) {
                         Ok(()) => return Ok(()),
                         Err(e) => {
@@ -171,8 +171,8 @@ pub(super) fn capture_loop_ext(
         quality,
         rate_control,
         fps,
-        deferred_resize,
     );
+    proc.set_pending_initial_resize(pending_initial_resize);
     let mut frame_pacer = FramePacer::new(fps, Instant::now());
 
     let buffers = [&buffer_0, &buffer_1];

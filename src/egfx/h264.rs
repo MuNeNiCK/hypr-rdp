@@ -80,6 +80,8 @@ pub struct H264Encoder {
     v_buf: Vec<u8>,
     /// Cached SPS/PPS NAL units from the last IDR frame (Annex B format)
     cached_sps_pps: Option<Vec<u8>>,
+    #[cfg(test)]
+    force_idr_requests: u32,
 }
 
 impl H264Encoder {
@@ -121,14 +123,31 @@ impl H264Encoder {
         };
 
         let threads = openh264_thread_count();
+        let openh264_rate_control = h264_rate_control_mode(rate_control, options);
+        tracing::info!(
+            bitrate,
+            fps,
+            quality = qp,
+            rate_control = ?rate_control,
+            openh264_rate_control = ?openh264_rate_control,
+            usage_type = ?options.usage_type,
+            complexity = ?options.complexity,
+            scene_change_detect = options.scene_change_detect,
+            adaptive_quantization = options.adaptive_quantization,
+            background_detection = options.background_detection,
+            long_term_reference = options.long_term_reference,
+            frame_skip = options.frame_skip,
+            threads,
+            "OpenH264 encoder settings"
+        );
         let mut config = EncoderConfig::new()
             .bitrate(BitRate::from_bps(bitrate))
             .max_frame_rate(FrameRate::from_hz(fps as f32))
             .usage_type(options.usage_type)
-            .complexity(Complexity::Medium)
+            .complexity(options.complexity)
             .scene_change_detect(options.scene_change_detect)
-            .adaptive_quantization(false)
-            .background_detection(false)
+            .adaptive_quantization(options.adaptive_quantization)
+            .background_detection(options.background_detection)
             .long_term_reference(options.long_term_reference)
             .vui(VuiConfig::bt709_full());
         if threads > 1 {
@@ -139,8 +158,8 @@ impl H264Encoder {
         }
         config = match rate_control {
             H264RateControl::Vbr => config
-                .rate_control_mode(RateControlMode::Bitrate)
-                .qp(QpRange::new(0, 51))
+                .rate_control_mode(openh264_rate_control)
+                .qp(QpRange::new(0, vbr_max_qp(qp)))
                 .skip_frames(options.frame_skip),
             H264RateControl::Cqp => config
                 .rate_control_mode(RateControlMode::Off)
@@ -162,6 +181,8 @@ impl H264Encoder {
             u_buf: vec![0u8; (w / 2) * (h / 2)],
             v_buf: vec![0u8; (w / 2) * (h / 2)],
             cached_sps_pps: None,
+            #[cfg(test)]
+            force_idr_requests: 0,
         })
     }
 
@@ -225,32 +246,71 @@ impl H264Encoder {
 
     /// Force the next encoded frame to be an IDR frame.
     pub fn force_idr(&mut self) {
+        #[cfg(test)]
+        {
+            self.force_idr_requests = self.force_idr_requests.saturating_add(1);
+        }
         self.encoder.force_intra_frame();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn force_idr_requests_for_test(&self) -> u32 {
+        self.force_idr_requests
     }
 
     /// Convert BGRA pixels to YUV420P planes (BT.709 full range).
     fn bgra_to_yuv420(&mut self, bgra: &[u8], stride: usize) -> Result<()> {
-        let mut yuv = YuvPlanarImageMut {
-            y_plane: BufferStoreMut::Borrowed(&mut self.y_buf),
-            y_stride: self.width as u32,
-            u_plane: BufferStoreMut::Borrowed(&mut self.u_buf),
-            u_stride: (self.width / 2) as u32,
-            v_plane: BufferStoreMut::Borrowed(&mut self.v_buf),
-            v_stride: (self.width / 2) as u32,
-            width: self.width as u32,
-            height: self.height as u32,
-        };
-
-        bgra_to_yuv420(
-            &mut yuv,
+        convert_bgra_to_yuv420_planes(
+            self.width,
+            self.height,
             bgra,
-            stride as u32,
-            YuvRange::Full,
-            YuvStandardMatrix::Bt709,
-            YuvConversionMode::Balanced,
+            stride,
+            &mut self.y_buf,
+            &mut self.u_buf,
+            &mut self.v_buf,
         )
-        .context("BGRA to YUV420 conversion failed")
     }
+}
+
+fn convert_bgra_to_yuv420_planes(
+    width: usize,
+    height: usize,
+    bgra: &[u8],
+    stride: usize,
+    y_buf: &mut [u8],
+    u_buf: &mut [u8],
+    v_buf: &mut [u8],
+) -> Result<()> {
+    let y_len = width
+        .checked_mul(height)
+        .context("Y plane length calculation overflow")?;
+    let uv_len = (width / 2)
+        .checked_mul(height / 2)
+        .context("UV plane length calculation overflow")?;
+    anyhow::ensure!(y_buf.len() >= y_len, "Y plane too small");
+    anyhow::ensure!(u_buf.len() >= uv_len, "U plane too small");
+    anyhow::ensure!(v_buf.len() >= uv_len, "V plane too small");
+
+    let mut yuv = YuvPlanarImageMut {
+        y_plane: BufferStoreMut::Borrowed(&mut y_buf[..y_len]),
+        y_stride: width as u32,
+        u_plane: BufferStoreMut::Borrowed(&mut u_buf[..uv_len]),
+        u_stride: (width / 2) as u32,
+        v_plane: BufferStoreMut::Borrowed(&mut v_buf[..uv_len]),
+        v_stride: (width / 2) as u32,
+        width: width as u32,
+        height: height as u32,
+    };
+
+    bgra_to_yuv420(
+        &mut yuv,
+        bgra,
+        stride as u32,
+        YuvRange::Full,
+        YuvStandardMatrix::Bt709,
+        YuvConversionMode::Balanced,
+    )
+    .context("BGRA to YUV420 conversion failed")
 }
 
 fn validate_bgra_buffer(width: usize, height: usize, stride: usize, len: usize) -> Result<()> {
@@ -278,7 +338,10 @@ fn validate_bgra_buffer(width: usize, height: usize, stride: usize, len: usize) 
 #[derive(Clone, Copy)]
 pub(super) struct H264EncoderOptions {
     pub(super) usage_type: UsageType,
+    pub(super) complexity: Complexity,
     pub(super) scene_change_detect: bool,
+    pub(super) adaptive_quantization: bool,
+    pub(super) background_detection: bool,
     pub(super) long_term_reference: bool,
     pub(super) frame_skip: bool,
 }
@@ -287,7 +350,10 @@ impl Default for H264EncoderOptions {
     fn default() -> Self {
         Self {
             usage_type: UsageType::ScreenContentRealTime,
+            complexity: Complexity::Medium,
             scene_change_detect: true,
+            adaptive_quantization: false,
+            background_detection: false,
             long_term_reference: false,
             frame_skip: true,
         }
@@ -296,32 +362,66 @@ impl Default for H264EncoderOptions {
 
 pub(super) fn avc444_h264_encoder_options() -> H264EncoderOptions {
     H264EncoderOptions {
-        // AVC444 LC=0 carries main and auxiliary H.264 streams in one
-        // RDPEGFX bitmap payload. A skipped OpenH264 frame produces an empty
-        // bitstream, which cannot be represented as a valid LC=0 update.
-        usage_type: UsageType::ScreenContentRealTime,
+        usage_type: UsageType::CameraVideoRealTime,
+        complexity: Complexity::Medium,
         scene_change_detect: true,
+        adaptive_quantization: true,
+        background_detection: true,
         long_term_reference: false,
-        frame_skip: false,
+        frame_skip: true,
+    }
+}
+
+fn vbr_max_qp(qp: u8) -> u8 {
+    qp.clamp(1, 51)
+}
+
+fn vbr_rate_control_mode(options: H264EncoderOptions) -> RateControlMode {
+    if options.frame_skip {
+        RateControlMode::Bitrate
+    } else {
+        RateControlMode::Quality
+    }
+}
+
+fn h264_rate_control_mode(
+    rate_control: H264RateControl,
+    options: H264EncoderOptions,
+) -> RateControlMode {
+    match rate_control {
+        H264RateControl::Vbr => vbr_rate_control_mode(options),
+        H264RateControl::Cqp => RateControlMode::Off,
     }
 }
 
 fn openh264_thread_count() -> u16 {
-    if let Ok(value) = std::env::var("HYPR_RDP_OPENH264_THREADS") {
+    let env_value = std::env::var("HYPR_RDP_OPENH264_THREADS").ok();
+    let default_parallelism = std::thread::available_parallelism()
+        .map(|threads| threads.get().clamp(1, 4) as u16)
+        .unwrap_or(1);
+
+    openh264_thread_count_with(env_value.as_deref(), default_parallelism)
+}
+
+fn openh264_thread_count_with(env_value: Option<&str>, default_parallelism: u16) -> u16 {
+    if let Some(value) = env_value {
         if let Ok(parsed) = value.parse::<u16>() {
             return parsed.clamp(1, 16);
         }
     }
 
-    std::thread::available_parallelism()
-        .map(|threads| threads.get().clamp(1, 4) as u16)
-        .unwrap_or(1)
+    default_parallelism.clamp(1, 4)
 }
 
 fn openh264_size_limited_slice_len() -> Option<u32> {
-    if let Ok(value) = std::env::var("HYPR_RDP_OPENH264_MAX_SLICE_LEN") {
+    let env_value = std::env::var("HYPR_RDP_OPENH264_MAX_SLICE_LEN").ok();
+    openh264_size_limited_slice_len_with(env_value.as_deref())
+}
+
+fn openh264_size_limited_slice_len_with(env_value: Option<&str>) -> Option<u32> {
+    if let Some(value) = env_value {
         if let Ok(parsed) = value.parse::<u32>() {
-            return Some(parsed.clamp(4096, 262_144));
+            return (parsed != 0).then(|| parsed.clamp(4096, 262_144));
         }
     }
 
@@ -483,6 +583,128 @@ mod tests {
     }
 
     #[test]
+    fn vbr_quality_caps_max_qp() {
+        assert_eq!(vbr_max_qp(0), 1);
+        assert_eq!(vbr_max_qp(23), 23);
+        assert_eq!(vbr_max_qp(51), 51);
+        assert_eq!(vbr_max_qp(99), 51);
+    }
+
+    #[test]
+    fn default_h264_encoder_options_follow_freerdp_rdpegfx_baseline() {
+        let options = H264EncoderOptions::default();
+
+        assert!(matches!(
+            options.usage_type,
+            UsageType::ScreenContentRealTime
+        ));
+        assert!(matches!(options.complexity, Complexity::Medium));
+        assert!(options.scene_change_detect);
+        assert!(!options.adaptive_quantization);
+        assert!(!options.background_detection);
+        assert!(!options.long_term_reference);
+        assert!(options.frame_skip);
+    }
+
+    #[test]
+    fn vbr_uses_bitrate_mode_when_frame_skip_is_enabled() {
+        let default_options = H264EncoderOptions::default();
+        assert!(matches!(
+            vbr_rate_control_mode(default_options),
+            RateControlMode::Bitrate
+        ));
+
+        let avc444_options = avc444_h264_encoder_options();
+        assert!(matches!(
+            vbr_rate_control_mode(avc444_options),
+            RateControlMode::Bitrate
+        ));
+    }
+
+    #[test]
+    fn cqp_uses_rc_off_independent_of_frame_skip_option() {
+        let mut options = H264EncoderOptions {
+            frame_skip: true,
+            ..H264EncoderOptions::default()
+        };
+        assert!(matches!(
+            h264_rate_control_mode(H264RateControl::Cqp, options),
+            RateControlMode::Off
+        ));
+
+        options.frame_skip = false;
+        assert!(matches!(
+            h264_rate_control_mode(H264RateControl::Cqp, options),
+            RateControlMode::Off
+        ));
+    }
+
+    #[test]
+    fn openh264_thread_count_env_is_bounded_and_falls_back_to_available_parallelism() {
+        assert_eq!(openh264_thread_count_with(Some("0"), 4), 1);
+        assert_eq!(openh264_thread_count_with(Some("2"), 1), 2);
+        assert_eq!(openh264_thread_count_with(Some("32"), 1), 16);
+        assert_eq!(openh264_thread_count_with(Some("invalid"), 3), 3);
+        assert_eq!(openh264_thread_count_with(None, 0), 1);
+        assert_eq!(openh264_thread_count_with(None, 8), 4);
+    }
+
+    #[test]
+    fn openh264_size_limited_slice_len_env_is_optional_and_bounded() {
+        assert_eq!(openh264_size_limited_slice_len_with(None), None);
+        assert_eq!(openh264_size_limited_slice_len_with(Some("invalid")), None);
+        assert_eq!(openh264_size_limited_slice_len_with(Some("0")), None);
+        assert_eq!(
+            openh264_size_limited_slice_len_with(Some("1024")),
+            Some(4096)
+        );
+        assert_eq!(
+            openh264_size_limited_slice_len_with(Some("65536")),
+            Some(65_536)
+        );
+        assert_eq!(
+            openh264_size_limited_slice_len_with(Some("999999")),
+            Some(262_144)
+        );
+    }
+
+    fn solid_bgra(width: usize, height: usize, stride: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
+        let mut bgra = vec![0xee; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let offset = y * stride + x * 4;
+                bgra[offset] = b;
+                bgra[offset + 1] = g;
+                bgra[offset + 2] = r;
+                bgra[offset + 3] = 255;
+            }
+        }
+        bgra
+    }
+
+    fn bt709_full_range_reference_yuv(r: u8, g: u8, b: u8) -> (u8, u8, u8) {
+        let r = f64::from(r);
+        let g = f64::from(g);
+        let b = f64::from(b);
+        let y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        let u = 128.0 + (b - y) / (2.0 * (1.0 - 0.0722));
+        let v = 128.0 + (r - y) / (2.0 * (1.0 - 0.2126));
+        (
+            y.round().clamp(0.0, 255.0) as u8,
+            u.round().clamp(0.0, 255.0) as u8,
+            v.round().clamp(0.0, 255.0) as u8,
+        )
+    }
+
+    fn assert_near(actual: u8, expected: u8, tolerance: u8) {
+        let delta = actual.abs_diff(expected);
+        assert!(
+            delta <= tolerance,
+            "actual {actual} differs from expected {expected} by {delta}, tolerance {tolerance}"
+        );
+    }
+
+    #[test]
     fn extract_sps_pps_keeps_parameter_sets_and_drops_other_nals() {
         let stream = [
             0x99, 0x88, // leading bytes before Annex B data
@@ -513,6 +735,25 @@ mod tests {
     }
 
     #[test]
+    fn extract_sps_pps_preserves_emulation_prevention_bytes_inside_parameter_sets() {
+        let stream = [
+            0x00, 0x00, 0x01, 0x67, 0x11, 0x00, 0x00, 0x03, 0x01, 0x22, // SPS
+            0x00, 0x00, 0x01, 0x68, 0x33, 0x00, 0x00, 0x03, 0x02, // PPS
+            0x00, 0x00, 0x00, 0x01, 0x61, 0x44, // non-IDR slice
+        ];
+
+        let extracted = extract_sps_pps(&stream).expect("SPS/PPS are present");
+
+        assert_eq!(
+            extracted,
+            vec![
+                0x00, 0x00, 0x01, 0x67, 0x11, 0x00, 0x00, 0x03, 0x01, 0x22, 0x00, 0x00, 0x01, 0x68,
+                0x33, 0x00, 0x00, 0x03, 0x02,
+            ]
+        );
+    }
+
+    #[test]
     fn annex_b_nal_types_handles_mixed_start_codes_and_trailing_start() {
         let stream = [
             0x00, 0x00, 0x01, 0x67, 0xaa, // SPS
@@ -522,6 +763,123 @@ mod tests {
         ];
 
         assert_eq!(annex_b_nal_types(&stream), vec![7, 8, 5]);
+    }
+
+    #[test]
+    fn annex_b_nal_types_ignores_emulation_prevention_start_code_lookalikes() {
+        let stream = [
+            0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x03, 0x01, 0xbb, // SPS
+            0x00, 0x00, 0x01, 0x68, 0xcc, 0x00, 0x00, 0x03, 0x00, // PPS
+        ];
+
+        assert_eq!(annex_b_nal_types(&stream), vec![7, 8]);
+    }
+
+    #[test]
+    fn avc420_bgra_to_yuv420_uses_bt709_full_range_reference_colors() {
+        for &(r, g, b) in &[
+            (0, 0, 0),
+            (255, 255, 255),
+            (255, 0, 0),
+            (0, 255, 0),
+            (0, 0, 255),
+            (128, 128, 128),
+            (255, 255, 0),
+            (0, 255, 255),
+            (255, 0, 255),
+        ] {
+            let width = 2;
+            let height = 2;
+            let stride = width * 4 + 8;
+            let bgra = solid_bgra(width, height, stride, r, g, b);
+            let mut y = vec![0; width * height];
+            let mut u = vec![0; (width / 2) * (height / 2)];
+            let mut v = vec![0; (width / 2) * (height / 2)];
+
+            convert_bgra_to_yuv420_planes(width, height, &bgra, stride, &mut y, &mut u, &mut v)
+                .expect("BGRA converts to YUV420");
+
+            let (expected_y, expected_u, expected_v) = bt709_full_range_reference_yuv(r, g, b);
+            for actual_y in y {
+                assert_near(actual_y, expected_y, 2);
+            }
+            assert_near(u[0], expected_u, 2);
+            assert_near(v[0], expected_v, 2);
+        }
+    }
+
+    #[test]
+    fn avc420_bgra_to_yuv420_keeps_mixed_2x2_chroma_within_bt709_tolerance() {
+        let width = 2;
+        let height = 2;
+        let stride = width * 4 + 8;
+        let colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 255)];
+        let mut bgra = vec![0xee; stride * height];
+        for y_pos in 0..height {
+            for x_pos in 0..width {
+                let (r, g, b) = colors[y_pos * width + x_pos];
+                let offset = y_pos * stride + x_pos * 4;
+                bgra[offset] = b;
+                bgra[offset + 1] = g;
+                bgra[offset + 2] = r;
+                bgra[offset + 3] = 255;
+            }
+        }
+
+        let mut y = vec![0; width * height];
+        let mut u = vec![0; 1];
+        let mut v = vec![0; 1];
+        convert_bgra_to_yuv420_planes(width, height, &bgra, stride, &mut y, &mut u, &mut v)
+            .expect("BGRA converts to YUV420");
+
+        let mut expected_u_sum = 0u32;
+        let mut expected_v_sum = 0u32;
+        for (index, (r, g, b)) in colors.into_iter().enumerate() {
+            let (expected_y, expected_u, expected_v) = bt709_full_range_reference_yuv(r, g, b);
+            assert_near(y[index], expected_y, 2);
+            expected_u_sum += u32::from(expected_u);
+            expected_v_sum += u32::from(expected_v);
+        }
+
+        assert_near(u[0], ((expected_u_sum + 2) / 4) as u8, 3);
+        assert_near(v[0], ((expected_v_sum + 2) / 4) as u8, 3);
+    }
+
+    #[test]
+    fn avc420_bgra_to_yuv420_keeps_2x2_chroma_blocks_separate_with_padded_stride() {
+        let width = 4;
+        let height = 2;
+        let stride = width * 4 + 12;
+        let mut bgra = vec![0xee; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let (r, g, b) = if x < 2 { (255, 0, 0) } else { (0, 0, 255) };
+                let offset = y * stride + x * 4;
+                bgra[offset] = b;
+                bgra[offset + 1] = g;
+                bgra[offset + 2] = r;
+                bgra[offset + 3] = 255;
+            }
+        }
+        let mut y = vec![0; width * height];
+        let mut u = vec![0; (width / 2) * (height / 2)];
+        let mut v = vec![0; (width / 2) * (height / 2)];
+
+        convert_bgra_to_yuv420_planes(width, height, &bgra, stride, &mut y, &mut u, &mut v)
+            .expect("BGRA converts to YUV420");
+
+        let (red_y, red_u, red_v) = bt709_full_range_reference_yuv(255, 0, 0);
+        let (blue_y, blue_u, blue_v) = bt709_full_range_reference_yuv(0, 0, 255);
+        for row in 0..height {
+            assert_near(y[row * width], red_y, 2);
+            assert_near(y[row * width + 1], red_y, 2);
+            assert_near(y[row * width + 2], blue_y, 2);
+            assert_near(y[row * width + 3], blue_y, 2);
+        }
+        assert_near(u[0], red_u, 2);
+        assert_near(v[0], red_v, 2);
+        assert_near(u[1], blue_u, 2);
+        assert_near(v[1], blue_v, 2);
     }
 
     #[test]

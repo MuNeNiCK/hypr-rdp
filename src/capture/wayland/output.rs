@@ -87,33 +87,54 @@ pub(crate) fn create_headless_output(
     Ok((name, guard))
 }
 
-/// Wait for a Hyprland output to be ready (has non-zero dimensions).
-pub(crate) fn wait_for_output(output_name: &str, timeout: Duration) -> Result<()> {
+/// Wait for a Hyprland output to reach the requested dimensions.
+pub(crate) fn wait_for_output_size(
+    output_name: &str,
+    width: u32,
+    height: u32,
+    timeout: Duration,
+) -> Result<()> {
     let start = Instant::now();
     let poll_interval = Duration::from_millis(100);
 
     loop {
         if let Ok(monitors) = crate::hyprland::monitors() {
-            if let Some(arr) = monitors.as_array() {
-                let found = arr.iter().any(|m| {
-                    m["name"].as_str() == Some(output_name) && m["width"].as_i64().unwrap_or(0) > 0
-                });
-                if found {
-                    return Ok(());
-                }
+            if output_has_dimensions(&monitors, output_name, width, height) {
+                return Ok(());
             }
         }
 
         if start.elapsed() >= timeout {
             bail!(
-                "timed out waiting for output '{}' after {}ms",
+                "timed out waiting for output '{}' to become {}x{} after {}ms",
                 output_name,
+                width,
+                height,
                 timeout.as_millis()
             );
         }
 
         std::thread::sleep(poll_interval);
     }
+}
+
+fn output_dimensions(monitors: &serde_json::Value, output_name: &str) -> Option<(u32, u32)> {
+    let monitor = monitors
+        .as_array()?
+        .iter()
+        .find(|m| m["name"].as_str() == Some(output_name))?;
+    let width = u32::try_from(monitor["width"].as_u64()?).ok()?;
+    let height = u32::try_from(monitor["height"].as_u64()?).ok()?;
+    Some((width, height))
+}
+
+fn output_has_dimensions(
+    monitors: &serde_json::Value,
+    output_name: &str,
+    width: u32,
+    height: u32,
+) -> bool {
+    width > 0 && height > 0 && output_dimensions(monitors, output_name) == Some((width, height))
 }
 
 /// Query a Hyprland output's current dimensions without starting capture.
@@ -142,4 +163,33 @@ pub(crate) fn output_info(output_name: &str) -> Result<CaptureInfo> {
         height,
         output_name: output_name.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn output_size_predicate_requires_exact_requested_dimensions() {
+        let monitors = json!([
+            { "name": "DP-1", "width": 2560, "height": 1440 },
+            { "name": "hypr-rdp-1", "width": 1920, "height": 1080 }
+        ]);
+
+        assert_eq!(
+            output_dimensions(&monitors, "hypr-rdp-1"),
+            Some((1920, 1080))
+        );
+        assert!(output_has_dimensions(&monitors, "hypr-rdp-1", 1920, 1080));
+        assert!(!output_has_dimensions(&monitors, "hypr-rdp-1", 1920, 1200));
+    }
+
+    #[test]
+    fn output_ready_predicate_rejects_zero_dimensions() {
+        let monitors = json!([{ "name": "hypr-rdp-1", "width": 0, "height": 1200 }]);
+
+        assert_eq!(output_dimensions(&monitors, "hypr-rdp-1"), Some((0, 1200)));
+        assert!(!output_has_dimensions(&monitors, "hypr-rdp-1", 0, 1200));
+    }
 }

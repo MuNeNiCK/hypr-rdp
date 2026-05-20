@@ -4,7 +4,7 @@ use clap::Parser;
 use serde::Deserialize;
 
 use crate::capture::CaptureMode;
-use crate::egfx::{H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+use crate::egfx::{EgfxCodecPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 
 #[derive(Parser, Debug)]
 #[command(name = "hypr-rdp", version, about = "Native RDP server for Hyprland")]
@@ -57,6 +57,10 @@ struct Args {
     #[arg(long)]
     max_frames_in_flight: Option<u32>,
 
+    /// EGFX codec policy: "auto" (default), "avc420", or "avc444"
+    #[arg(long)]
+    egfx_codec: Option<String>,
+
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
     output: Option<String>,
@@ -80,6 +84,7 @@ struct ConfigFile {
     rate_control: Option<String>,
     fps: Option<u32>,
     max_frames_in_flight: Option<u32>,
+    egfx_codec: Option<String>,
     output: Option<String>,
 }
 
@@ -130,6 +135,7 @@ pub struct RuntimeConfig {
     pub rate_control: H264RateControl,
     pub fps: u32,
     pub max_frames_in_flight: u32,
+    pub egfx_codec: EgfxCodecPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
 }
@@ -178,6 +184,11 @@ impl RuntimeConfig {
             .max_frames_in_flight
             .or(config.max_frames_in_flight)
             .unwrap_or(DEFAULT_MAX_FRAMES_IN_FLIGHT);
+        let egfx_codec_str = args
+            .egfx_codec
+            .or(config.egfx_codec)
+            .unwrap_or_else(|| "auto".into());
+        let egfx_codec = parse_egfx_codec_policy(&egfx_codec_str)?;
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
@@ -210,6 +221,7 @@ impl RuntimeConfig {
             rate_control,
             fps,
             max_frames_in_flight,
+            egfx_codec,
             resolution_fixed,
             output,
         })
@@ -221,6 +233,18 @@ fn parse_rate_control(s: &str) -> anyhow::Result<H264RateControl> {
         "vbr" => Ok(H264RateControl::Vbr),
         "cqp" => Ok(H264RateControl::Cqp),
         other => anyhow::bail!("unknown rate control '{}', expected 'vbr' or 'cqp'", other),
+    }
+}
+
+fn parse_egfx_codec_policy(s: &str) -> anyhow::Result<EgfxCodecPolicy> {
+    match s {
+        "auto" => Ok(EgfxCodecPolicy::Auto),
+        "avc420" => Ok(EgfxCodecPolicy::Avc420),
+        "avc444" => Ok(EgfxCodecPolicy::Avc444),
+        other => anyhow::bail!(
+            "unknown EGFX codec '{}', expected 'auto', 'avc420', or 'avc444'",
+            other
+        ),
     }
 }
 
@@ -248,4 +272,26 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
         anyhow::bail!("resolution too small (minimum 2x2 for H.264)");
     }
     Ok((w, h))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_egfx_codec_policy_values() {
+        assert_eq!(
+            parse_egfx_codec_policy("auto").unwrap(),
+            EgfxCodecPolicy::Auto
+        );
+        assert_eq!(
+            parse_egfx_codec_policy("avc420").unwrap(),
+            EgfxCodecPolicy::Avc420
+        );
+        assert_eq!(
+            parse_egfx_codec_policy("avc444").unwrap(),
+            EgfxCodecPolicy::Avc444
+        );
+        assert!(parse_egfx_codec_policy("h264").is_err());
+    }
 }

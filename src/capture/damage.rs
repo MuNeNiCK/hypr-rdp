@@ -1,5 +1,3 @@
-use ironrdp_egfx::pdu::Avc420Region;
-
 const DAMAGE_TILE_SIZE: i32 = 64;
 const DAMAGE_MERGE_DISTANCE: i32 = 16;
 
@@ -250,41 +248,6 @@ fn frame_tile_changed(
     false
 }
 
-pub(super) fn damage_regions_to_avc420(
-    damage_regions: &[(i32, i32, i32, i32)],
-    width: u16,
-    height: u16,
-    qp: u8,
-) -> Vec<Avc420Region> {
-    damage_regions
-        .iter()
-        .filter_map(|&(x, y, w, h)| {
-            if w <= 0 || h <= 0 {
-                return None;
-            }
-
-            let left = x.clamp(0, i32::from(width)) as u16;
-            let top = y.clamp(0, i32::from(height)) as u16;
-            let right = x.saturating_add(w).clamp(0, i32::from(width)) as u16;
-            let bottom = y.saturating_add(h).clamp(0, i32::from(height)) as u16;
-
-            if right <= left || bottom <= top {
-                return None;
-            }
-
-            // RDPGFX_RECT16 uses exclusive right/bottom bounds.
-            Some(Avc420Region::new(
-                left,
-                top,
-                right,
-                bottom,
-                qp,
-                crate::egfx::rdpegfx_region_quality(qp),
-            ))
-        })
-        .collect()
-}
-
 pub(super) fn damage_area_pixels(
     damage_regions: &[(i32, i32, i32, i32)],
     width: u32,
@@ -316,79 +279,6 @@ pub(super) fn damage_area_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn damage_regions_are_clamped_and_exclusive() {
-        let regions =
-            damage_regions_to_avc420(&[(-10, 5, 30, 10), (1270, 710, 20, 20)], 1280, 720, 23);
-
-        assert_eq!(regions.len(), 2);
-        assert_eq!(
-            (
-                regions[0].left,
-                regions[0].top,
-                regions[0].right,
-                regions[0].bottom
-            ),
-            (0, 5, 20, 15)
-        );
-        assert_eq!(
-            (
-                regions[1].left,
-                regions[1].top,
-                regions[1].right,
-                regions[1].bottom
-            ),
-            (1270, 710, 1280, 720)
-        );
-        assert_eq!(regions[0].quantization_parameter, 23);
-    }
-
-    #[test]
-    fn damage_regions_drop_empty_rectangles() {
-        let regions = damage_regions_to_avc420(
-            &[(10, 10, 0, 20), (20, 20, 10, -1), (2000, 2000, 10, 10)],
-            1280,
-            720,
-            23,
-        );
-        assert!(regions.is_empty());
-    }
-
-    #[test]
-    fn damage_regions_preserve_touching_and_disjoint_rectangles() {
-        let regions =
-            damage_regions_to_avc420(&[(0, 0, 10, 10), (10, 0, 5, 10), (30, 2, 4, 6)], 64, 64, 23);
-
-        assert_eq!(regions.len(), 3);
-        assert_eq!(
-            (
-                regions[0].left,
-                regions[0].top,
-                regions[0].right,
-                regions[0].bottom
-            ),
-            (0, 0, 10, 10)
-        );
-        assert_eq!(
-            (
-                regions[1].left,
-                regions[1].top,
-                regions[1].right,
-                regions[1].bottom
-            ),
-            (10, 0, 15, 10)
-        );
-        assert_eq!(
-            (
-                regions[2].left,
-                regions[2].top,
-                regions[2].right,
-                regions[2].bottom
-            ),
-            (30, 2, 34, 8)
-        );
-    }
 
     #[test]
     fn damage_region_clamp_handles_extreme_coordinates_without_overflow() {
@@ -423,6 +313,23 @@ mod tests {
         assert_eq!(
             damage_area_pixels(&[(-10, -10, 20, 20), (1270, 710, 20, 20)], 1280, 720),
             200
+        );
+    }
+
+    #[test]
+    fn damage_area_drops_empty_and_overflowed_rectangles() {
+        assert_eq!(
+            damage_area_pixels(
+                &[
+                    (10, 10, 0, 10),
+                    (10, 10, 10, -1),
+                    (i32::MAX - 1, 0, 100, 100),
+                    (0, i32::MAX - 1, 100, 100),
+                ],
+                1280,
+                720,
+            ),
+            0
         );
     }
 
@@ -523,6 +430,72 @@ mod tests {
             reference[offset..offset + 4].copy_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd]);
         }
         assert_eq!(updated, &reference);
+    }
+
+    #[test]
+    fn reference_region_update_handles_offset_rows_and_adjacent_regions() {
+        let width = 8;
+        let height = 4;
+        let stride = width * 4 + 12;
+        let reference = vec![0x10; stride * height];
+        let mut current = reference.clone();
+        let mut expected = reference.clone();
+
+        for row in 0..height {
+            let padding = row * stride + width * 4;
+            current[padding..padding + 12].fill(0x99);
+        }
+        for row in 1..3 {
+            for x in 2..5 {
+                let offset = row * stride + x * 4;
+                let pixel = [x as u8, row as u8, 0xaa, 0xff];
+                current[offset..offset + 4].copy_from_slice(&pixel);
+                expected[offset..offset + 4].copy_from_slice(&pixel);
+            }
+        }
+
+        let mut detector = FrameDiffDamageDetector::new();
+        detector.update_reference(&reference, height as u32, stride);
+        detector.update_reference_regions(
+            &current,
+            width as u32,
+            height as u32,
+            stride,
+            &[(2, 1, 2, 2), (4, 1, 1, 2)],
+        );
+
+        let updated = detector.reference_frame.as_ref().expect("reference exists");
+        assert_eq!(updated, &expected);
+    }
+
+    #[test]
+    fn frame_diff_detector_merges_overlapping_candidate_regions_without_touching_padding() {
+        let width = 96;
+        let height = 80;
+        let stride = width * 4 + 20;
+        let reference = vec![0; stride * height];
+        let mut current = reference.clone();
+        for row in 20..25 {
+            for x in 20..25 {
+                current[row * stride + x * 4] = 1;
+            }
+        }
+        for row in 0..height {
+            let padding = row * stride + width * 4;
+            current[padding..padding + 20].fill(0xff);
+        }
+
+        let mut detector = FrameDiffDamageDetector::new();
+        detector.update_reference(&reference, height as u32, stride);
+        let regions = detector.detect(
+            &current,
+            width as u32,
+            height as u32,
+            stride,
+            &[(0, 0, 64, 64), (16, 16, 64, 64)],
+        );
+
+        assert_eq!(regions, vec![(0, 0, 80, 80)]);
     }
 
     #[test]

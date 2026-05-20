@@ -1,13 +1,57 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ironrdp_server::{GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
-pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 120;
+pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = u32::MAX;
+const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = u32::MAX;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum EgfxCodecPolicy {
+    #[default]
+    Auto,
+    Avc420,
+    Avc444,
+}
 
 pub(in crate::egfx) fn avc444_disabled_by_env() -> bool {
     std::env::var_os("HYPR_RDP_DISABLE_AVC444").is_some()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EgfxFrameReadiness {
+    Ready,
+    LocalBackpressure {
+        in_flight: u32,
+        max: u32,
+        client_queue_depth: u32,
+        ack_suspended: bool,
+    },
+    TransportUnavailable,
+    TransportNotReady,
+    TransportNoChannel,
+    TransportBackpressure {
+        in_flight: u32,
+        client_queue_depth: u32,
+    },
+}
+
+impl EgfxFrameReadiness {
+    pub(crate) fn is_ready(self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::LocalBackpressure { .. } => "local_backpressure",
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::TransportNotReady => "transport_not_ready",
+            Self::TransportNoChannel => "transport_no_channel",
+            Self::TransportBackpressure { .. } => "transport_backpressure",
+        }
+    }
 }
 
 /// Shared EGFX state accessible from factory, handler, and capture thread.
@@ -26,12 +70,23 @@ pub struct EgfxShared {
     pub(in crate::egfx) event_sender: Mutex<Option<mpsc::UnboundedSender<ServerEvent>>>,
     /// Surface size for auto-create in EGFX negotiation
     surface_size: Mutex<(u16, u16)>,
+    current_surface: Mutex<Option<(u16, u16, u16)>>,
     /// Flow-control window for latency/throughput tuning.
     max_frames_in_flight: AtomicU32,
+    frames_in_flight: AtomicU32,
+    client_queue_depth: AtomicU32,
+    frame_ack_suspended: AtomicBool,
+    last_queued_frame_id: AtomicU32,
+    ack_cutoff_frame_id: AtomicU32,
+    ack_cutoff_active: AtomicBool,
+    total_queued_frames: AtomicU64,
+    total_acked_frames: AtomicU64,
+    force_full_frame: AtomicBool,
+    codec_policy: EgfxCodecPolicy,
 }
 
 impl EgfxShared {
-    pub fn new(max_frames_in_flight: u32) -> Self {
+    pub fn with_codec_policy(max_frames_in_flight: u32, codec_policy: EgfxCodecPolicy) -> Self {
         Self {
             handle: Mutex::new(None),
             ready: AtomicBool::new(false),
@@ -40,7 +95,18 @@ impl EgfxShared {
             ready_generation: AtomicU32::new(0),
             event_sender: Mutex::new(None),
             surface_size: Mutex::new((0, 0)),
+            current_surface: Mutex::new(None),
             max_frames_in_flight: AtomicU32::new(max_frames_in_flight.max(1)),
+            frames_in_flight: AtomicU32::new(0),
+            client_queue_depth: AtomicU32::new(0),
+            frame_ack_suspended: AtomicBool::new(false),
+            last_queued_frame_id: AtomicU32::new(0),
+            ack_cutoff_frame_id: AtomicU32::new(0),
+            ack_cutoff_active: AtomicBool::new(false),
+            total_queued_frames: AtomicU64::new(0),
+            total_acked_frames: AtomicU64::new(0),
+            force_full_frame: AtomicBool::new(false),
+            codec_policy,
         }
     }
 
@@ -54,8 +120,30 @@ impl EgfxShared {
         self.surface_size.lock().map(|g| *g).unwrap_or((0, 0))
     }
 
+    pub(in crate::egfx) fn current_surface_id(&self, width: u16, height: u16) -> Option<u16> {
+        let (surface_id, surface_width, surface_height) =
+            self.current_surface.lock().ok()?.as_ref().copied()?;
+        (surface_width == width && surface_height == height).then_some(surface_id)
+    }
+
+    pub(in crate::egfx) fn set_current_surface(&self, surface_id: u16, width: u16, height: u16) {
+        if let Ok(mut guard) = self.current_surface.lock() {
+            *guard = Some((surface_id, width, height));
+        }
+    }
+
+    pub(in crate::egfx) fn clear_current_surface(&self) {
+        if let Ok(mut guard) = self.current_surface.lock() {
+            *guard = None;
+        }
+    }
+
     pub(in crate::egfx) fn max_frames_in_flight(&self) -> u32 {
         self.max_frames_in_flight.load(Ordering::Acquire).max(1)
+    }
+
+    pub(in crate::egfx) fn codec_policy(&self) -> EgfxCodecPolicy {
+        self.codec_policy
     }
 
     pub fn is_avc_enabled(&self) -> bool {
@@ -74,6 +162,102 @@ impl EgfxShared {
         self.ready_generation.load(Ordering::Acquire)
     }
 
+    pub(crate) fn request_full_frame(&self) {
+        self.force_full_frame.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn full_frame_requested(&self) -> bool {
+        self.force_full_frame.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn take_full_frame_request(&self) -> bool {
+        self.force_full_frame.swap(false, Ordering::AcqRel)
+    }
+
+    pub(in crate::egfx) fn frames_in_flight(&self) -> u32 {
+        self.frames_in_flight.load(Ordering::Acquire)
+    }
+
+    pub(in crate::egfx) fn client_queue_depth(&self) -> u32 {
+        self.client_queue_depth.load(Ordering::Acquire)
+    }
+
+    pub(in crate::egfx) fn frame_ack_suspended(&self) -> bool {
+        self.frame_ack_suspended.load(Ordering::Acquire)
+    }
+
+    pub(in crate::egfx) fn should_backpressure_frames(&self) -> bool {
+        !self.frame_ack_suspended() && self.frames_in_flight() >= self.max_frames_in_flight()
+    }
+
+    pub(in crate::egfx) fn record_frame_queued(&self, frame_id: u32) {
+        self.last_queued_frame_id.store(frame_id, Ordering::Release);
+        self.frames_in_flight.fetch_add(1, Ordering::AcqRel);
+        self.total_queued_frames.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(in crate::egfx) fn record_frame_ack(&self, frame_id: u32, queue_depth: u32) {
+        self.client_queue_depth
+            .store(queue_depth, Ordering::Release);
+        self.frame_ack_suspended.store(
+            queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH,
+            Ordering::Release,
+        );
+
+        if self.ack_cutoff_active.load(Ordering::Acquire)
+            && frame_id <= self.ack_cutoff_frame_id.load(Ordering::Acquire)
+        {
+            tracing::trace!(
+                frame_id,
+                cutoff = self.ack_cutoff_frame_id.load(Ordering::Acquire),
+                "EGFX: ignoring stale frame ack"
+            );
+            return;
+        }
+
+        let mut current = self.frames_in_flight.load(Ordering::Acquire);
+        while current > 0 {
+            match self.frames_in_flight.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    self.total_acked_frames.fetch_add(1, Ordering::AcqRel);
+                    return;
+                }
+                Err(next) => current = next,
+            }
+        }
+    }
+
+    pub(in crate::egfx) fn clear_frame_queue(&self) {
+        let queued = self.total_queued_frames.load(Ordering::Acquire);
+        let acked = self.total_acked_frames.load(Ordering::Acquire);
+        if queued > acked {
+            let last = self.last_queued_frame_id.load(Ordering::Acquire);
+            self.ack_cutoff_frame_id.store(last, Ordering::Release);
+            self.ack_cutoff_active.store(true, Ordering::Release);
+            self.total_acked_frames.store(queued, Ordering::Release);
+        }
+
+        self.frames_in_flight.store(0, Ordering::Release);
+        self.client_queue_depth.store(0, Ordering::Release);
+        self.frame_ack_suspended.store(false, Ordering::Release);
+    }
+
+    pub(in crate::egfx) fn reset_frame_queue_for_new_client(&self) {
+        self.frames_in_flight.store(0, Ordering::Release);
+        self.client_queue_depth.store(0, Ordering::Release);
+        self.frame_ack_suspended.store(false, Ordering::Release);
+        self.last_queued_frame_id.store(0, Ordering::Release);
+        self.ack_cutoff_frame_id.store(0, Ordering::Release);
+        self.ack_cutoff_active.store(false, Ordering::Release);
+        self.total_queued_frames.store(0, Ordering::Release);
+        self.total_acked_frames.store(0, Ordering::Release);
+    }
+
     pub fn get_handle(&self) -> Option<GfxServerHandle> {
         self.handle.lock().ok()?.clone()
     }
@@ -82,12 +266,15 @@ impl EgfxShared {
         self.event_sender.lock().ok()?.clone()
     }
 
-    /// Reset readiness state for a new client connection.
-    /// Called from updates() so each connection starts with a clean EGFX slate.
+    /// Reset readiness state for a new EGFX server instance.
+    /// Called when the factory builds a per-client graphics pipeline server.
     /// The handle and event_sender are preserved (set per-connection by the factory).
     pub fn reset_for_new_client(&self) {
         self.ready.store(false, Ordering::Release);
         self.avc_enabled.store(false, Ordering::Release);
         self.avc444_enabled.store(false, Ordering::Release);
+        self.force_full_frame.store(false, Ordering::Release);
+        self.clear_current_surface();
+        self.reset_frame_queue_for_new_client();
     }
 }

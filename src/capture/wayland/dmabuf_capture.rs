@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use ironrdp_server::DisplayUpdate;
+use ironrdp_server::{DesktopSize, DisplayUpdate};
 use wayland_client::protocol::wl_buffer;
 use wayland_client::{Connection, QueueHandle};
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
@@ -226,7 +226,7 @@ pub(super) fn capture_loop_ext_dmabuf(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
-    deferred_resize: Option<ironrdp_server::DesktopSize>,
+    mut pending_initial_resize: Option<DesktopSize>,
 ) -> Result<()> {
     tracing::info!(
         width,
@@ -240,7 +240,6 @@ pub(super) fn capture_loop_ext_dmabuf(
     let mut frame_pacer = FramePacer::new(fps, Instant::now());
     let mut cap_idx: usize = 0;
     let mut sent_first_frame = false;
-    let mut deferred_resize = deferred_resize;
 
     // EGFX state (mirrors FrameProcessor but for DMA-BUF path)
     let mut h264_encoder: Option<crate::egfx::FrameEncoder> = None;
@@ -310,6 +309,19 @@ pub(super) fn capture_loop_ext_dmabuf(
             // Process via DMA-BUF zero-copy pipeline
             // Update EGFX state
             if let Some(shared) = &egfx_shared {
+                if let Some(size) = pending_initial_resize {
+                    if shared.is_ready() {
+                        tracing::info!(
+                            width = size.width,
+                            height = size.height,
+                            "Sending initial resize after graphics channel is ready"
+                        );
+                        pending_initial_resize = None;
+                        let _ = state.tx.blocking_send(DisplayUpdate::Resize(size));
+                        break;
+                    }
+                }
+
                 let ready = shared.is_ready() && shared.is_avc_enabled();
                 let gen = shared.generation();
 
@@ -382,7 +394,7 @@ pub(super) fn capture_loop_ext_dmabuf(
 
                     if let Some(sid) = egfx_surface_id {
                         if let Some(handle) = &egfx_handle {
-                            if !EgfxShared::can_send_frame(handle) {
+                            if !shared.can_send_frame(handle) {
                                 tracing::trace!("EGFX frame skipped before DMA-BUF encode");
                                 continue;
                             }
@@ -420,7 +432,7 @@ pub(super) fn capture_loop_ext_dmabuf(
                                         .unwrap_or_default()
                                         .as_millis()
                                         as u32;
-                                    let sent = EgfxShared::send_frame(
+                                    let sent = shared.send_tracked_avc420_frame(
                                         handle,
                                         sender,
                                         sid,
@@ -432,15 +444,6 @@ pub(super) fn capture_loop_ext_dmabuf(
                                     );
                                     if sent {
                                         sent_first_frame = true;
-                                        if let Some(size) = deferred_resize.take() {
-                                            tracing::trace!(
-                                                width = size.width,
-                                                height = size.height,
-                                                "Sending deferred resize"
-                                            );
-                                            let _ =
-                                                state.tx.blocking_send(DisplayUpdate::Resize(size));
-                                        }
                                     } else if let Some(enc) = &mut h264_encoder {
                                         enc.force_idr();
                                     }

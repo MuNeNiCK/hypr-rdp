@@ -48,11 +48,10 @@ struct HyprDisplayInner {
     fps: u32,
     output: Option<String>,
     resolution_fixed: bool,
-    pending_resize: bool,
-    deferred_resize: Option<(u32, u32)>,
     stop_flag: Arc<AtomicBool>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
     headless_guard: Option<HeadlessOutputGuard>,
+    pending_initial_resize: Option<DesktopSize>,
 }
 
 impl HyprDisplayInner {
@@ -92,8 +91,8 @@ fn resize_headless_output(output_name: &str, width: u32, height: u32) -> Result<
     let mode = format!("{}x{}@60", width, height);
     let rule = format!("{},{},-9999x0,1", output_name, mode);
     crate::hyprland::keyword_monitor(&rule).context("failed to resize headless output")?;
-    wayland::wait_for_output(output_name, Duration::from_secs(5))
-        .context("headless output not ready after resize")?;
+    wayland::wait_for_output_size(output_name, width, height, Duration::from_secs(5))
+        .context("headless output did not reach requested size after resize")?;
     Ok(())
 }
 
@@ -163,14 +162,24 @@ impl HyprDisplay {
                 let rule = format!("{},{},-9999x0,1", existing, mode);
                 crate::hyprland::keyword_monitor(&rule)
                     .context("failed to resize reused headless output")?;
-                wayland::wait_for_output(&existing, Duration::from_secs(5))?;
+                wayland::wait_for_output_size(
+                    &existing,
+                    resolution.0,
+                    resolution.1,
+                    Duration::from_secs(5),
+                )?;
                 (
                     existing.clone(),
                     Some(wayland::HeadlessOutputGuard::adopt(existing)),
                 )
             } else {
                 let (name, guard) = wayland::create_headless_output(resolution.0, resolution.1)?;
-                wayland::wait_for_output(&name, Duration::from_secs(5))?;
+                wayland::wait_for_output_size(
+                    &name,
+                    resolution.0,
+                    resolution.1,
+                    Duration::from_secs(5),
+                )?;
                 (name, Some(guard))
             }
         };
@@ -210,11 +219,10 @@ impl HyprDisplay {
             fps,
             output,
             resolution_fixed,
-            pending_resize: false,
-            deferred_resize: None,
             stop_flag,
             capture_handle: None,
             headless_guard,
+            pending_initial_resize: None,
         }));
 
         let dims = (capture_info.width as u16, capture_info.height as u16);
@@ -274,9 +282,14 @@ impl RdpServerDisplay for HyprDisplay {
                 inner.resolution = (cw, ch);
                 inner.width = cw as u16;
                 inner.height = ch as u16;
-                inner.deferred_resize = Some((cw, ch));
+                let desktop_size = DesktopSize {
+                    width: inner.width,
+                    height: inner.height,
+                };
+                inner.pending_initial_resize = Some(desktop_size);
                 if let Some(shared) = &inner.egfx_shared {
                     shared.set_surface_size(inner.width, inner.height);
+                    shared.prepare_for_resize(inner.width, inner.height);
                 }
                 if let Err(e) = inner.output_layout.update_from_output(&inner.output_name) {
                     tracing::warn!("Failed to refresh input layout after initial resize: {}", e);
@@ -354,11 +367,7 @@ impl RdpServerDisplay for HyprDisplay {
             return;
         }
 
-        // request_layout is sync, so use try_lock
-        let mut inner = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => return,
-        };
+        let mut inner = self.inner.blocking_lock();
 
         if (w == inner.resolution.0 && h == inner.resolution.1)
             || inner.output.is_some()
@@ -377,7 +386,6 @@ impl RdpServerDisplay for HyprDisplay {
         inner.resolution = (w, h);
         inner.width = w as u16;
         inner.height = h as u16;
-        inner.pending_resize = false;
 
         if let Some(shared) = &inner.egfx_shared {
             shared.set_surface_size(inner.width, inner.height);
@@ -409,37 +417,10 @@ impl RdpServerDisplay for HyprDisplay {
 
         let mut inner = self.inner.lock().await;
 
-        if let Some(ref shared) = inner.egfx_shared {
-            if inner.pending_resize {
-                shared.prepare_for_resize(inner.width, inner.height);
-                inner.pending_resize = false;
-            } else {
-                shared.reset_for_new_client();
-            }
-        }
-
         let (tx, rx) = mpsc::channel(128);
         inner.update_tx = tx.clone();
 
-        let deferred = if let Some((w, h)) = inner.deferred_resize.take() {
-            inner.resolution = (w, h);
-            inner.width = w as u16;
-            inner.height = h as u16;
-            inner.pending_resize = true;
-
-            if inner.headless_guard.is_some() {
-                if let Err(e) = resize_headless_output(&inner.output_name, w, h) {
-                    tracing::warn!("Failed to resize headless output: {}", e);
-                }
-            }
-
-            Some(DesktopSize {
-                width: w as u16,
-                height: h as u16,
-            })
-        } else {
-            None
-        };
+        let pending_initial_resize = inner.pending_initial_resize.take();
 
         inner.stop_flag = Arc::new(AtomicBool::new(false));
         let (capture_info, capture_handle) = wayland::start_capture(
@@ -452,7 +433,7 @@ impl RdpServerDisplay for HyprDisplay {
             inner.rate_control,
             inner.fps,
             inner.output_name.clone(),
-            deferred,
+            pending_initial_resize,
             Arc::clone(&inner.stop_flag),
         )
         .await?;
