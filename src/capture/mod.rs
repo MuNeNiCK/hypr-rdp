@@ -100,7 +100,7 @@ impl HyprDisplay {
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
 
-        // Create or verify output before starting capture
+        // Create or verify headless output
         let (output_name, headless_guard) = if let Some(ref name) = output {
             (name.clone(), None)
         } else {
@@ -120,37 +120,17 @@ impl HyprDisplay {
             }
         };
 
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let (capture_info, capture_handle) = wayland::start_capture(
-            tx.clone(),
-            capture_mode,
-            None,
-            Arc::clone(&output_layout),
-            bitrate,
-            quality,
-            fps,
-            output_name.clone(),
-            None,
-            Arc::clone(&stop_flag),
-        )
-        .await?;
+        let width = resolution.0 as u16;
+        let height = resolution.1 as u16;
 
-        let protocol_name = match capture_mode {
-            CaptureMode::Ext => "ext-image-copy-capture-v1",
-            CaptureMode::Wlr => "wlr-screencopy-v1",
-        };
-        tracing::info!(
-            width = capture_info.width,
-            height = capture_info.height,
-            "Display capture initialized via {}", protocol_name
-        );
+        tracing::info!(width, height, output = %output_name, "Display initialized (capture deferred until client connects)");
 
         let inner = Arc::new(Mutex::new(HyprDisplayInner {
-            width: capture_info.width as u16,
-            height: capture_info.height as u16,
+            width,
+            height,
             resolution,
             capture_mode,
-            output_name: capture_info.output_name,
+            output_name,
             egfx_shared: Some(egfx_shared),
             output_layout,
             update_tx: tx,
@@ -161,12 +141,12 @@ impl HyprDisplay {
             output,
             pending_resize: false,
             deferred_resize: None,
-            stop_flag,
-            capture_handle: Some(capture_handle),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            capture_handle: None,
             headless_guard,
         }));
 
-        let dims = (capture_info.width as u16, capture_info.height as u16);
+        let dims = (width, height);
         let handle = HyprDisplayHandle { inner: Arc::clone(&inner) };
         Ok((Self { inner }, handle, dims))
     }
