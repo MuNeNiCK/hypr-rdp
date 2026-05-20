@@ -419,6 +419,37 @@ fn resize_does_not_bump_generation_when_reset_cannot_be_sent() {
 }
 
 #[test]
+fn capability_renegotiation_bumps_generation_for_surface_reinit() {
+    let shared = Arc::new(EgfxShared::new(DEFAULT_MAX_FRAMES_IN_FLIGHT));
+    shared.set_surface_size(64, 64);
+    let (event_tx, _event_rx) = mpsc::unbounded_channel();
+    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
+    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
+    let (mut bridge, _handle) =
+        ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
+            .expect("EGFX server builds");
+    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+
+    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
+        ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+            flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+        },
+    ]));
+    let caps = encode_vec(&caps).expect("capabilities encode");
+
+    let _ = bridge
+        .process(TEST_CHANNEL_ID, &caps)
+        .expect("initial capabilities process");
+    let first_generation = shared.generation();
+
+    let _ = bridge
+        .process(TEST_CHANNEL_ID, &caps)
+        .expect("renegotiated capabilities process");
+
+    assert!(shared.generation() > first_generation);
+}
+
+#[test]
 fn capability_support_respects_avc_disabled_flags_and_avc444_env_switch() {
     use ironrdp_egfx::pdu::*;
 

@@ -154,12 +154,12 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
                 ?cap,
                 avc420,
                 avc444,
-                "EGFX: client re-negotiated (keeping surface)"
+                "EGFX: client re-negotiated; reinitializing surface"
             );
         } else {
             tracing::info!(?cap, avc420, avc444, "EGFX: channel ready (first time)");
-            self.shared.ready_generation.fetch_add(1, Ordering::Release);
         }
+        self.shared.ready_generation.fetch_add(1, Ordering::Release);
         self.shared.ready.store(true, Ordering::Release);
     }
 
