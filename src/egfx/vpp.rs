@@ -1,34 +1,24 @@
 //! VA-API Video Post-Processing (VPP) for color conversion (XRGB -> NV12).
 //!
-//! Uses its own VADisplay (separate from the encoder's cros-libva Display)
-//! because cros-libva's Display::handle() is pub(crate).
-
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use libva_sys::va_display_drm as va;
 
-// Re-use the raw bindings from cros-libva
-use cros_libva::{
-    vaBeginPicture, vaCreateBuffer, vaCreateConfig, vaCreateContext, vaCreateSurfaces,
-    vaDestroyBuffer, vaDestroyConfig, vaDestroyContext, vaDestroySurfaces, vaEndPicture,
-    vaExportSurfaceHandle, vaGetDisplayDRM, vaInitialize, vaRenderPicture, vaSyncSurface,
-    vaTerminate, VABufferID, VABufferType, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
-    VADisplay, VAEntrypoint, VAProfile, VARectangle, VAStatus, VASurfaceAttrib, VASurfaceID,
+use super::vaapi_sys::{
+    self as sys, va_check, VABufferID, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
+    VADisplay, VARectangle, VASurfaceAttrib, VASurfaceID,
 };
 
 // Constants from VA-API headers
-const VA_RT_FORMAT_RGB32: u32 = cros_libva::VA_RT_FORMAT_RGB32;
-const VA_RT_FORMAT_YUV420: u32 = cros_libva::VA_RT_FORMAT_YUV420;
-const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 =
-    cros_libva::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
-const VA_EXPORT_SURFACE_READ_ONLY: u32 = cros_libva::VA_EXPORT_SURFACE_READ_ONLY;
-const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = cros_libva::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
-
-const VA_STATUS_SUCCESS: u32 = cros_libva::VA_STATUS_SUCCESS;
+const VA_RT_FORMAT_RGB32: u32 = sys::VA_RT_FORMAT_RGB32;
+const VA_RT_FORMAT_YUV420: u32 = sys::VA_RT_FORMAT_YUV420;
+const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = sys::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+const VA_EXPORT_SURFACE_READ_ONLY: u32 = sys::VA_EXPORT_SURFACE_READ_ONLY;
+const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = sys::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
 const DRM_FORMAT_ARGB8888: u32 = 0x34324152;
-const DRM_FORMAT_NV12: u32 = 0x3231564E;
 
 #[derive(Debug, Clone)]
 pub(crate) struct VppDmaBufInfo {
@@ -36,14 +26,13 @@ pub(crate) struct VppDmaBufInfo {
     pub(crate) stride: u32,
     pub(crate) offset: u32,
     pub(crate) modifier: u64,
-    pub(crate) format: u32,
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) uv_stride: u32,
     pub(crate) uv_offset: u32,
 }
 
-/// VAProcPipelineParameterBuffer — manually defined since bindgen doesn't always generate it.
+/// Local VAProcPipelineParameterBuffer definition for bindings that omit it.
 /// Layout verified against C sizeof on x86_64 (224 bytes).
 #[repr(C)]
 struct VAProcPipelineParameterBuffer {
@@ -81,14 +70,6 @@ struct VAProcPipelineParameterBuffer {
     va_reserved: [u32; 16],
 }
 
-fn va_check(status: VAStatus, op: &str) -> Result<()> {
-    if status as u32 == VA_STATUS_SUCCESS {
-        Ok(())
-    } else {
-        bail!("{} failed with VA status {}", op, status);
-    }
-}
-
 /// VA-API VPP color converter: XRGB DMA-BUF -> NV12 DMA-BUF.
 pub struct VppConverter {
     va_display: VADisplay,
@@ -114,7 +95,7 @@ impl VppConverter {
             OwnedFd::from(file)
         };
 
-        let va_display = unsafe { vaGetDisplayDRM(drm_fd.as_raw_fd()) };
+        let va_display = unsafe { va::vaGetDisplayDRM(drm_fd.as_raw_fd()) };
         if va_display.is_null() {
             bail!("vaGetDisplayDRM returned NULL for VPP");
         }
@@ -122,7 +103,7 @@ impl VppConverter {
         let mut major = 0i32;
         let mut minor = 0i32;
         va_check(
-            unsafe { vaInitialize(va_display, &mut major, &mut minor) },
+            unsafe { va::vaInitialize(va_display, &mut major, &mut minor) },
             "vaInitialize (VPP)",
         )?;
 
@@ -130,10 +111,10 @@ impl VppConverter {
         let mut config_id: VAConfigID = 0;
         va_check(
             unsafe {
-                vaCreateConfig(
+                va::vaCreateConfig(
                     va_display,
-                    VAProfile::VAProfileNone,
-                    VAEntrypoint::VAEntrypointVideoProc,
+                    sys::VA_PROFILE_NONE,
+                    sys::VA_ENTRYPOINT_VIDEO_PROC,
                     std::ptr::null_mut(),
                     0,
                     &mut config_id,
@@ -145,18 +126,18 @@ impl VppConverter {
         // Create NV12 output surface (driver-allocated)
         let mut output_surface: VASurfaceID = 0;
         let mut pixel_format_attr = VASurfaceAttrib {
-            type_: cros_libva::VASurfaceAttribType::VASurfaceAttribPixelFormat,
-            flags: cros_libva::VA_SURFACE_ATTRIB_SETTABLE,
-            value: cros_libva::VAGenericValue {
-                type_: cros_libva::VAGenericValueType::VAGenericValueTypeInteger,
-                value: cros_libva::_VAGenericValue__bindgen_ty_1 {
+            type_: va::VASurfaceAttribType_VASurfaceAttribPixelFormat,
+            flags: va::VA_SURFACE_ATTRIB_SETTABLE,
+            value: va::VAGenericValue {
+                type_: va::VAGenericValueType_VAGenericValueTypeInteger,
+                value: va::_VAGenericValue__bindgen_ty_1 {
                     i: u32::from_ne_bytes(*b"NV12") as i32,
                 },
             },
         };
         va_check(
             unsafe {
-                vaCreateSurfaces(
+                va::vaCreateSurfaces(
                     va_display,
                     VA_RT_FORMAT_YUV420,
                     width,
@@ -174,7 +155,7 @@ impl VppConverter {
         let mut context_id: VAContextID = 0;
         va_check(
             unsafe {
-                vaCreateContext(
+                va::vaCreateContext(
                     va_display,
                     config_id,
                     width as i32,
@@ -243,21 +224,21 @@ impl VppConverter {
         let mut attrs: [VASurfaceAttrib; 2] = unsafe { std::mem::zeroed() };
 
         // Memory type attribute
-        attrs[0].type_ = cros_libva::VASurfaceAttribType::VASurfaceAttribMemoryType;
-        attrs[0].flags = cros_libva::VA_SURFACE_ATTRIB_SETTABLE;
-        attrs[0].value.type_ = cros_libva::VAGenericValueType::VAGenericValueTypeInteger;
+        attrs[0].type_ = va::VASurfaceAttribType_VASurfaceAttribMemoryType;
+        attrs[0].flags = va::VA_SURFACE_ATTRIB_SETTABLE;
+        attrs[0].value.type_ = va::VAGenericValueType_VAGenericValueTypeInteger;
         attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32;
 
         // External buffer descriptor attribute
-        attrs[1].type_ = cros_libva::VASurfaceAttribType::VASurfaceAttribExternalBufferDescriptor;
-        attrs[1].flags = cros_libva::VA_SURFACE_ATTRIB_SETTABLE;
-        attrs[1].value.type_ = cros_libva::VAGenericValueType::VAGenericValueTypePointer;
+        attrs[1].type_ = va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor;
+        attrs[1].flags = va::VA_SURFACE_ATTRIB_SETTABLE;
+        attrs[1].value.type_ = va::VAGenericValueType_VAGenericValueTypePointer;
         attrs[1].value.value.p = &mut desc as *mut _ as *mut std::ffi::c_void;
 
         let mut surface_id: VASurfaceID = 0;
         va_check(
             unsafe {
-                vaCreateSurfaces(
+                va::vaCreateSurfaces(
                     self.va_display,
                     rt_format,
                     width,
@@ -287,7 +268,7 @@ impl VppConverter {
         let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
         va_check(
             unsafe {
-                vaExportSurfaceHandle(
+                va::vaExportSurfaceHandle(
                     self.va_display,
                     self.output_surface,
                     VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
@@ -324,7 +305,6 @@ impl VppConverter {
             stride: desc.layers[0].pitch[0],
             offset: desc.layers[0].offset[0],
             modifier: desc.objects[0].drm_format_modifier,
-            format: DRM_FORMAT_NV12,
             width: self.width,
             height: self.height,
             uv_stride,
@@ -378,10 +358,10 @@ impl VppConverter {
         let mut buffer_id: VABufferID = 0;
         va_check(
             unsafe {
-                vaCreateBuffer(
+                va::vaCreateBuffer(
                     self.va_display,
                     self.context_id,
-                    VABufferType::VAProcPipelineParameterBufferType,
+                    va::VABufferType_VAProcPipelineParameterBufferType,
                     std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
                     1,
                     &pipeline_param as *const _ as *mut std::ffi::c_void,
@@ -393,26 +373,28 @@ impl VppConverter {
 
         let result = (|| -> Result<()> {
             va_check(
-                unsafe { vaBeginPicture(self.va_display, self.context_id, self.output_surface) },
+                unsafe {
+                    va::vaBeginPicture(self.va_display, self.context_id, self.output_surface)
+                },
                 "vaBeginPicture (VPP)",
             )?;
             va_check(
-                unsafe { vaRenderPicture(self.va_display, self.context_id, &mut buffer_id, 1) },
+                unsafe { va::vaRenderPicture(self.va_display, self.context_id, &mut buffer_id, 1) },
                 "vaRenderPicture (VPP)",
             )?;
             va_check(
-                unsafe { vaEndPicture(self.va_display, self.context_id) },
+                unsafe { va::vaEndPicture(self.va_display, self.context_id) },
                 "vaEndPicture (VPP)",
             )?;
             va_check(
-                unsafe { vaSyncSurface(self.va_display, self.output_surface) },
+                unsafe { va::vaSyncSurface(self.va_display, self.output_surface) },
                 "vaSyncSurface (VPP output)",
             )?;
             Ok(())
         })();
 
         unsafe {
-            vaDestroyBuffer(self.va_display, buffer_id);
+            va::vaDestroyBuffer(self.va_display, buffer_id);
         }
 
         result
@@ -435,12 +417,12 @@ impl Drop for VppConverter {
     fn drop(&mut self) {
         unsafe {
             for surface_id in &mut self.input_surfaces {
-                vaDestroySurfaces(self.va_display, surface_id, 1);
+                va::vaDestroySurfaces(self.va_display, surface_id, 1);
             }
-            vaDestroySurfaces(self.va_display, &mut self.output_surface, 1);
-            vaDestroyContext(self.va_display, self.context_id);
-            vaDestroyConfig(self.va_display, self.config_id);
-            vaTerminate(self.va_display);
+            va::vaDestroySurfaces(self.va_display, &mut self.output_surface, 1);
+            va::vaDestroyContext(self.va_display, self.context_id);
+            va::vaDestroyConfig(self.va_display, self.config_id);
+            va::vaTerminate(self.va_display);
         }
     }
 }

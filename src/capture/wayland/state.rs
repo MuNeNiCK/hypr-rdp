@@ -45,11 +45,16 @@ pub(super) struct AppState {
     #[cfg(feature = "vaapi")]
     pub(super) dmabuf_formats: Vec<(u32, Vec<u64>)>, // (drm_format, modifiers)
     // Frame state
+    pub(super) active_wlr_frame_id: Option<u32>,
     pub(super) frame_ready: bool,
     pub(super) frame_failed: bool,
     pub(super) damage_regions: Vec<(i32, i32, i32, i32)>,
     pub(super) stopped: bool,
     pub(super) stop_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+pub(super) fn is_active_wlr_frame_event(active_frame_id: Option<u32>, frame_id: u32) -> bool {
+    active_frame_id == Some(frame_id)
 }
 
 impl AppState {
@@ -79,6 +84,7 @@ impl AppState {
             dmabuf_device: None,
             #[cfg(feature = "vaapi")]
             dmabuf_formats: Vec::new(),
+            active_wlr_frame_id: None,
             frame_ready: false,
             frame_failed: false,
             damage_regions: Vec::new(),
@@ -274,12 +280,22 @@ delegate_noop!(AppState: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParams
 impl Dispatch<zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1, ()> for AppState {
     fn event(
         state: &mut Self,
-        _proxy: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
+        proxy: &zwlr_screencopy_frame_v1::ZwlrScreencopyFrameV1,
         event: zwlr_screencopy_frame_v1::Event,
         _: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
     ) {
+        let frame_id = proxy.id().protocol_id();
+        if !is_active_wlr_frame_event(state.active_wlr_frame_id, frame_id) {
+            tracing::trace!(
+                frame_id,
+                active_frame_id = ?state.active_wlr_frame_id,
+                "Ignoring stale WLR screencopy frame event"
+            );
+            return;
+        }
+
         match event {
             zwlr_screencopy_frame_v1::Event::Buffer {
                 format: WEnum::Value(format),
@@ -334,6 +350,7 @@ impl Dispatch<wayland_client::protocol::wl_display::WlDisplay, ()> for AppState 
     ) {
     }
 }
+
 impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for AppState {
     fn event(
         _: &mut Self,
@@ -343,5 +360,17 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for AppStat
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_active_wlr_frame_event;
+
+    #[test]
+    fn wlr_screencopy_events_are_accepted_only_for_the_active_frame() {
+        assert!(is_active_wlr_frame_event(Some(42), 42));
+        assert!(!is_active_wlr_frame_event(Some(42), 7));
+        assert!(!is_active_wlr_frame_event(None, 42));
     }
 }

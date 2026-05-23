@@ -16,6 +16,59 @@ use crate::capture::frame::FramePacer;
 use crate::egfx::{EgfxShared, H264RateControl};
 
 const MAX_ENCODE_FAILURES: u32 = 5;
+const MIN_SENDABLE_H264_BYTES: usize = 32;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmaBufEncodeFailureAction {
+    Retry,
+    FallBackToShm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmaBufEncodeProgress {
+    Sendable,
+    NoProgress,
+}
+
+fn classify_dmabuf_h264_output(h264_data: &[u8]) -> DmaBufEncodeProgress {
+    if h264_data.len() > MIN_SENDABLE_H264_BYTES {
+        DmaBufEncodeProgress::Sendable
+    } else {
+        DmaBufEncodeProgress::NoProgress
+    }
+}
+
+#[derive(Debug)]
+struct DmaBufEncodeFailureTracker {
+    failures: u32,
+    max_failures: u32,
+}
+
+impl DmaBufEncodeFailureTracker {
+    fn new(max_failures: u32) -> Self {
+        Self {
+            failures: 0,
+            max_failures: max_failures.max(1),
+        }
+    }
+
+    fn failures(&self) -> u32 {
+        self.failures
+    }
+
+    fn reset_window(&mut self) {
+        self.failures = 0;
+    }
+
+    fn record_no_progress(&mut self) -> DmaBufEncodeFailureAction {
+        self.failures = self.failures.saturating_add(1);
+        if self.failures >= self.max_failures {
+            DmaBufEncodeFailureAction::FallBackToShm
+        } else {
+            DmaBufEncodeFailureAction::Retry
+        }
+    }
+}
 
 /// Context for DMA-BUF capture (created during setup, passed to capture loop).
 #[cfg(feature = "vaapi")]
@@ -226,7 +279,7 @@ pub(super) fn capture_loop_ext_dmabuf(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
-    mut pending_initial_resize: Option<DesktopSize>,
+    pending_initial_resize: Option<DesktopSize>,
 ) -> Result<()> {
     tracing::info!(
         width,
@@ -250,7 +303,7 @@ pub(super) fn capture_loop_ext_dmabuf(
     let mut egfx_active = false;
     let mut egfx_ready = false;
     let mut egfx_generation: u32 = 0;
-    let mut encode_failures: u32 = 0;
+    let mut encode_failures = DmaBufEncodeFailureTracker::new(MAX_ENCODE_FAILURES);
     let metadata_qp = match rate_control {
         H264RateControl::Vbr => 0,
         H264RateControl::Cqp => quality.min(51),
@@ -305,7 +358,10 @@ pub(super) fn capture_loop_ext_dmabuf(
         }
 
         // Rate limit
-        if frame_pacer.should_send(Instant::now(), sent_first_frame, has_damage) {
+        let pacing_fps = egfx_shared
+            .as_ref()
+            .map_or(fps.max(1), |shared| shared.preferred_frame_rate(fps));
+        if frame_pacer.should_send(Instant::now(), sent_first_frame, has_damage, pacing_fps) {
             // Process via DMA-BUF zero-copy pipeline
             // Update EGFX state
             if let Some(shared) = &egfx_shared {
@@ -316,7 +372,6 @@ pub(super) fn capture_loop_ext_dmabuf(
                             height = size.height,
                             "Sending initial resize after graphics channel is ready"
                         );
-                        pending_initial_resize = None;
                         let _ = state.tx.blocking_send(DisplayUpdate::Resize(size));
                         break;
                     }
@@ -333,7 +388,7 @@ pub(super) fn capture_loop_ext_dmabuf(
                         egfx_sender = None;
                         egfx_surface_id = None;
                         h264_encoder = None;
-                        encode_failures = 0;
+                        encode_failures.reset_window();
                     }
                 }
 
@@ -341,7 +396,7 @@ pub(super) fn capture_loop_ext_dmabuf(
                     egfx_generation = gen;
                     egfx_surface_id = None;
                     h264_encoder = None;
-                    encode_failures = 0;
+                    encode_failures.reset_window();
                     if ready {
                         match crate::egfx::FrameEncoder::new(
                             width,
@@ -424,38 +479,62 @@ pub(super) fn capture_loop_ext_dmabuf(
                         };
 
                         match encode_result {
-                            Some(Ok(ref h264_data)) if h264_data.len() > 32 => {
-                                encode_failures = 0;
-                                if let (Some(handle), Some(sender)) = (&egfx_handle, &egfx_sender) {
-                                    let timestamp = std::time::SystemTime::now()
-                                        .duration_since(std::time::UNIX_EPOCH)
-                                        .unwrap_or_default()
-                                        .as_millis()
-                                        as u32;
-                                    let sent = shared.send_tracked_avc420_frame(
-                                        handle,
-                                        sender,
-                                        sid,
-                                        width as u16,
-                                        height as u16,
-                                        h264_data,
-                                        timestamp,
-                                        metadata_qp,
-                                    );
-                                    if sent {
-                                        sent_first_frame = true;
-                                    } else if let Some(enc) = &mut h264_encoder {
-                                        enc.force_idr();
+                            Some(Ok(ref h264_data)) => {
+                                match classify_dmabuf_h264_output(h264_data) {
+                                    DmaBufEncodeProgress::Sendable => {
+                                        encode_failures.reset_window();
+                                        if let (Some(handle), Some(sender)) =
+                                            (&egfx_handle, &egfx_sender)
+                                        {
+                                            let timestamp = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap_or_default()
+                                                .as_millis()
+                                                as u32;
+                                            let sent = shared.send_tracked_avc420_frame(
+                                                handle,
+                                                sender,
+                                                sid,
+                                                width as u16,
+                                                height as u16,
+                                                h264_data,
+                                                timestamp,
+                                                metadata_qp,
+                                            );
+                                            if sent {
+                                                sent_first_frame = true;
+                                            } else if let Some(enc) = &mut h264_encoder {
+                                                enc.force_idr();
+                                            }
+                                        }
+                                    }
+                                    DmaBufEncodeProgress::NoProgress => {
+                                        let action = encode_failures.record_no_progress();
+                                        tracing::trace!(
+                                            failures = encode_failures.failures(),
+                                            max = MAX_ENCODE_FAILURES,
+                                            bytes = h264_data.len(),
+                                            "DMA-BUF encode produced no sendable H.264 output"
+                                        );
+                                        if let Some(enc) = &mut h264_encoder {
+                                            enc.force_idr();
+                                        }
+                                        if action == DmaBufEncodeFailureAction::FallBackToShm {
+                                            frame.destroy();
+                                            bail!(
+                                                "VA-API encode produced no sendable H.264 output \
+                                                 {} consecutive times in DMA-BUF mode, falling \
+                                                 back to SHM",
+                                                encode_failures.failures()
+                                            );
+                                        }
                                     }
                                 }
                             }
-                            Some(Ok(_)) => {
-                                encode_failures = 0;
-                            }
                             Some(Err(e)) => {
-                                encode_failures += 1;
+                                let action = encode_failures.record_no_progress();
                                 tracing::warn!(
-                                    failures = encode_failures,
+                                    failures = encode_failures.failures(),
                                     max = MAX_ENCODE_FAILURES,
                                     "DMA-BUF encode pipeline failed: {:#}",
                                     e
@@ -463,13 +542,13 @@ pub(super) fn capture_loop_ext_dmabuf(
                                 if let Some(enc) = &mut h264_encoder {
                                     enc.force_idr();
                                 }
-                                if encode_failures >= MAX_ENCODE_FAILURES {
+                                if action == DmaBufEncodeFailureAction::FallBackToShm {
                                     // Destroy the in-flight frame before dropping DMA-BUF resources
                                     frame.destroy();
                                     bail!(
                                         "VA-API encode failed {} consecutive times in DMA-BUF mode, \
                                          falling back to SHM",
-                                        encode_failures
+                                        encode_failures.failures()
                                     );
                                 }
                             }
@@ -482,4 +561,72 @@ pub(super) fn capture_loop_ext_dmabuf(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dmabuf_encode_failure_tracker_retries_until_fallback_threshold() {
+        let mut tracker = DmaBufEncodeFailureTracker::new(3);
+
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::Retry
+        );
+        assert_eq!(tracker.failures(), 1);
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::Retry
+        );
+        assert_eq!(tracker.failures(), 2);
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::FallBackToShm
+        );
+        assert_eq!(tracker.failures(), 3);
+    }
+
+    #[test]
+    fn dmabuf_encode_failure_tracker_reset_requires_fresh_failure_window() {
+        let mut tracker = DmaBufEncodeFailureTracker::new(2);
+
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::Retry
+        );
+        tracker.reset_window();
+
+        assert_eq!(tracker.failures(), 0);
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::Retry
+        );
+    }
+
+    #[test]
+    fn dmabuf_encode_tracker_falls_back_after_unsendable_h264_outputs() {
+        let mut tracker = DmaBufEncodeFailureTracker::new(2);
+
+        assert_eq!(
+            classify_dmabuf_h264_output(&[0; MIN_SENDABLE_H264_BYTES]),
+            DmaBufEncodeProgress::NoProgress
+        );
+        assert_eq!(
+            classify_dmabuf_h264_output(&[0; MIN_SENDABLE_H264_BYTES + 1]),
+            DmaBufEncodeProgress::Sendable
+        );
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::Retry
+        );
+        assert_eq!(
+            tracker.record_no_progress(),
+            DmaBufEncodeFailureAction::FallBackToShm
+        );
+
+        tracker.reset_window();
+        assert_eq!(tracker.failures(), 0);
+    }
 }

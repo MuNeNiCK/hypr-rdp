@@ -19,6 +19,24 @@ pub struct Avc444EncodedFrame {
     pub stream2_regions: Vec<(i32, i32, i32, i32)>,
 }
 
+impl Avc444EncodedFrame {
+    pub fn stream1_nal_types(&self) -> Vec<u8> {
+        annex_b_nal_types(&self.stream1)
+    }
+
+    pub fn stream2_nal_types(&self) -> Vec<u8> {
+        annex_b_nal_types(&self.stream2)
+    }
+
+    pub fn stream1_has_idr(&self) -> bool {
+        self.stream1_nal_types().contains(&5)
+    }
+
+    pub fn stream2_has_idr(&self) -> bool {
+        self.stream2_nal_types().contains(&5)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Avc444FrameEncoding {
     LumaAndChroma,
@@ -262,7 +280,7 @@ impl EgfxShared {
 }
 
 pub struct Avc444Encoder {
-    encoder: H264Encoder,
+    encoder: Avc444H264Encoder,
     width: usize,
     height: usize,
     y444: Vec<u8>,
@@ -328,6 +346,32 @@ impl Avc444Encoder {
             h264_options,
         )?;
 
+        Self::new_with_encoder(width, height, Avc444H264Encoder::Software(encoder))
+    }
+
+    #[cfg(feature = "vaapi")]
+    pub(crate) fn new_with_vaapi(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        qp: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
+        if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(2) {
+            bail!(
+                "AVC444v2 dimensions must be non-zero, width must be divisible by 4, and height must be even: {}x{}",
+                width,
+                height
+            );
+        }
+
+        let encoder =
+            super::vaapi::VaapiEncoder::new(width, height, bitrate, fps, qp, rate_control)?;
+        Self::new_with_encoder(width, height, Avc444H264Encoder::Vaapi(Box::new(encoder)))
+    }
+
+    fn new_with_encoder(width: u32, height: u32, encoder: Avc444H264Encoder) -> Result<Self> {
         let w = width as usize;
         let h = height as usize;
         let y_len = w * h;
@@ -352,6 +396,14 @@ impl Avc444Encoder {
             force_chroma_on_next_frame: true,
             perf_stats: Avc444PerfStats::new(),
         })
+    }
+
+    pub(crate) fn backend_name(&self) -> &'static str {
+        self.encoder.backend_name()
+    }
+
+    pub(crate) fn is_vaapi(&self) -> bool {
+        self.encoder.is_vaapi()
     }
 
     pub fn encode(
@@ -479,6 +531,9 @@ impl Avc444Encoder {
                     Duration::ZERO,
                 )
             } else {
+                if force_full_frame {
+                    self.encoder.force_idr();
+                }
                 let stream2_encode_start = Instant::now();
                 let chroma =
                     self.encoder
@@ -525,26 +580,14 @@ impl Avc444Encoder {
         let stream1_is_idr = annex_b_nal_types(&stream1.data).contains(&5);
         let stream2_is_idr = annex_b_nal_types(&stream2.data).contains(&5);
 
-        let frame = if stream1_regions.is_empty()
-            || (encoding == Avc444FrameEncoding::LumaAndChroma && stream2_regions.is_empty())
-        {
-            self.last_chroma_encoded = false;
-            Avc444EncodedFrame {
-                encoding: Avc444FrameEncoding::Luma,
-                stream1: Vec::new(),
-                stream2: Vec::new(),
-                stream1_regions: Vec::new(),
-                stream2_regions: Vec::new(),
-            }
-        } else {
-            Avc444EncodedFrame {
-                encoding,
-                stream1: stream1.data,
-                stream2: stream2.data,
-                stream1_regions,
-                stream2_regions,
-            }
-        };
+        let (frame, commit_chroma_reference) = normalize_avc444_encoded_frame(
+            encoding,
+            stream1,
+            stream2,
+            stream1_regions,
+            stream2_regions,
+        );
+        self.last_chroma_encoded = commit_chroma_reference;
 
         let total_elapsed = total_start.elapsed();
         self.perf_stats.record(
@@ -654,6 +697,124 @@ impl Avc444Encoder {
             chroma_regions = chroma_regions.len(),
             "AVC444v2 encoded frame"
         );
+    }
+}
+
+enum Avc444H264Encoder {
+    Software(H264Encoder),
+    #[cfg(feature = "vaapi")]
+    Vaapi(Box<super::vaapi::VaapiEncoder>),
+}
+
+impl Avc444H264Encoder {
+    fn encode_yuv420_raw(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Result<EncodedH264> {
+        match self {
+            Self::Software(encoder) => encoder.encode_yuv420_raw(y, u, v),
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(encoder) => encoder.encode_yuv420_raw(y, u, v),
+        }
+    }
+
+    fn force_idr(&mut self) {
+        match self {
+            Self::Software(encoder) => encoder.force_idr(),
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(encoder) => encoder.force_idr(),
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::Software(_) => "ffmpeg-avc444",
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) => "vaapi-avc444",
+        }
+    }
+
+    fn is_vaapi(&self) -> bool {
+        match self {
+            Self::Software(_) => false,
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) => true,
+        }
+    }
+
+    #[cfg(test)]
+    fn force_idr_requests_for_test(&self) -> u32 {
+        match self {
+            Self::Software(encoder) => encoder.force_idr_requests_for_test(),
+            #[cfg(feature = "vaapi")]
+            Self::Vaapi(_) => 0,
+        }
+    }
+}
+
+fn normalize_avc444_encoded_frame(
+    encoding: Avc444FrameEncoding,
+    stream1: EncodedH264,
+    stream2: EncodedH264,
+    stream1_regions: Regions,
+    stream2_regions: Regions,
+) -> (Avc444EncodedFrame, bool) {
+    if stream1_regions.is_empty() || stream1.data.is_empty() {
+        return (
+            Avc444EncodedFrame {
+                encoding: Avc444FrameEncoding::Luma,
+                stream1: Vec::new(),
+                stream2: Vec::new(),
+                stream1_regions: Vec::new(),
+                stream2_regions: Vec::new(),
+            },
+            false,
+        );
+    }
+
+    match encoding {
+        Avc444FrameEncoding::Luma => (
+            Avc444EncodedFrame {
+                encoding,
+                stream1: stream1.data,
+                stream2: Vec::new(),
+                stream1_regions,
+                stream2_regions: Vec::new(),
+            },
+            false,
+        ),
+        Avc444FrameEncoding::Chroma => (
+            Avc444EncodedFrame {
+                encoding,
+                stream1: stream1.data,
+                stream2: Vec::new(),
+                stream1_regions,
+                stream2_regions: Vec::new(),
+            },
+            true,
+        ),
+        Avc444FrameEncoding::LumaAndChroma => {
+            if stream2_regions.is_empty() || stream2.data.is_empty() {
+                (
+                    Avc444EncodedFrame {
+                        encoding: Avc444FrameEncoding::Luma,
+                        stream1: stream1.data,
+                        stream2: Vec::new(),
+                        stream1_regions,
+                        stream2_regions: Vec::new(),
+                    },
+                    false,
+                )
+            } else {
+                (
+                    Avc444EncodedFrame {
+                        encoding,
+                        stream1: stream1.data,
+                        stream2: stream2.data,
+                        stream1_regions,
+                        stream2_regions,
+                    },
+                    true,
+                )
+            }
+        }
     }
 }
 
@@ -1637,18 +1798,25 @@ fn union_region(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, 
 mod tests {
     use super::*;
     use openh264::encoder::{Complexity, UsageType};
+    use proptest::prelude::*;
 
     #[test]
-    fn avc444_v2_encoder_options_follow_freerdp_vbr_frame_skip() {
+    fn avc444_v2_encoder_options_use_freerdp_libavcodec_backend_policy() {
         let options = avc444_h264_encoder_options();
 
-        assert!(matches!(options.usage_type, UsageType::CameraVideoRealTime));
+        assert!(matches!(
+            options.usage_type,
+            UsageType::ScreenContentRealTime
+        ));
         assert!(matches!(options.complexity, Complexity::Medium));
         assert!(options.scene_change_detect);
-        assert!(options.adaptive_quantization);
-        assert!(options.background_detection);
+        assert!(!options.adaptive_quantization);
+        assert!(!options.background_detection);
         assert!(!options.long_term_reference);
         assert!(options.frame_skip);
+        assert!(!options.vbr_qp_clamp);
+        assert!(!options.freerdp_openh264_params);
+        assert!(options.ffmpeg_libavcodec);
     }
 
     #[test]
@@ -1754,6 +1922,60 @@ mod tests {
         assert!(!chroma_protocol_regions.is_empty());
     }
 
+    proptest! {
+        #[test]
+        fn generated_avc444_aligned_protocol_regions_stay_inside_frame(
+            regions in proptest::collection::vec(
+                (any::<i32>(), any::<i32>(), any::<i32>(), any::<i32>()),
+                0..32
+            ),
+            width in 1usize..=4096,
+            height in 1usize..=4096,
+        ) {
+            let aligned = align_avc444_v2_protocol_regions(width, height, &regions);
+
+            for (left, top, region_width, region_height) in aligned {
+                prop_assert!(left >= 0);
+                prop_assert!(top >= 0);
+                prop_assert!(region_width > 0);
+                prop_assert!(region_height > 0);
+                prop_assert!((left as usize + region_width as usize) <= width);
+                prop_assert!((top as usize + region_height as usize) <= height);
+                prop_assert_eq!(left.rem_euclid(4), 0);
+                prop_assert_eq!(top.rem_euclid(2), 0);
+            }
+        }
+
+        #[test]
+        fn generated_avc444_chroma_region_mapping_stays_inside_protocol_frame(
+            x in any::<i32>(),
+            y in any::<i32>(),
+            w in any::<i32>(),
+            h in any::<i32>(),
+            width in 2usize..=4096,
+            height in 1usize..=4096,
+        ) {
+            let width = width & !1;
+            prop_assume!(width > 0);
+
+            for packed_region in avc444_v2_chroma_packed_candidates(width, height, (x, y, w, h)) {
+                let protocol_regions =
+                    avc444_v2_chroma_packed_region_to_protocol_regions(width, height, packed_region);
+
+                for (left, top, region_width, region_height) in protocol_regions {
+                    prop_assert!(left >= 0);
+                    prop_assert!(top >= 0);
+                    prop_assert!(region_width > 0);
+                    prop_assert!(region_height > 0);
+                    prop_assert!((left as usize + region_width as usize) <= width);
+                    prop_assert!((top as usize + region_height as usize) <= height);
+                    prop_assert_eq!(left.rem_euclid(4), 0);
+                    prop_assert_eq!(top.rem_euclid(2), 0);
+                }
+            }
+        }
+    }
+
     #[test]
     fn chroma_only_avc444_v2_frame_uses_chroma_as_stream1() {
         let frame = Avc444EncodedFrame {
@@ -1773,8 +1995,8 @@ mod tests {
 
     #[test]
     fn avc444_v2_encoder_first_frame_shape_uses_luma_and_chroma_when_available() {
-        let width = 16;
-        let height = 16;
+        let width = 64;
+        let height = 64;
         let stride = width * 4;
         let mut bgra = vec![0; stride * height];
         for y in 0..height {
@@ -2137,6 +2359,49 @@ mod tests {
         assert_eq!(encoder.force_idr_requests_for_test(), 1);
     }
 
+    #[test]
+    fn avc444_lc0_empty_chroma_payload_becomes_luma_only_without_chroma_commit() {
+        let (frame, commit_chroma) = normalize_avc444_encoded_frame(
+            Avc444FrameEncoding::LumaAndChroma,
+            EncodedH264 {
+                data: vec![0x00, 0x00, 0x01, 0x65],
+                frame_type: openh264::encoder::FrameType::IDR,
+            },
+            EncodedH264::empty(),
+            vec![(0, 0, 16, 16)],
+            vec![(0, 0, 16, 16)],
+        );
+
+        assert_eq!(frame.encoding, Avc444FrameEncoding::Luma);
+        assert_eq!(frame.stream1, vec![0x00, 0x00, 0x01, 0x65]);
+        assert!(frame.stream2.is_empty());
+        assert_eq!(frame.stream1_regions, vec![(0, 0, 16, 16)]);
+        assert!(frame.stream2_regions.is_empty());
+        assert!(!commit_chroma);
+    }
+
+    #[test]
+    fn avc444_lc0_with_both_payloads_keeps_chroma_commit() {
+        let (frame, commit_chroma) = normalize_avc444_encoded_frame(
+            Avc444FrameEncoding::LumaAndChroma,
+            EncodedH264 {
+                data: vec![0x00, 0x00, 0x01, 0x65],
+                frame_type: openh264::encoder::FrameType::IDR,
+            },
+            EncodedH264 {
+                data: vec![0x00, 0x00, 0x01, 0x41],
+                frame_type: openh264::encoder::FrameType::P,
+            },
+            vec![(0, 0, 16, 16)],
+            vec![(0, 0, 16, 16)],
+        );
+
+        assert_eq!(frame.encoding, Avc444FrameEncoding::LumaAndChroma);
+        assert_eq!(frame.stream2, vec![0x00, 0x00, 0x01, 0x41]);
+        assert_eq!(frame.stream2_regions, vec![(0, 0, 16, 16)]);
+        assert!(commit_chroma);
+    }
+
     #[derive(Debug)]
     struct Avc444WireProfile {
         encoding: Avc444FrameEncoding,
@@ -2173,8 +2438,8 @@ mod tests {
     fn avc444_profiles_with_options(
         options: H264EncoderOptions,
     ) -> std::result::Result<Vec<Avc444WireProfile>, String> {
-        let width = 16;
-        let height = 16;
+        let width = 64;
+        let height = 64;
         let stride = width * 4;
         let mut first = gradient_bgra_frame(width, height, stride);
         let mut second = first.clone();
@@ -2378,6 +2643,7 @@ mod tests {
             vec![(0, 0, width as i32, height as i32)]
         );
         assert!(annex_b_nal_types(&recovered.stream1).contains(&5));
+        assert!(annex_b_nal_types(&recovered.stream2).contains(&5));
         assert!(!recovered.stream2.is_empty());
     }
 
@@ -2449,7 +2715,59 @@ mod tests {
             vec![(0, 0, width as i32, height as i32)]
         );
         assert!(annex_b_nal_types(&recovered.stream1).contains(&5));
+        assert!(annex_b_nal_types(&recovered.stream2).contains(&5));
         assert!(!recovered.stream2.is_empty());
+    }
+
+    #[test]
+    fn avc444_vbr_force_idr_refresh_includes_chroma_idr() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut encoder = match Avc444Encoder::new(
+            width as u32,
+            height as u32,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Vbr,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        let initial = encoder
+            .encode(&frame, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("initial frame encodes");
+        assert_eq!(initial.encoding, Avc444FrameEncoding::LumaAndChroma);
+        encoder.commit_reference();
+
+        encoder.force_idr();
+        let refresh = encoder
+            .encode(&frame, stride, &[(0, 0, width as i32, height as i32)])
+            .expect("forced refresh encodes");
+
+        assert_eq!(refresh.encoding, Avc444FrameEncoding::LumaAndChroma);
+        assert_eq!(
+            refresh.stream1_regions,
+            vec![(0, 0, width as i32, height as i32)]
+        );
+        assert_eq!(
+            refresh.stream2_regions,
+            vec![(0, 0, width as i32, height as i32)]
+        );
+        assert!(
+            annex_b_nal_types(&refresh.stream1).contains(&5),
+            "refresh luma must be IDR: {:?}",
+            annex_b_nal_types(&refresh.stream1)
+        );
+        assert!(
+            annex_b_nal_types(&refresh.stream2).contains(&5),
+            "refresh chroma must be IDR: {:?}",
+            annex_b_nal_types(&refresh.stream2)
+        );
     }
 
     #[test]

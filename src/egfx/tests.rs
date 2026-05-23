@@ -1,277 +1,20 @@
 use super::factory::{capability_avc_support, preferred_capabilities_for_policy};
+use super::test_support::{
+    ack_frame, assert_wire_to_surface_frame, decode_avc444_wire_to_surface, decode_gfx_output,
+    drain_gfx_pdus, negotiated_avc420_session, ready_avc420_session, ready_avc444_handle,
+    ready_tracked_avc420_session, tracked_avc444_session, unnegotiated_egfx_session,
+    TEST_CHANNEL_ID,
+};
 use super::*;
 use ironrdp_core::{encode_vec, Decode, Encode, ReadCursor};
-use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
 use ironrdp_dvc::DvcProcessor as _;
 use ironrdp_egfx::pdu::{
-    Avc420BitmapStream, Avc420Region, Avc444BitmapStream, Codec1Type, Encoding,
-    FrameAcknowledgePdu, GfxPdu, PixelFormat, QuantQuality, QueueDepth, WireToSurface1Pdu,
+    Avc420BitmapStream, Avc420Region, Avc444BitmapStream, Codec1Type, Encoding, GfxPdu,
+    PixelFormat, QuantQuality, QueueDepth, WireToSurface1Pdu,
 };
 use ironrdp_pdu::geometry::InclusiveRectangle;
-use ironrdp_server::{EgfxServerMessage, GfxDvcBridge, GfxServerHandle, ServerEvent};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-
-const TEST_CHANNEL_ID: u32 = 1007;
-
-fn ready_avc444_handle(width: u16, height: u16) -> (GfxServerHandle, u16) {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Avc444,
-    ));
-    shared.set_surface_size(width, height);
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
-    let (mut bridge, handle) = ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-        .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
-
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V10_7 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
-        },
-    ]));
-    let caps = encode_vec(&caps).expect("capabilities encode");
-    let _ = bridge
-        .process(TEST_CHANNEL_ID, &caps)
-        .expect("capabilities process");
-    assert!(shared.is_ready());
-    assert!(shared.is_avc444_enabled());
-
-    let surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, width, height).expect("surface init");
-    (handle, surface_id)
-}
-
-fn ready_avc420_session(
-    width: u16,
-    height: u16,
-) -> (
-    GfxServerHandle,
-    u16,
-    mpsc::UnboundedSender<ServerEvent>,
-    mpsc::UnboundedReceiver<ServerEvent>,
-) {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(width, height);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
-    let (mut bridge, handle) = ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-        .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
-
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
-        },
-    ]));
-    let caps = encode_vec(&caps).expect("capabilities encode");
-    let _ = bridge
-        .process(TEST_CHANNEL_ID, &caps)
-        .expect("capabilities process");
-    assert!(shared.is_ready());
-    assert!(shared.is_avc_enabled());
-    assert!(!shared.is_avc444_enabled());
-
-    let surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, width, height).expect("surface init");
-    (handle, surface_id, event_tx, event_rx)
-}
-
-fn ready_tracked_avc420_session(
-    width: u16,
-    height: u16,
-    max_frames_in_flight: u32,
-) -> (
-    Arc<EgfxShared>,
-    GfxDvcBridge,
-    GfxServerHandle,
-    u16,
-    mpsc::UnboundedSender<ServerEvent>,
-    mpsc::UnboundedReceiver<ServerEvent>,
-) {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        max_frames_in_flight,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(width, height);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
-    let (mut bridge, handle) = ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-        .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
-
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
-        },
-    ]));
-    let caps = encode_vec(&caps).expect("capabilities encode");
-    let _ = bridge
-        .process(TEST_CHANNEL_ID, &caps)
-        .expect("capabilities process");
-    assert!(shared.is_ready());
-    assert!(shared.is_avc_enabled());
-
-    let surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, width, height).expect("surface init");
-    (shared, bridge, handle, surface_id, event_tx, event_rx)
-}
-
-fn negotiated_avc420_session(
-    width: u16,
-    height: u16,
-    max_frames_in_flight: u32,
-) -> (
-    Arc<EgfxShared>,
-    GfxDvcBridge,
-    GfxServerHandle,
-    mpsc::UnboundedSender<ServerEvent>,
-    mpsc::UnboundedReceiver<ServerEvent>,
-) {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        max_frames_in_flight,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(width, height);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
-    let (mut bridge, handle) = ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-        .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
-
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
-        },
-    ]));
-    let caps = encode_vec(&caps).expect("capabilities encode");
-    let _ = bridge
-        .process(TEST_CHANNEL_ID, &caps)
-        .expect("capabilities process");
-    assert!(shared.is_ready());
-    assert!(shared.is_avc_enabled());
-
-    (shared, bridge, handle, event_tx, event_rx)
-}
-
-fn decode_gfx_output(message: &ironrdp_dvc::DvcMessage) -> GfxPdu {
-    let wrapped = encode_vec(&**message).expect("DVC message encodes");
-    assert_eq!(&wrapped[0..2], &[0xe0, 0x04]);
-    let mut cursor = ReadCursor::new(&wrapped[2..]);
-    GfxPdu::decode(&mut cursor).expect("GFX PDU decodes")
-}
-
-fn decode_avc444_wire_to_surface(message: &ironrdp_dvc::DvcMessage) -> WireToSurface1Pdu {
-    match decode_gfx_output(message) {
-        GfxPdu::WireToSurface1(pdu) => pdu,
-        other => panic!("expected WireToSurface1, got {other:?}"),
-    }
-}
-
-fn drain_gfx_pdus(event_rx: &mut mpsc::UnboundedReceiver<ServerEvent>) -> Vec<GfxPdu> {
-    let mut pdus = Vec::new();
-    let mut expected_fragment_len = 0usize;
-    let mut fragments = Vec::new();
-
-    while let Ok(event) = event_rx.try_recv() {
-        let ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) = event else {
-            continue;
-        };
-
-        for message in messages {
-            let encoded = message.encode_unframed_pdu().expect("DVC message encodes");
-            let mut cursor = ReadCursor::new(&encoded);
-            let dvc = DrdynvcServerPdu::decode(&mut cursor).expect("DVC message decodes");
-            let DrdynvcServerPdu::Data(data) = dvc else {
-                continue;
-            };
-
-            let complete = match data {
-                DrdynvcDataPdu::DataFirst(data_first) => {
-                    let total_len = data_first.length() as usize;
-                    if total_len == data_first.data().len() {
-                        Some(data_first.into_data())
-                    } else {
-                        expected_fragment_len = total_len;
-                        fragments = data_first.into_data();
-                        None
-                    }
-                }
-                DrdynvcDataPdu::Data(mut data) => {
-                    if expected_fragment_len == 0 {
-                        Some(data.into_data())
-                    } else {
-                        fragments.append(data.data_mut());
-                        if fragments.len() == expected_fragment_len {
-                            expected_fragment_len = 0;
-                            Some(std::mem::take(&mut fragments))
-                        } else {
-                            None
-                        }
-                    }
-                }
-            };
-
-            if let Some(gfx_bytes) = complete {
-                let gfx_bytes = if gfx_bytes.starts_with(&[0xe0, 0x04]) {
-                    &gfx_bytes[2..]
-                } else {
-                    &gfx_bytes
-                };
-                let mut cursor = ReadCursor::new(gfx_bytes);
-                pdus.push(GfxPdu::decode(&mut cursor).expect("GFX PDU decodes"));
-            }
-        }
-    }
-
-    pdus
-}
-
-fn assert_wire_to_surface_frame(
-    pdus: &[GfxPdu],
-    surface_id: u16,
-    codec_id: Codec1Type,
-) -> &WireToSurface1Pdu {
-    assert_eq!(pdus.len(), 3);
-    let start = match &pdus[0] {
-        GfxPdu::StartFrame(start) => start,
-        other => panic!("expected StartFrame, got {other:?}"),
-    };
-    let wire = match &pdus[1] {
-        GfxPdu::WireToSurface1(wire) => wire,
-        other => panic!("expected WireToSurface1, got {other:?}"),
-    };
-    let end = match &pdus[2] {
-        GfxPdu::EndFrame(end) => end,
-        other => panic!("expected EndFrame, got {other:?}"),
-    };
-
-    assert_eq!(end.frame_id, start.frame_id);
-    assert_eq!(wire.surface_id, surface_id);
-    assert_eq!(wire.codec_id, codec_id);
-    assert!(!wire.bitmap_data.is_empty());
-    wire
-}
-
-fn ack_frame(bridge: &mut GfxDvcBridge, frame_id: u32, queue_depth: QueueDepth) {
-    let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
-        queue_depth,
-        frame_id,
-        total_frames_decoded: 1,
-    });
-    let ack = encode_vec(&ack).expect("frame ack encodes");
-    let _ = bridge
-        .process(TEST_CHANNEL_ID, &ack)
-        .expect("frame ack processes");
-}
 
 #[test]
 fn full_frame_region_uses_rdpegfx_exclusive_bounds() {
@@ -487,6 +230,26 @@ fn tracked_frame_ack_releases_local_queue_depth() {
     assert_eq!(shared.frames_in_flight(), 0);
     assert_eq!(shared.client_queue_depth(), 8);
     assert!(shared.can_send_frame(&handle));
+
+    assert!(shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xbb],
+        &regions,
+        124,
+    ));
+    assert_eq!(shared.frames_in_flight(), 1);
+    assert_eq!(
+        shared.frame_readiness(&handle),
+        EgfxFrameReadiness::LocalBackpressure {
+            in_flight: 1,
+            max: 1,
+            client_queue_depth: 8,
+            ack_suspended: false,
+        }
+    );
+    assert!(!shared.can_send_frame(&handle));
 }
 
 #[test]
@@ -522,31 +285,23 @@ fn frame_readiness_distinguishes_transport_backpressure_from_local_queue_policy(
 
 #[test]
 fn frame_readiness_distinguishes_transport_not_ready_before_capabilities() {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
-    let (_bridge, handle) = ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-        .expect("EGFX server builds");
+    let session = unnegotiated_egfx_session(64, 64, EgfxCodecPolicy::Auto);
 
     assert_eq!(
-        shared.frame_readiness(&handle),
+        session.shared.frame_readiness(&session.handle),
         EgfxFrameReadiness::TransportNotReady
     );
-    assert!(!shared.can_send_frame(&handle));
+    assert!(!session.shared.can_send_frame(&session.handle));
 }
 
 #[test]
-fn default_queue_policy_does_not_stall_when_client_sends_no_frame_acks() {
+fn default_queue_policy_backpressures_before_first_frame_ack() {
     let (shared, _bridge, handle, surface_id, event_tx, mut event_rx) =
         ready_tracked_avc420_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
     let _ = drain_gfx_pdus(&mut event_rx);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    for index in 0..(130 + 1) {
+    for index in 0..DEFAULT_MAX_FRAMES_IN_FLIGHT {
         assert!(
             shared.send_tracked_avc420_frame_with_regions(
                 &handle,
@@ -556,12 +311,151 @@ fn default_queue_policy_does_not_stall_when_client_sends_no_frame_acks() {
                 &regions,
                 123 + index,
             ),
-            "frame {index} should not be blocked before any frame ack is observed"
+            "frame {index} should fit the default local window"
         );
     }
 
-    assert_eq!(shared.frames_in_flight(), 131);
-    assert!(shared.can_send_frame(&handle));
+    assert_eq!(shared.frames_in_flight(), DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    assert!(!shared.frame_ack_stream_established());
+    assert_eq!(
+        shared.frame_readiness(&handle),
+        EgfxFrameReadiness::LocalBackpressure {
+            in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            max: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            client_queue_depth: 0,
+            ack_suspended: false,
+        }
+    );
+    assert!(!shared.can_send_frame(&handle));
+    assert!(!shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xff],
+        &regions,
+        999,
+    ));
+}
+
+#[test]
+fn tracked_queue_policy_backpressures_after_ack_stream_stalls() {
+    let (shared, mut bridge, handle, surface_id, event_tx, mut event_rx) =
+        ready_tracked_avc420_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    let _ = drain_gfx_pdus(&mut event_rx);
+    let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
+
+    assert!(shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xaa],
+        &regions,
+        123,
+    ));
+    let pdus = drain_gfx_pdus(&mut event_rx);
+    let first_frame_id = match &pdus[0] {
+        GfxPdu::StartFrame(start) => start.frame_id,
+        other => panic!("expected StartFrame, got {other:?}"),
+    };
+    ack_frame(
+        &mut bridge,
+        first_frame_id,
+        QueueDepth::AvailableBytes(661_655),
+    );
+
+    assert_eq!(shared.frames_in_flight(), 0);
+    assert_eq!(
+        shared.frame_flow_snapshot().last_acked_frame_id,
+        first_frame_id
+    );
+    assert!(shared.frame_ack_stream_established());
+
+    for index in 0..DEFAULT_MAX_FRAMES_IN_FLIGHT {
+        assert!(
+            shared.send_tracked_avc420_frame_with_regions(
+                &handle,
+                &event_tx,
+                surface_id,
+                &[0, 0, 1, 0x65, index as u8],
+                &regions,
+                124 + index,
+            ),
+            "frame {index} should fit the ACK-established local window"
+        );
+    }
+
+    assert_eq!(shared.frames_in_flight(), DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    assert_eq!(
+        shared.frame_readiness(&handle),
+        EgfxFrameReadiness::LocalBackpressure {
+            in_flight: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            max: DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            client_queue_depth: 661_655,
+            ack_suspended: false,
+        }
+    );
+    assert!(!shared.can_send_frame(&handle));
+    assert!(!shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xff],
+        &regions,
+        999,
+    ));
+}
+
+#[test]
+fn preferred_frame_rate_drops_as_ack_window_fills() {
+    let (shared, mut bridge, handle, surface_id, event_tx, mut event_rx) =
+        ready_tracked_avc420_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    let _ = drain_gfx_pdus(&mut event_rx);
+    let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
+
+    assert_eq!(shared.preferred_frame_rate(30), 30);
+
+    assert!(shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xaa],
+        &regions,
+        123,
+    ));
+    assert_eq!(shared.frames_in_flight(), 1);
+    assert_eq!(shared.preferred_frame_rate(30), 30);
+
+    assert!(shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xbb],
+        &regions,
+        124,
+    ));
+    assert_eq!(shared.frames_in_flight(), 2);
+    assert_eq!(shared.preferred_frame_rate(30), 9);
+
+    assert!(shared.send_tracked_avc420_frame_with_regions(
+        &handle,
+        &event_tx,
+        surface_id,
+        &[0, 0, 1, 0x65, 0xcc],
+        &regions,
+        125,
+    ));
+    assert_eq!(shared.frames_in_flight(), 3);
+    assert_eq!(shared.preferred_frame_rate(30), 7);
+
+    let pdus = drain_gfx_pdus(&mut event_rx);
+    let first_frame_id = match &pdus[0] {
+        GfxPdu::StartFrame(start) => start.frame_id,
+        other => panic!("expected StartFrame, got {other:?}"),
+    };
+    ack_frame(&mut bridge, first_frame_id, QueueDepth::Suspend);
+
+    assert!(shared.frame_ack_suspended());
+    assert_eq!(shared.preferred_frame_rate(30), 30);
 }
 
 #[test]
@@ -1052,34 +946,15 @@ fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
 
 #[test]
 fn resize_does_not_bump_generation_when_reset_cannot_be_sent() {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(64, 64);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx.clone());
-    let (mut bridge, handle) = ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-        .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+    let session = tracked_avc444_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    let _ =
+        EgfxShared::init_surface(&session.handle, &session.event_tx, 64, 64).expect("surface init");
+    let generation = session.shared.generation();
 
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V10_7 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
-        },
-    ]));
-    let caps = encode_vec(&caps).expect("capabilities encode");
-    let _ = bridge
-        .process(TEST_CHANNEL_ID, &caps)
-        .expect("capabilities process");
-    let _ = EgfxShared::init_surface(&handle, &event_tx, 64, 64).expect("surface init");
-    let generation = shared.generation();
+    drop(session.event_rx);
+    session.shared.prepare_for_resize(64, 64);
 
-    drop(event_rx);
-    shared.prepare_for_resize(64, 64);
-
-    assert_eq!(shared.generation(), generation);
+    assert_eq!(session.shared.generation(), generation);
 }
 
 #[test]
@@ -1187,18 +1062,11 @@ fn new_gfx_server_requires_fresh_capabilities_and_surface_setup() {
 
 #[test]
 fn repeated_compatible_capabilities_keep_surface_generation() {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(64, 64);
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
-    let (mut bridge, _handle) =
-        ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-            .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+    let mut session = unnegotiated_egfx_session(64, 64, EgfxCodecPolicy::Auto);
+    session
+        .bridge
+        .start(TEST_CHANNEL_ID)
+        .expect("channel starts");
 
     let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
         ironrdp_egfx::pdu::CapabilitySet::V10_7 {
@@ -1207,34 +1075,29 @@ fn repeated_compatible_capabilities_keep_surface_generation() {
     ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
 
-    let _ = bridge
+    let _ = session
+        .bridge
         .process(TEST_CHANNEL_ID, &caps)
         .expect("initial capabilities process");
-    let first_generation = shared.generation();
-    assert!(!shared.full_frame_requested());
+    let first_generation = session.shared.generation();
+    assert!(!session.shared.full_frame_requested());
 
-    let _ = bridge
+    let _ = session
+        .bridge
         .process(TEST_CHANNEL_ID, &caps)
         .expect("repeated capabilities process");
 
-    assert_eq!(shared.generation(), first_generation);
-    assert!(shared.full_frame_requested());
+    assert_eq!(session.shared.generation(), first_generation);
+    assert!(session.shared.full_frame_requested());
 }
 
 #[test]
 fn changed_avc_capabilities_bump_generation_for_surface_reinit() {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(64, 64);
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
-    let (mut bridge, _handle) =
-        ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-            .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+    let mut session = unnegotiated_egfx_session(64, 64, EgfxCodecPolicy::Auto);
+    session
+        .bridge
+        .start(TEST_CHANNEL_ID)
+        .expect("channel starts");
 
     let avc_caps =
         GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
@@ -1251,32 +1114,27 @@ fn changed_avc_capabilities_bump_generation_for_surface_reinit() {
         ]));
     let no_avc_caps = encode_vec(&no_avc_caps).expect("non-AVC capabilities encode");
 
-    let _ = bridge
+    let _ = session
+        .bridge
         .process(TEST_CHANNEL_ID, &avc_caps)
         .expect("initial AVC capabilities process");
-    let first_generation = shared.generation();
+    let first_generation = session.shared.generation();
 
-    let _ = bridge
+    let _ = session
+        .bridge
         .process(TEST_CHANNEL_ID, &no_avc_caps)
         .expect("changed capabilities process");
 
-    assert!(shared.generation() > first_generation);
+    assert!(session.shared.generation() > first_generation);
 }
 
 #[test]
 fn auto_policy_uses_v10_avc444_when_v81_lacks_avc420_flag() {
-    let shared = Arc::new(EgfxShared::with_codec_policy(
-        DEFAULT_MAX_FRAMES_IN_FLIGHT,
-        EgfxCodecPolicy::Auto,
-    ));
-    shared.set_surface_size(64, 64);
-    let (event_tx, _event_rx) = mpsc::unbounded_channel();
-    let mut factory = HyprGfxFactory::new(Arc::clone(&shared));
-    ironrdp_server::ServerEventSender::set_sender(&mut factory, event_tx);
-    let (mut bridge, _handle) =
-        ironrdp_server::GfxServerFactory::build_server_with_handle(&factory)
-            .expect("EGFX server builds");
-    bridge.start(TEST_CHANNEL_ID).expect("channel starts");
+    let mut session = unnegotiated_egfx_session(64, 64, EgfxCodecPolicy::Auto);
+    session
+        .bridge
+        .start(TEST_CHANNEL_ID)
+        .expect("channel starts");
 
     let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
         ironrdp_egfx::pdu::CapabilitySet::V8_1 {
@@ -1288,12 +1146,13 @@ fn auto_policy_uses_v10_avc444_when_v81_lacks_avc420_flag() {
     ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
 
-    let _ = bridge
+    let _ = session
+        .bridge
         .process(TEST_CHANNEL_ID, &caps)
         .expect("capabilities process");
 
-    assert!(shared.is_avc_enabled());
-    assert!(shared.is_avc444_enabled());
+    assert!(session.shared.is_avc_enabled());
+    assert!(session.shared.is_avc444_enabled());
 }
 
 #[test]

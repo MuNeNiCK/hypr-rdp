@@ -120,6 +120,12 @@ fn parse_bind_addr(bind: &str) -> Result<SocketAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    use ironrdp_server::{ConnectionHandler, PostConnectionAction, RdpServer, ServerEvent};
+    use tokio::net::TcpStream;
+    use tokio::sync::mpsc;
+    use tokio::sync::oneshot;
 
     #[test]
     fn empty_username_and_password_disable_authentication() {
@@ -147,5 +153,97 @@ mod tests {
         let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
 
         assert!(format!("{error:#}").contains("invalid bind address"));
+    }
+
+    #[tokio::test]
+    async fn server_lifecycle_quit_exits_after_ephemeral_bind() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .build();
+        let event_sender = server.event_sender().clone();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let server_task = tokio::task::spawn_local(async move { server.run().await });
+                let bound_addr = wait_for_local_addr(&event_sender).await;
+                assert_eq!(bound_addr.ip().to_string(), "127.0.0.1");
+                assert_ne!(bound_addr.port(), 0);
+
+                event_sender
+                    .send(ServerEvent::Quit("test quit".into()))
+                    .expect("server event receiver");
+
+                tokio::time::timeout(Duration::from_secs(1), server_task)
+                    .await
+                    .expect("server quit must be bounded")
+                    .expect("server task must not panic")
+                    .expect("server run must succeed");
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn server_lifecycle_client_abort_returns_to_disconnect_handler() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_connection_handler(Some(Box::new(StopAfterDisconnect)))
+            .build();
+        let event_sender = server.event_sender().clone();
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let server_task = tokio::task::spawn_local(async move { server.run().await });
+                let bound_addr = wait_for_local_addr(&event_sender).await;
+                let stream = TcpStream::connect(bound_addr)
+                    .await
+                    .expect("connect to server");
+                drop(stream);
+
+                tokio::time::timeout(Duration::from_secs(1), server_task)
+                    .await
+                    .expect("client abort must be bounded")
+                    .expect("server task must not panic")
+                    .expect("server run must succeed");
+            })
+            .await;
+    }
+
+    struct StopAfterDisconnect;
+
+    impl ConnectionHandler for StopAfterDisconnect {
+        fn on_disconnected(
+            &mut self,
+            _peer: std::net::SocketAddr,
+            _duration: Duration,
+            error: Option<&anyhow::Error>,
+        ) -> PostConnectionAction {
+            assert!(error.is_some(), "raw client abort should end with an error");
+            PostConnectionAction::Stop
+        }
+    }
+
+    async fn wait_for_local_addr(
+        event_sender: &mpsc::UnboundedSender<ServerEvent>,
+    ) -> std::net::SocketAddr {
+        for _ in 0..100 {
+            let (tx, rx) = oneshot::channel();
+            event_sender
+                .send(ServerEvent::GetLocalAddr(tx))
+                .expect("server event receiver");
+            if let Some(addr) = rx.await.expect("local addr response") {
+                return addr;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        panic!("server did not publish local address");
     }
 }

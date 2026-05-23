@@ -192,11 +192,7 @@ impl RuntimeConfig {
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
-        let capture_mode = match capture_mode_str.as_str() {
-            "ext" => CaptureMode::Ext,
-            "wlr" => CaptureMode::Wlr,
-            other => anyhow::bail!("unknown capture mode '{}', expected 'ext' or 'wlr'", other),
-        };
+        let capture_mode = parse_capture_mode(&capture_mode_str)?;
 
         if quality > 51 {
             anyhow::bail!("quality must be 0-51");
@@ -233,6 +229,14 @@ fn parse_rate_control(s: &str) -> anyhow::Result<H264RateControl> {
         "vbr" => Ok(H264RateControl::Vbr),
         "cqp" => Ok(H264RateControl::Cqp),
         other => anyhow::bail!("unknown rate control '{}', expected 'vbr' or 'cqp'", other),
+    }
+}
+
+fn parse_capture_mode(s: &str) -> anyhow::Result<CaptureMode> {
+    match s {
+        "ext" => Ok(CaptureMode::Ext),
+        "wlr" => Ok(CaptureMode::Wlr),
+        other => anyhow::bail!("unknown capture mode '{}', expected 'ext' or 'wlr'", other),
     }
 }
 
@@ -277,6 +281,7 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn parses_egfx_codec_policy_values() {
@@ -293,5 +298,84 @@ mod tests {
             EgfxCodecPolicy::Avc444
         );
         assert!(parse_egfx_codec_policy("h264").is_err());
+    }
+
+    #[test]
+    fn parses_capture_mode_values() {
+        assert_eq!(parse_capture_mode("wlr").unwrap(), CaptureMode::Wlr);
+        assert_eq!(parse_capture_mode("ext").unwrap(), CaptureMode::Ext);
+        assert!(parse_capture_mode("invalid").is_err());
+    }
+
+    #[test]
+    fn cli_accepts_capture_mode_values() {
+        let wlr = Args::try_parse_from(["hypr-rdp", "--capture-mode", "wlr"]).unwrap();
+        assert_eq!(wlr.capture_mode.as_deref(), Some("wlr"));
+
+        let ext = Args::try_parse_from(["hypr-rdp", "--capture-mode", "ext"]).unwrap();
+        assert_eq!(ext.capture_mode.as_deref(), Some("ext"));
+    }
+
+    proptest! {
+        #[test]
+        fn generated_resolution_parser_rounds_even_dimensions_or_rejects_too_small(
+            width in 0u32..=u16::MAX as u32,
+            height in 0u32..=u16::MAX as u32,
+        ) {
+            let parsed = parse_resolution(&format!("{width}x{height}"));
+            let expected_width = width & !1;
+            let expected_height = height & !1;
+
+            if expected_width >= 2 && expected_height >= 2 {
+                prop_assert_eq!(parsed.unwrap(), (expected_width, expected_height));
+            } else {
+                prop_assert!(parsed.is_err());
+            }
+        }
+
+        #[test]
+        fn generated_resolution_parser_rejects_dimensions_above_wire_limit(
+            wide in (u16::MAX as u32 + 1)..=u32::MAX,
+            high in (u16::MAX as u32 + 1)..=u32::MAX,
+            valid in 2u32..=u16::MAX as u32,
+        ) {
+            let wide_resolution = format!("{wide}x{valid}");
+            let high_resolution = format!("{valid}x{high}");
+
+            prop_assert!(parse_resolution(&wide_resolution).is_err());
+            prop_assert!(parse_resolution(&high_resolution).is_err());
+        }
+
+        #[test]
+        fn generated_policy_parsers_accept_only_documented_exact_tokens(
+            token in "[a-z0-9_-]{0,16}"
+        ) {
+            match token.as_str() {
+                "auto" | "avc420" | "avc444" => {
+                    prop_assert!(parse_egfx_codec_policy(&token).is_ok());
+                }
+                _ => {
+                    prop_assert!(parse_egfx_codec_policy(&token).is_err());
+                }
+            }
+
+            match token.as_str() {
+                "wlr" | "ext" => {
+                    prop_assert!(parse_capture_mode(&token).is_ok());
+                }
+                _ => {
+                    prop_assert!(parse_capture_mode(&token).is_err());
+                }
+            }
+
+            match token.as_str() {
+                "vbr" | "cqp" => {
+                    prop_assert!(parse_rate_control(&token).is_ok());
+                }
+                _ => {
+                    prop_assert!(parse_rate_control(&token).is_err());
+                }
+            }
+        }
     }
 }

@@ -17,3 +17,21 @@ pub(super) fn advertised_format() -> AudioFormat {
         data: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_audio_format_is_single_pcm_s16le_stereo_stream() {
+        let format = advertised_format();
+
+        assert_eq!(format.format, WaveFormat::PCM);
+        assert_eq!(format.n_channels, CHANNELS);
+        assert_eq!(format.n_samples_per_sec, SAMPLE_RATE);
+        assert_eq!(format.n_avg_bytes_per_sec, SAMPLE_RATE * BLOCK_ALIGN as u32);
+        assert_eq!(format.n_block_align, BLOCK_ALIGN);
+        assert_eq!(format.bits_per_sample, BITS_PER_SAMPLE);
+        assert!(format.data.is_none());
+    }
+}

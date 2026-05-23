@@ -345,6 +345,7 @@ impl HyprCliprdrBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::io::Cursor;
 
     const ONE_BY_ONE_RGBA_PNG: &[u8] = &[
@@ -391,6 +392,18 @@ mod tests {
         assert_eq!(info.bit_depth, png::BitDepth::Eight);
         buffer.truncate(info.buffer_size());
         (info.width, info.height, info.color_type, buffer)
+    }
+
+    fn rgba_png_pixel(pixel: [u8; 4]) -> Vec<u8> {
+        let mut png_data = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png_data, 1, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("PNG header");
+            writer.write_image_data(&pixel).expect("PNG pixel");
+        }
+        png_data
     }
 
     fn assert_pending_image_pixel(
@@ -624,6 +637,35 @@ mod tests {
     }
 
     #[test]
+    fn format_data_response_preserves_dibv5_transparent_alpha_for_wayland() {
+        let (mut backend, _event_rx) = backend_with_events();
+        backend.last_requested_format = Some(ClipboardFormatId::CF_DIBV5);
+        let png = rgba_png_pixel([17, 34, 51, 127]);
+        let dibv5 =
+            ironrdp_cliprdr_format::bitmap::png_to_cf_dibv5(&png).expect("PNG converts to DIBV5");
+
+        backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
+
+        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
+        assert_eq!(backend.last_requested_format, None);
+        assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[17, 34, 51, 127]);
+    }
+
+    #[test]
+    fn format_data_response_writes_dib_alpha_as_rgb_for_wayland() {
+        let (mut backend, _event_rx) = backend_with_events();
+        backend.last_requested_format = Some(ClipboardFormatId::CF_DIB);
+        let png = rgba_png_pixel([17, 34, 51, 127]);
+        let dib = ironrdp_cliprdr_format::bitmap::png_to_cf_dib(&png).expect("PNG converts to DIB");
+
+        backend.on_format_data_response(FormatDataResponse::new_data(&dib));
+
+        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
+        assert_eq!(backend.last_requested_format, None);
+        assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[17, 34, 51]);
+    }
+
+    #[test]
     fn format_data_response_repairs_bitfields_dib_before_png_conversion() {
         let (mut backend, _event_rx) = backend_with_events();
         backend.last_requested_format = Some(ClipboardFormatId::CF_DIB);
@@ -646,5 +688,28 @@ mod tests {
         assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert!(backend.pending_write.lock().unwrap().is_none());
+    }
+
+    proptest! {
+        #[test]
+        fn generated_clipboard_image_responses_do_not_panic_or_write_invalid_png(
+            data in proptest::collection::vec(any::<u8>(), 0..256),
+            use_dibv5 in any::<bool>(),
+        ) {
+            let (mut backend, _event_rx) = backend_with_events();
+            backend.last_requested_format = Some(if use_dibv5 {
+                ClipboardFormatId::CF_DIBV5
+            } else {
+                ClipboardFormatId::CF_DIB
+            });
+
+            backend.handle_format_data_response(FormatDataResponse::new_data(&data), 256);
+
+            if let Some(PendingWrite::Image(png_data)) = backend.pending_write.lock().unwrap().as_ref() {
+                let _ = decode_png(png_data);
+                prop_assert!(backend.suppress_watcher.load(Ordering::SeqCst));
+            }
+            prop_assert_eq!(backend.last_requested_format, None);
+        }
     }
 }

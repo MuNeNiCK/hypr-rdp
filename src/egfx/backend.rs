@@ -18,6 +18,10 @@ pub enum H264RateControl {
 pub enum FrameEncoder {
     #[cfg(feature = "vaapi")]
     Vaapi(Box<vaapi::VaapiEncoder>),
+    #[cfg(test)]
+    FailingVaapiForTest {
+        force_idr_requests: u32,
+    },
     Software(Box<encoder::H264Encoder>),
     SoftwareAvc444(Box<encoder::Avc444Encoder>),
 }
@@ -34,7 +38,7 @@ impl FrameEncoder {
     ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
         {
-            match vaapi::VaapiEncoder::new(width, height, bitrate, fps) {
+            match vaapi::VaapiEncoder::new(width, height, bitrate, fps, quality, rate_control) {
                 Ok(enc) => {
                     tracing::info!("Using VA-API hardware encoder");
                     return Ok(Self::Vaapi(Box::new(enc)));
@@ -54,6 +58,8 @@ impl FrameEncoder {
         match self {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(enc) => enc.encode(bgra, stride),
+            #[cfg(test)]
+            Self::FailingVaapiForTest { .. } => anyhow::bail!("test VA-API encode failure"),
             Self::Software(enc) => enc.encode(bgra, stride),
             Self::SoftwareAvc444(_) => anyhow::bail!("AVC444 encoder requires encode_avc444"),
         }
@@ -69,6 +75,10 @@ impl FrameEncoder {
             Self::SoftwareAvc444(enc) => enc.encode(bgra, stride, candidate_regions),
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => anyhow::bail!("AVC444 encoding requires software encoder"),
+            #[cfg(test)]
+            Self::FailingVaapiForTest { .. } => {
+                anyhow::bail!("AVC444 encoding requires software encoder")
+            }
             Self::Software(_) => anyhow::bail!("AVC444 encoding requires AVC444 encoder"),
         }
     }
@@ -85,6 +95,7 @@ impl FrameEncoder {
             Self::SoftwareAvc444(enc) => enc.luma_reference_y_for_test(),
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) | Self::Software(_) => None,
+            Self::FailingVaapiForTest { .. } => None,
             #[cfg(not(feature = "vaapi"))]
             Self::Software(_) => None,
         }
@@ -98,6 +109,7 @@ impl FrameEncoder {
             Self::SoftwareAvc444(enc) => Some(enc.last_reference_regions_for_test()),
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) | Self::Software(_) => None,
+            Self::FailingVaapiForTest { .. } => None,
             #[cfg(not(feature = "vaapi"))]
             Self::Software(_) => None,
         }
@@ -121,7 +133,10 @@ impl FrameEncoder {
             Self::Vaapi(enc) => enc.encode_dmabuf(
                 nv12_fd, width, height, stride, offset, modifier, uv_stride, uv_offset,
             ),
+            #[cfg(test)]
+            Self::FailingVaapiForTest { .. } => anyhow::bail!("test VA-API DMA-BUF failure"),
             Self::Software(_) => anyhow::bail!("DMA-BUF encode requires VA-API backend"),
+            Self::SoftwareAvc444(_) => anyhow::bail!("DMA-BUF encode requires VA-API backend"),
         }
     }
 
@@ -129,8 +144,10 @@ impl FrameEncoder {
         match self {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => "vaapi",
+            #[cfg(test)]
+            Self::FailingVaapiForTest { .. } => "vaapi-test-failing",
             Self::Software(_) => "openh264",
-            Self::SoftwareAvc444(_) => "openh264-avc444",
+            Self::SoftwareAvc444(enc) => enc.backend_name(),
         }
     }
 
@@ -138,8 +155,10 @@ impl FrameEncoder {
         match self {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => true,
+            #[cfg(test)]
+            Self::FailingVaapiForTest { .. } => true,
             Self::Software(_) => false,
-            Self::SoftwareAvc444(_) => false,
+            Self::SoftwareAvc444(enc) => enc.is_vaapi(),
         }
     }
 
@@ -157,6 +176,42 @@ impl FrameEncoder {
         Ok(Self::Software(Box::new(enc)))
     }
 
+    pub fn new_avc444(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
+        #[cfg(feature = "vaapi")]
+        {
+            match encoder::Avc444Encoder::new_with_vaapi(
+                width,
+                height,
+                bitrate,
+                fps,
+                quality,
+                rate_control,
+            ) {
+                Ok(enc) => {
+                    tracing::info!("Using VA-API hardware AVC444 encoder");
+                    return Ok(Self::SoftwareAvc444(Box::new(enc)));
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "VA-API AVC444 init failed, falling back to software: {:#}",
+                        e
+                    );
+                }
+            }
+        }
+
+        let enc = encoder::Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
+        tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
+        Ok(Self::SoftwareAvc444(Box::new(enc)))
+    }
+
     pub fn new_avc444_software_only(
         width: u32,
         height: u32,
@@ -166,8 +221,15 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         let enc = encoder::Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using OpenH264 software AVC444 encoder");
+        tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
         Ok(Self::SoftwareAvc444(Box::new(enc)))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failing_vaapi_for_test() -> Self {
+        Self::FailingVaapiForTest {
+            force_idr_requests: 0,
+        }
     }
 
     /// Force the next encoded frame to be an IDR (recovery after dropped frames).
@@ -175,6 +237,10 @@ impl FrameEncoder {
         match self {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(enc) => enc.force_idr(),
+            #[cfg(test)]
+            Self::FailingVaapiForTest { force_idr_requests } => {
+                *force_idr_requests = force_idr_requests.saturating_add(1);
+            }
             Self::Software(enc) => enc.force_idr(),
             Self::SoftwareAvc444(enc) => enc.force_idr(),
         }
@@ -185,8 +251,24 @@ impl FrameEncoder {
         match self {
             #[cfg(feature = "vaapi")]
             Self::Vaapi(_) => None,
+            Self::FailingVaapiForTest { force_idr_requests } => Some(*force_idr_requests),
             Self::Software(enc) => Some(enc.force_idr_requests_for_test()),
             Self::SoftwareAvc444(enc) => Some(enc.force_idr_requests_for_test()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avc444_software_backend_reports_ffmpeg_and_not_vaapi() {
+        let encoder =
+            FrameEncoder::new_avc444_software_only(64, 64, 1_000_000, 30, 23, H264RateControl::Cqp)
+                .expect("software AVC444 encoder initializes");
+
+        assert_eq!(encoder.backend_name(), "ffmpeg-avc444");
+        assert!(!encoder.is_vaapi());
     }
 }

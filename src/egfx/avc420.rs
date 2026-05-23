@@ -262,6 +262,7 @@ pub(crate) fn damage_regions_to_avc420(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn avc420_damage_regions_are_clamped_and_exclusive() {
@@ -354,5 +355,29 @@ mod tests {
             ),
             (30, 2, 34, 8)
         );
+    }
+
+    proptest! {
+        #[test]
+        fn generated_avc420_damage_regions_stay_inside_exclusive_bounds(
+            damage_regions in proptest::collection::vec(
+                (any::<i32>(), any::<i32>(), any::<i32>(), any::<i32>()),
+                0..32
+            ),
+            width in 1u16..=4096,
+            height in 1u16..=4096,
+            qp in any::<u8>(),
+        ) {
+            let regions = damage_regions_to_avc420(&damage_regions, width, height, qp);
+
+            for region in regions {
+                prop_assert!(region.left < region.right);
+                prop_assert!(region.top < region.bottom);
+                prop_assert!(region.right <= width);
+                prop_assert!(region.bottom <= height);
+                prop_assert_eq!(region.quantization_parameter, qp);
+                prop_assert_eq!(region.quality, avc420_region_quality(qp));
+            }
+        }
     }
 }

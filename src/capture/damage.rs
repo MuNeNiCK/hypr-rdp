@@ -279,6 +279,7 @@ pub(super) fn damage_area_pixels(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn damage_region_clamp_handles_extreme_coordinates_without_overflow() {
@@ -535,5 +536,42 @@ mod tests {
         );
 
         assert_eq!(regions, vec![(128, 0, 64, 64)]);
+    }
+
+    proptest! {
+        #[test]
+        fn generated_damage_clamp_stays_inside_frame(
+            x in any::<i32>(),
+            y in any::<i32>(),
+            w in any::<i32>(),
+            h in any::<i32>(),
+            width in 0u32..4096,
+            height in 0u32..4096,
+        ) {
+            if let Some((left, top, region_w, region_h)) =
+                clamp_damage_region(x, y, w, h, width, height)
+            {
+                prop_assert!(left >= 0);
+                prop_assert!(top >= 0);
+                prop_assert!(region_w > 0);
+                prop_assert!(region_h > 0);
+                prop_assert!((left as i64 + region_w as i64) <= width as i64);
+                prop_assert!((top as i64 + region_h as i64) <= height as i64);
+            }
+        }
+
+        #[test]
+        fn generated_damage_area_is_bounded_by_clamped_regions(
+            regions in proptest::collection::vec(
+                (any::<i32>(), any::<i32>(), any::<i32>(), any::<i32>()),
+                0..32
+            ),
+            width in 0u32..4096,
+            height in 0u32..4096,
+        ) {
+            let area = damage_area_pixels(&regions, width, height);
+            let max_region_area = width as u64 * height as u64;
+            prop_assert!(area <= max_region_area.saturating_mul(regions.len() as u64));
+        }
     }
 }

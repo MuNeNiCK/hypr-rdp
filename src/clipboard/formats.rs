@@ -53,6 +53,7 @@ pub(super) fn utf16le_to_utf8(data: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn utf16le(units: &[u16]) -> Vec<u8> {
         units.iter().flat_map(|u| u.to_le_bytes()).collect()
@@ -121,5 +122,74 @@ mod tests {
         not_bitfields[14..16].copy_from_slice(&32u16.to_le_bytes());
         not_bitfields[16..20].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(fix_bitfields_dib(&not_bitfields), None);
+    }
+
+    proptest! {
+        #[test]
+        fn generated_utf16le_conversion_stops_at_first_nul(
+            before in proptest::collection::vec(1u16..=0xd7ff, 0..32),
+            after in proptest::collection::vec(any::<u16>(), 0..32),
+            trailing_odd_byte in proptest::option::of(any::<u8>()),
+        ) {
+            let mut data = utf16le(&before);
+            data.extend_from_slice(&0u16.to_le_bytes());
+            data.extend_from_slice(&utf16le(&after));
+            if let Some(byte) = trailing_odd_byte {
+                data.push(byte);
+            }
+
+            let expected = String::from_utf16_lossy(&before);
+
+            prop_assert_eq!(utf16le_to_utf8(&data), expected);
+        }
+
+        #[test]
+        fn generated_bitfields_dib_rewrite_preserves_header_and_payload(
+            width in any::<u32>(),
+            height in any::<u32>(),
+            planes in any::<u16>(),
+            image_size in any::<u32>(),
+            masks in (any::<u32>(), any::<u32>(), any::<u32>()),
+            payload in proptest::collection::vec(any::<u8>(), 0..256),
+        ) {
+            let mut dib = vec![0; 40];
+            dib[0..4].copy_from_slice(&40u32.to_le_bytes());
+            dib[4..8].copy_from_slice(&width.to_le_bytes());
+            dib[8..12].copy_from_slice(&height.to_le_bytes());
+            dib[12..14].copy_from_slice(&planes.to_le_bytes());
+            dib[14..16].copy_from_slice(&32u16.to_le_bytes());
+            dib[16..20].copy_from_slice(&3u32.to_le_bytes());
+            dib[20..24].copy_from_slice(&image_size.to_le_bytes());
+            dib.extend_from_slice(&masks.0.to_le_bytes());
+            dib.extend_from_slice(&masks.1.to_le_bytes());
+            dib.extend_from_slice(&masks.2.to_le_bytes());
+            dib.extend_from_slice(&payload);
+
+            let fixed = fix_bitfields_dib(&dib).expect("generated BITFIELDS DIB is fixable");
+
+            prop_assert_eq!(fixed.len(), dib.len() - 12);
+            prop_assert_eq!(&fixed[0..16], &dib[0..16]);
+            prop_assert_eq!(&fixed[16..20], &0u32.to_le_bytes());
+            prop_assert_eq!(&fixed[20..40], &dib[20..40]);
+            prop_assert_eq!(&fixed[40..], payload.as_slice());
+        }
+
+        #[test]
+        fn generated_non_bitfields_dib_headers_are_not_rewritten(
+            header_size in any::<u32>(),
+            bit_count in any::<u16>(),
+            compression in any::<u32>(),
+            payload in proptest::collection::vec(any::<u8>(), 12..256),
+        ) {
+            prop_assume!(header_size != 40 || bit_count != 32 || compression != 3);
+
+            let mut dib = vec![0; 40];
+            dib[0..4].copy_from_slice(&header_size.to_le_bytes());
+            dib[14..16].copy_from_slice(&bit_count.to_le_bytes());
+            dib[16..20].copy_from_slice(&compression.to_le_bytes());
+            dib.extend_from_slice(&payload);
+
+            prop_assert!(fix_bitfields_dib(&dib).is_none());
+        }
     }
 }

@@ -8,6 +8,8 @@ use wayland_client::protocol::{wl_output, wl_shm};
 use wayland_client::{Connection, QueueHandle};
 use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1;
 
+#[cfg(feature = "vaapi")]
+use super::dmabuf_capture;
 use super::state::AppState;
 use super::{create_shm_fd, poll_dispatch, CaptureInfo, MmapRegion, POLL_TIMEOUT_MS};
 use crate::capture::frame::{FramePacer, FrameProcessor};
@@ -233,7 +235,8 @@ pub(super) fn capture_loop_ext(
         proc.queue_damage(&completed_damage_regions);
 
         let data = mmaps[completed_idx].as_slice();
-        proc.stats.record_capture(width, height);
+        proc.stats
+            .record_capture(width, height, completed_damage_regions.len(), false);
 
         // Always enforce frame rate limit. Without this, compositor animations
         // (window open, cursor blink) flood the client with 60fps H.264 frames,
@@ -242,8 +245,12 @@ pub(super) fn capture_loop_ext(
         let has_pending_damage = proc.has_pending_damage();
         if !has_pending_damage && proc.sent_first_frame {
             proc.stats.record_no_damage_skip(width, height);
-        } else if frame_pacer.should_send(Instant::now(), proc.sent_first_frame, has_pending_damage)
-        {
+        } else if frame_pacer.should_send(
+            Instant::now(),
+            proc.sent_first_frame,
+            has_pending_damage,
+            proc.pacing_fps(),
+        ) {
             if !proc.process(data, &state.tx) {
                 break;
             }

@@ -1,24 +1,27 @@
 //! VA-API H.264 hardware encoder for Intel/AMD GPUs.
 //!
-//! Uses cros-libva for GPU-accelerated H.264 encoding. Surfaces are pooled
-//! for triple-buffering, and a separate reconstructed surface pool enables
-//! true inter-frame prediction via DPB tracking.
+//! Uses VA-API for GPU-accelerated H.264 encoding. Surfaces are pooled for
+//! triple-buffering, and a separate reconstructed surface pool enables true
+//! inter-frame prediction via DPB tracking.
 //!
 //! Thread Safety: NOT Send — VA-API is thread-local. Create and use on the
 //! same thread (the capture thread satisfies this).
 
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
-use cros_libva::{
-    self as libva, BufferType, Context as VaContext, Display, EncCodedBuffer, EncMiscParameter,
-    EncMiscParameterFrameRate, EncMiscParameterHRD, EncMiscParameterRateControl,
-    EncPictureParameter, EncSequenceParameter, EncSliceParameter, MappedCodedBuffer, Picture,
-    RcFlags, Surface, UsageHint, VAEntrypoint, VAImageFormat, VAProfile, VA_INVALID_ID,
-    VA_INVALID_SURFACE, VA_PICTURE_H264_INVALID, VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-    VA_RT_FORMAT_YUV420,
+use libva_sys::va_display_drm as va;
+use openh264::encoder::FrameType;
+
+use super::h264::{annex_b_nal_types, EncodedH264};
+use super::vaapi_sys::{
+    self as sys, VAConfigAttrib, VADRMPRIMESurfaceDescriptor, VAImageFormat, VAProfile, VaBuffer,
+    VaConfig, VaContext, VaDisplay, VaImageMapping, VaSurface, VA_INVALID_ID, VA_INVALID_SURFACE,
+    VA_PICTURE_H264_INVALID, VA_PICTURE_H264_SHORT_TERM_REFERENCE, VA_RT_FORMAT_YUV420,
 };
+use super::H264RateControl;
 
 const INPUT_SURFACE_POOL_SIZE: usize = 3;
 const RECON_SURFACE_POOL_SIZE: usize = 2;
@@ -49,7 +52,7 @@ fn find_vaapi_device() -> Result<PathBuf> {
     }
 
     for device in &devices {
-        let display = match Display::open_drm_display(device) {
+        let display = match VaDisplay::open_drm(device) {
             Ok(d) => d,
             Err(e) => {
                 tracing::trace!(device = %device.display(), "Skipping VA-API device: {:?}", e);
@@ -62,10 +65,10 @@ fn find_vaapi_device() -> Result<PathBuf> {
             Err(_) => continue,
         };
 
-        let h264_profile = if profiles.contains(&VAProfile::VAProfileH264High) {
-            VAProfile::VAProfileH264High
-        } else if profiles.contains(&VAProfile::VAProfileH264Main) {
-            VAProfile::VAProfileH264Main
+        let h264_profile = if profiles.contains(&sys::VA_PROFILE_H264_HIGH) {
+            sys::VA_PROFILE_H264_HIGH
+        } else if profiles.contains(&sys::VA_PROFILE_H264_MAIN) {
+            sys::VA_PROFILE_H264_MAIN
         } else {
             continue;
         };
@@ -75,7 +78,7 @@ fn find_vaapi_device() -> Result<PathBuf> {
             Err(_) => continue,
         };
 
-        if entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice) {
+        if entrypoints.contains(&sys::VA_ENTRYPOINT_ENC_SLICE) {
             let vendor = display
                 .query_vendor_string()
                 .unwrap_or_else(|_| "unknown".into());
@@ -102,44 +105,79 @@ struct DpbEntry {
     poc: i32,
 }
 
-/// Descriptor for importing a NV12 DMA-BUF as a VA surface.
-pub struct DmaBufSurfaceImport {
-    desc: libva::VADRMPRIMESurfaceDescriptor,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct VaapiRateControlPolicy {
+    config_mode: u32,
+    pic_init_qp: u8,
+    bits_per_second: u32,
+    target_percentage: u32,
+    initial_qp: u32,
+    min_qp: u32,
+    max_qp: u32,
 }
 
-impl libva::ExternalBufferDescriptor for DmaBufSurfaceImport {
-    const MEMORY_TYPE: libva::MemoryType = libva::MemoryType::DrmPrime2;
-    type DescriptorAttribute = libva::VADRMPRIMESurfaceDescriptor;
-    fn va_surface_attribute(&mut self) -> libva::VADRMPRIMESurfaceDescriptor {
-        self.desc
+fn vaapi_rate_control_policy(
+    bitrate: u32,
+    quality: u8,
+    rate_control: H264RateControl,
+) -> VaapiRateControlPolicy {
+    let qp = quality.min(51);
+    match rate_control {
+        H264RateControl::Vbr => VaapiRateControlPolicy {
+            config_mode: sys::VA_RC_VBR,
+            pic_init_qp: qp,
+            bits_per_second: bitrate,
+            target_percentage: 66,
+            initial_qp: qp.into(),
+            min_qp: 0,
+            max_qp: u32::from(qp.max(1)),
+        },
+        H264RateControl::Cqp => VaapiRateControlPolicy {
+            config_mode: sys::VA_RC_CQP,
+            pic_init_qp: qp,
+            bits_per_second: 0,
+            target_percentage: 100,
+            initial_qp: qp.into(),
+            min_qp: qp.into(),
+            max_qp: qp.into(),
+        },
     }
 }
 
 pub struct VaapiEncoder {
-    #[allow(dead_code)]
-    display: Rc<Display>,
-    context: Rc<VaContext>,
-    input_surfaces: Vec<Surface<()>>,
-    recon_surfaces: Vec<Surface<()>>,
+    input_surfaces: Vec<VaSurface>,
+    recon_surfaces: Vec<VaSurface>,
+    coded_buffers: Vec<VaBuffer>,
+    dmabuf_input_surface: Option<VaSurface>,
+    context: VaContext,
+    _config: VaConfig,
+    display: Rc<VaDisplay>,
     current_input_surface: usize,
     current_recon_surface: usize,
-    coded_buffers: Vec<EncCodedBuffer>,
     current_coded_buffer: usize,
     last_ref: Option<DpbEntry>,
     cached_sps_pps: Option<Vec<u8>>,
     width: u32,
     height: u32,
     bitrate: u32,
+    quality: u8,
+    rate_control: H264RateControl,
     fps: u32,
     frame_count: u64,
     force_idr: bool,
     nv12_format: VAImageFormat,
-    dmabuf_input_surface: Option<Surface<DmaBufSurfaceImport>>,
-    profile: VAProfile::Type,
+    profile: VAProfile,
 }
 
 impl VaapiEncoder {
-    pub fn new(width: u32, height: u32, bitrate: u32, fps: u32) -> Result<Self> {
+    pub fn new(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
         }
@@ -153,7 +191,7 @@ impl VaapiEncoder {
             device_path.display()
         );
 
-        let display = Display::open_drm_display(&device_path)
+        let display = VaDisplay::open_drm(&device_path)
             .map_err(|e| anyhow::anyhow!("Failed to open VA display: {:?}", e))?;
 
         let driver = display
@@ -165,10 +203,10 @@ impl VaapiEncoder {
             .query_config_profiles()
             .map_err(|e| anyhow::anyhow!("Failed to query profiles: {}", e))?;
 
-        let h264_profile = if profiles.contains(&VAProfile::VAProfileH264High) {
-            VAProfile::VAProfileH264High
-        } else if profiles.contains(&VAProfile::VAProfileH264Main) {
-            VAProfile::VAProfileH264Main
+        let h264_profile = if profiles.contains(&sys::VA_PROFILE_H264_HIGH) {
+            sys::VA_PROFILE_H264_HIGH
+        } else if profiles.contains(&sys::VA_PROFILE_H264_MAIN) {
+            sys::VA_PROFILE_H264_MAIN
         } else {
             bail!("H.264 encode not supported by VA-API driver");
         };
@@ -177,38 +215,49 @@ impl VaapiEncoder {
             .query_config_entrypoints(h264_profile)
             .map_err(|e| anyhow::anyhow!("Failed to query entrypoints: {}", e))?;
 
-        if !entrypoints.contains(&VAEntrypoint::VAEntrypointEncSlice) {
+        if !entrypoints.contains(&sys::VA_ENTRYPOINT_ENC_SLICE) {
             bail!("H.264 encode entrypoint not supported");
         }
 
+        let rc_policy = vaapi_rate_control_policy(bitrate, quality, rate_control);
+        let config_attribs = [
+            VAConfigAttrib {
+                type_: sys::VA_CONFIG_ATTRIB_RT_FORMAT,
+                value: VA_RT_FORMAT_YUV420,
+            },
+            VAConfigAttrib {
+                type_: sys::VA_CONFIG_ATTRIB_RATE_CONTROL,
+                value: rc_policy.config_mode,
+            },
+        ];
         let config = display
-            .create_config(vec![], h264_profile, VAEntrypoint::VAEntrypointEncSlice)
+            .create_config(h264_profile, sys::VA_ENTRYPOINT_ENC_SLICE, &config_attribs)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
         let input_surfaces = display
             .create_surfaces(
                 VA_RT_FORMAT_YUV420,
-                Some(u32::from_ne_bytes(*b"NV12")),
+                Some(sys::fourcc(b"NV12")),
                 width,
                 height,
-                Some(UsageHint::USAGE_HINT_ENCODER),
-                vec![(); INPUT_SURFACE_POOL_SIZE],
+                Some(va::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER),
+                INPUT_SURFACE_POOL_SIZE,
             )
             .map_err(|e| anyhow::anyhow!("Failed to create input surfaces: {}", e))?;
 
         let recon_surfaces = display
             .create_surfaces(
                 VA_RT_FORMAT_YUV420,
-                Some(u32::from_ne_bytes(*b"NV12")),
+                Some(sys::fourcc(b"NV12")),
                 width,
                 height,
-                Some(UsageHint::USAGE_HINT_ENCODER),
-                vec![(); RECON_SURFACE_POOL_SIZE],
+                Some(va::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER),
+                RECON_SURFACE_POOL_SIZE,
             )
             .map_err(|e| anyhow::anyhow!("Failed to create recon surfaces: {}", e))?;
 
         let context = display
-            .create_context(&config, width, height, None::<&Vec<Surface<()>>>, true)
+            .create_context(&config, width, height, &mut [])
             .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
 
         let image_formats = display
@@ -217,7 +266,7 @@ impl VaapiEncoder {
 
         let nv12_format = image_formats
             .iter()
-            .find(|f| f.fourcc == u32::from_ne_bytes(*b"NV12"))
+            .find(|f| f.fourcc == sys::fourcc(b"NV12"))
             .copied()
             .ok_or_else(|| anyhow::anyhow!("NV12 format not supported"))?;
 
@@ -225,36 +274,41 @@ impl VaapiEncoder {
         let mut coded_buffers = Vec::with_capacity(CODED_BUFFER_COUNT);
         for i in 0..CODED_BUFFER_COUNT {
             let buf = context
-                .create_enc_coded(coded_buffer_size)
+                .create_coded_buffer(coded_buffer_size)
                 .map_err(|e| anyhow::anyhow!("Failed to create coded buffer {}: {}", i, e))?;
             coded_buffers.push(buf);
         }
 
         tracing::info!(
             profile = ?h264_profile,
+            rate_control = ?rate_control,
+            quality = quality,
             "VA-API encoder ready: {}x{}, {}kbps, IDR every {} frames",
             width, height, bitrate / 1000, IDR_INTERVAL,
         );
 
         Ok(Self {
-            display,
-            context,
             input_surfaces,
             recon_surfaces,
+            coded_buffers,
+            dmabuf_input_surface: None,
+            context,
+            _config: config,
+            display,
             current_input_surface: 0,
             current_recon_surface: 0,
-            coded_buffers,
             current_coded_buffer: 0,
             last_ref: None,
             cached_sps_pps: None,
             width,
             height,
             bitrate,
+            quality,
+            rate_control,
             fps,
             frame_count: 0,
             force_idr: true,
             nv12_format,
-            dmabuf_input_surface: None,
             profile: h264_profile,
         })
     }
@@ -279,11 +333,11 @@ impl VaapiEncoder {
         // Convert BGRA to NV12 and upload to surface via VA image,
         // using the image's actual pitches/offsets (not assuming stride == width).
         {
-            let mut image = libva::Image::create_from(
+            let mut image = VaImageMapping::create_from(
                 &self.input_surfaces[input_idx],
                 self.nv12_format,
-                (self.width, self.height),
-                (self.width, self.height),
+                self.width,
+                self.height,
             )
             .context("Failed to create VA image")?;
 
@@ -299,7 +353,7 @@ impl VaapiEncoder {
 
             Self::bgra_to_nv12(
                 bgra,
-                image.as_mut(),
+                image.data_mut(),
                 self.width as usize,
                 self.height as usize,
                 stride,
@@ -319,11 +373,7 @@ impl VaapiEncoder {
         // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
         let poc = ((self.frame_count * 2) % 256) as i32;
 
-        let mut picture = Picture::new(
-            self.frame_count,
-            Rc::clone(&self.context),
-            &self.input_surfaces[input_idx],
-        );
+        let mut picture_buffers = Vec::new();
 
         if is_idr {
             self.last_ref = None;
@@ -331,19 +381,15 @@ impl VaapiEncoder {
             let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
             let seq_buffer = self
                 .context
-                .create_buffer(BufferType::EncSequenceParameter(
-                    EncSequenceParameter::H264(seq_param),
-                ))
+                .create_buffer(
+                    va::VABufferType_VAEncSequenceParameterBufferType,
+                    seq_param,
+                    "vaCreateBuffer (H.264 sequence)",
+                )
                 .context("Failed to create seq buffer")?;
-            picture.add_buffer(seq_buffer);
+            picture_buffers.push(seq_buffer);
 
-            for rc_buf_type in self.build_rate_control_buffers() {
-                let buf = self
-                    .context
-                    .create_buffer(rc_buf_type)
-                    .context("Failed to create rate control buffer")?;
-                picture.add_buffer(buf);
-            }
+            picture_buffers.extend(self.create_rate_control_buffers()?);
         }
 
         let pic_param = self.build_picture_params(
@@ -355,34 +401,27 @@ impl VaapiEncoder {
         );
         let pic_buffer = self
             .context
-            .create_buffer(BufferType::EncPictureParameter(EncPictureParameter::H264(
+            .create_buffer(
+                va::VABufferType_VAEncPictureParameterBufferType,
                 pic_param,
-            )))
+                "vaCreateBuffer (H.264 picture)",
+            )
             .context("Failed to create pic buffer")?;
-        picture.add_buffer(pic_buffer);
+        picture_buffers.push(pic_buffer);
 
         let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
         let slice_buffer = self
             .context
-            .create_buffer(BufferType::EncSliceParameter(EncSliceParameter::H264(
+            .create_buffer(
+                va::VABufferType_VAEncSliceParameterBufferType,
                 slice_param,
-            )))
+                "vaCreateBuffer (H.264 slice)",
+            )
             .context("Failed to create slice buffer")?;
-        picture.add_buffer(slice_buffer);
+        picture_buffers.push(slice_buffer);
 
-        // Execute: begin → render → end → sync
-        let picture = picture
-            .begin()
-            .map_err(|e| anyhow::anyhow!("vaBeginPicture failed: {}", e))?;
-        let picture = picture
-            .render()
-            .map_err(|e| anyhow::anyhow!("vaRenderPicture failed: {}", e))?;
-        let picture = picture
-            .end()
-            .map_err(|e| anyhow::anyhow!("vaEndPicture failed: {}", e))?;
-        let _picture = picture
-            .sync()
-            .map_err(|(e, _)| anyhow::anyhow!("vaSyncSurface failed: {}", e))?;
+        self.context
+            .render_picture(self.input_surfaces[input_idx].id(), &picture_buffers)?;
 
         // Update DPB
         self.last_ref = Some(DpbEntry {
@@ -392,21 +431,15 @@ impl VaapiEncoder {
         });
 
         // Read encoded bitstream
-        let mapped = MappedCodedBuffer::new(&self.coded_buffers[coded_idx])
-            .map_err(|e| anyhow::anyhow!("Failed to map coded buffer: {}", e))?;
-
-        let mut data = Vec::new();
-        for segment in mapped.iter() {
-            data.extend_from_slice(segment.buf);
-        }
+        let mut data = self.coded_buffers[coded_idx].read_coded()?;
 
         // SPS/PPS handling: extract from IDR output or generate if missing
         if is_idr {
             if let Some(sps_pps) = super::extract_sps_pps(&data) {
                 self.cached_sps_pps = Some(sps_pps);
             } else {
-                // VA-API driver didn't include SPS/PPS — generate manually
-                tracing::trace!("VA-API IDR missing SPS/PPS, generating manually");
+                // VA-API driver did not include SPS/PPS; synthesize it here.
+                tracing::trace!("VA-API IDR missing SPS/PPS, synthesizing parameter sets");
                 let sps_pps = self.generate_sps_pps();
                 // Prepend to IDR frame
                 let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
@@ -430,6 +463,126 @@ impl VaapiEncoder {
         Ok(data)
     }
 
+    pub(super) fn encode_yuv420_raw(
+        &mut self,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<EncodedH264> {
+        let y_len = (self.width * self.height) as usize;
+        let uv_len = ((self.width / 2) * (self.height / 2)) as usize;
+        anyhow::ensure!(y.len() >= y_len, "Y plane too small");
+        anyhow::ensure!(u.len() >= uv_len, "U plane too small");
+        anyhow::ensure!(v.len() >= uv_len, "V plane too small");
+
+        let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
+
+        let input_idx = self.current_input_surface;
+        self.current_input_surface = (self.current_input_surface + 1) % self.input_surfaces.len();
+
+        let recon_idx = self.current_recon_surface;
+        self.current_recon_surface = (self.current_recon_surface + 1) % self.recon_surfaces.len();
+
+        let coded_idx = self.current_coded_buffer;
+        self.current_coded_buffer = (self.current_coded_buffer + 1) % self.coded_buffers.len();
+
+        self.upload_yuv420_to_surface(input_idx, y, u, v)
+            .context("Failed to upload YUV420 planes to VA-API surface")?;
+
+        let mb_width = self.width.div_ceil(16);
+        let mb_height = self.height.div_ceil(16);
+        let num_macroblocks = mb_width * mb_height;
+        let frame_num = (self.frame_count % 256) as u16;
+        let poc = ((self.frame_count * 2) % 256) as i32;
+
+        let mut picture_buffers = Vec::new();
+
+        if is_idr {
+            self.last_ref = None;
+
+            let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
+            let seq_buffer = self
+                .context
+                .create_buffer(
+                    va::VABufferType_VAEncSequenceParameterBufferType,
+                    seq_param,
+                    "vaCreateBuffer (H.264 sequence)",
+                )
+                .context("Failed to create seq buffer")?;
+            picture_buffers.push(seq_buffer);
+
+            picture_buffers.extend(self.create_rate_control_buffers()?);
+        }
+
+        let pic_param = self.build_picture_params(
+            self.recon_surfaces[recon_idx].id(),
+            self.coded_buffers[coded_idx].id(),
+            is_idr,
+            frame_num,
+            poc,
+        );
+        let pic_buffer = self
+            .context
+            .create_buffer(
+                va::VABufferType_VAEncPictureParameterBufferType,
+                pic_param,
+                "vaCreateBuffer (H.264 picture)",
+            )
+            .context("Failed to create pic buffer")?;
+        picture_buffers.push(pic_buffer);
+
+        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
+        let slice_buffer = self
+            .context
+            .create_buffer(
+                va::VABufferType_VAEncSliceParameterBufferType,
+                slice_param,
+                "vaCreateBuffer (H.264 slice)",
+            )
+            .context("Failed to create slice buffer")?;
+        picture_buffers.push(slice_buffer);
+
+        self.context
+            .render_picture(self.input_surfaces[input_idx].id(), &picture_buffers)?;
+
+        self.last_ref = Some(DpbEntry {
+            surface_id: self.recon_surfaces[recon_idx].id(),
+            frame_num,
+            poc,
+        });
+
+        let mut data = self.coded_buffers[coded_idx].read_coded()?;
+
+        if is_idr {
+            if let Some(sps_pps) = super::extract_sps_pps(&data) {
+                self.cached_sps_pps = Some(sps_pps);
+            } else {
+                tracing::trace!("VA-API IDR missing SPS/PPS, synthesizing parameter sets");
+                let sps_pps = self.generate_sps_pps();
+                let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
+                combined.extend_from_slice(&sps_pps);
+                combined.extend_from_slice(&data);
+                data = combined;
+                self.cached_sps_pps = Some(sps_pps);
+            }
+        }
+
+        if self.force_idr {
+            self.force_idr = false;
+        }
+        self.frame_count += 1;
+
+        let frame_type = if data.is_empty() {
+            FrameType::Skip
+        } else if annex_b_nal_types(&data).contains(&5) {
+            FrameType::IDR
+        } else {
+            FrameType::P
+        };
+
+        Ok(EncodedH264 { data, frame_type })
+    }
+
     /// Encode from an NV12 DMA-BUF (zero-copy path).
     ///
     /// Imports the NV12 DMA-BUF as an encoder input surface (cached after first call),
@@ -447,8 +600,8 @@ impl VaapiEncoder {
         uv_offset: u32,
     ) -> Result<Vec<u8>> {
         if self.dmabuf_input_surface.is_none() {
-            let mut desc: libva::VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
-            desc.fourcc = u32::from_ne_bytes(*b"NV12");
+            let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { mem::zeroed() };
+            desc.fourcc = sys::fourcc(b"NV12");
             desc.width = width;
             desc.height = height;
             desc.num_objects = 1;
@@ -458,34 +611,21 @@ impl VaapiEncoder {
             desc.objects[0].size = y_end.max(uv_end);
             desc.objects[0].drm_format_modifier = modifier;
             desc.num_layers = 2;
-            desc.layers[0].drm_format = u32::from_ne_bytes(*b"NV12");
+            desc.layers[0].drm_format = sys::fourcc(b"NV12");
             desc.layers[0].num_planes = 1;
             desc.layers[0].object_index[0] = 0;
             desc.layers[0].offset[0] = offset;
             desc.layers[0].pitch[0] = stride;
-            desc.layers[1].drm_format = u32::from_ne_bytes(*b"NV12");
+            desc.layers[1].drm_format = sys::fourcc(b"NV12");
             desc.layers[1].num_planes = 1;
             desc.layers[1].object_index[0] = 0;
             desc.layers[1].offset[0] = uv_offset;
             desc.layers[1].pitch[0] = uv_stride;
 
-            let import = DmaBufSurfaceImport { desc };
-            let surfaces = self
+            let surface = self
                 .display
-                .create_surfaces(
-                    VA_RT_FORMAT_YUV420,
-                    Some(u32::from_ne_bytes(*b"NV12")),
-                    width,
-                    height,
-                    Some(UsageHint::USAGE_HINT_ENCODER),
-                    vec![import],
-                )
+                .import_prime_surface(VA_RT_FORMAT_YUV420, width, height, &mut desc)
                 .map_err(|e| anyhow::anyhow!("Failed to import NV12 DMA-BUF surface: {}", e))?;
-
-            let surface = surfaces
-                .into_iter()
-                .next()
-                .context("VA-API returned no surfaces from DMA-BUF import")?;
             tracing::trace!(
                 surface_id = surface.id(),
                 "Encoder: imported NV12 DMA-BUF surface"
@@ -493,10 +633,11 @@ impl VaapiEncoder {
             self.dmabuf_input_surface = Some(surface);
         }
 
-        let dmabuf_surface = self
+        let dmabuf_surface_id = self
             .dmabuf_input_surface
             .as_ref()
-            .expect("dmabuf_input_surface must be set before encode");
+            .expect("dmabuf_input_surface must be set before encode")
+            .id();
         let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
 
         let recon_idx = self.current_recon_surface;
@@ -513,26 +654,22 @@ impl VaapiEncoder {
         // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
         let poc = ((self.frame_count * 2) % 256) as i32;
 
-        let mut picture = Picture::new(self.frame_count, Rc::clone(&self.context), dmabuf_surface);
+        let mut picture_buffers = Vec::new();
 
         if is_idr {
             self.last_ref = None;
             let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
             let seq_buffer = self
                 .context
-                .create_buffer(BufferType::EncSequenceParameter(
-                    EncSequenceParameter::H264(seq_param),
-                ))
+                .create_buffer(
+                    va::VABufferType_VAEncSequenceParameterBufferType,
+                    seq_param,
+                    "vaCreateBuffer (H.264 sequence)",
+                )
                 .context("Failed to create seq buffer")?;
-            picture.add_buffer(seq_buffer);
+            picture_buffers.push(seq_buffer);
 
-            for rc_buf_type in self.build_rate_control_buffers() {
-                let buf = self
-                    .context
-                    .create_buffer(rc_buf_type)
-                    .context("Failed to create rate control buffer")?;
-                picture.add_buffer(buf);
-            }
+            picture_buffers.extend(self.create_rate_control_buffers()?);
         }
 
         let pic_param = self.build_picture_params(
@@ -544,33 +681,28 @@ impl VaapiEncoder {
         );
         let pic_buffer = self
             .context
-            .create_buffer(BufferType::EncPictureParameter(EncPictureParameter::H264(
+            .create_buffer(
+                va::VABufferType_VAEncPictureParameterBufferType,
                 pic_param,
-            )))
+                "vaCreateBuffer (H.264 picture)",
+            )
             .context("Failed to create pic buffer")?;
-        picture.add_buffer(pic_buffer);
+        picture_buffers.push(pic_buffer);
 
         let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
         let slice_buffer = self
             .context
-            .create_buffer(BufferType::EncSliceParameter(EncSliceParameter::H264(
+            .create_buffer(
+                va::VABufferType_VAEncSliceParameterBufferType,
                 slice_param,
-            )))
+                "vaCreateBuffer (H.264 slice)",
+            )
             .context("Failed to create slice buffer")?;
-        picture.add_buffer(slice_buffer);
+        picture_buffers.push(slice_buffer);
 
-        let picture = picture
-            .begin()
-            .map_err(|e| anyhow::anyhow!("vaBeginPicture failed (dmabuf): {}", e))?;
-        let picture = picture
-            .render()
-            .map_err(|e| anyhow::anyhow!("vaRenderPicture failed (dmabuf): {}", e))?;
-        let picture = picture
-            .end()
-            .map_err(|e| anyhow::anyhow!("vaEndPicture failed (dmabuf): {}", e))?;
-        let _picture = picture
-            .sync()
-            .map_err(|(e, _)| anyhow::anyhow!("vaSyncSurface failed (dmabuf): {}", e))?;
+        self.context
+            .render_picture(dmabuf_surface_id, &picture_buffers)
+            .map_err(|e| anyhow::anyhow!("VA-API render failed (dmabuf): {}", e))?;
 
         self.last_ref = Some(DpbEntry {
             surface_id: self.recon_surfaces[recon_idx].id(),
@@ -578,20 +710,14 @@ impl VaapiEncoder {
             poc,
         });
 
-        let mapped = MappedCodedBuffer::new(&self.coded_buffers[coded_idx])
-            .map_err(|e| anyhow::anyhow!("Failed to map coded buffer: {}", e))?;
-
-        let mut data = Vec::new();
-        for segment in mapped.iter() {
-            data.extend_from_slice(segment.buf);
-        }
+        let mut data = self.coded_buffers[coded_idx].read_coded()?;
 
         // SPS/PPS handling (same as encode())
         if is_idr {
             if let Some(sps_pps) = super::extract_sps_pps(&data) {
                 self.cached_sps_pps = Some(sps_pps);
             } else {
-                tracing::trace!("VA-API IDR missing SPS/PPS, generating manually");
+                tracing::trace!("VA-API IDR missing SPS/PPS, synthesizing parameter sets");
                 let sps_pps = self.generate_sps_pps();
                 let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
                 combined.extend_from_slice(&sps_pps);
@@ -682,6 +808,55 @@ impl VaapiEncoder {
         }
     }
 
+    fn upload_yuv420_to_surface(
+        &self,
+        input_idx: usize,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<()> {
+        let mut image = VaImageMapping::create_from(
+            &self.input_surfaces[input_idx],
+            self.nv12_format,
+            self.width,
+            self.height,
+        )
+        .context("Failed to create VA image")?;
+
+        let (y_pitch, uv_pitch, y_offset, uv_offset) = {
+            let i = image.image();
+            (
+                i.pitches[0] as usize,
+                i.pitches[1] as usize,
+                i.offsets[0] as usize,
+                i.offsets[1] as usize,
+            )
+        };
+
+        let width = self.width as usize;
+        let height = self.height as usize;
+        let chroma_width = width / 2;
+        let chroma_height = height / 2;
+        let dst = image.data_mut();
+
+        for row in 0..height {
+            let src_start = row * width;
+            let dst_start = y_offset + row * y_pitch;
+            dst[dst_start..dst_start + width].copy_from_slice(&y[src_start..src_start + width]);
+        }
+
+        for row in 0..chroma_height {
+            let dst_start = uv_offset + row * uv_pitch;
+            let src_start = row * chroma_width;
+            for col in 0..chroma_width {
+                dst[dst_start + col * 2] = u[src_start + col];
+                dst[dst_start + col * 2 + 1] = v[src_start + col];
+            }
+        }
+
+        Ok(())
+    }
+
     fn get_h264_level(&self) -> u8 {
         let macroblocks_per_sec = (self.width / 16) * (self.height / 16) * self.fps;
         if macroblocks_per_sec <= 40500 {
@@ -703,57 +878,37 @@ impl VaapiEncoder {
         &self,
         mb_width: u16,
         mb_height: u16,
-    ) -> libva::EncSequenceParameterBufferH264 {
-        use libva::{EncSequenceParameterBufferH264, H264EncSeqFields, H264VuiFields};
-
-        let seq_fields = H264EncSeqFields::new(
-            1, // chroma_format_idc (4:2:0)
-            1, // frame_mbs_only_flag
-            0, // mb_adaptive_frame_field_flag
-            0, // seq_scaling_matrix_present_flag
-            1, // direct_8x8_inference_flag
-            4, // log2_max_frame_num_minus4
-            0, // pic_order_cnt_type
-            4, // log2_max_pic_order_cnt_lsb_minus4
-            0, // delta_pic_order_always_zero_flag
-        );
-
-        let vui_fields = H264VuiFields::new(
-            0,  // aspect_ratio_info_present_flag
-            1,  // timing_info_present_flag
-            1,  // bitstream_restriction_flag (enables low-latency decode hints)
-            16, // log2_max_mv_length_horizontal
-            16, // log2_max_mv_length_vertical
-            0,  // fixed_frame_rate_flag
-            0,  // low_delay_hrd_flag
-            1,  // motion_vectors_over_pic_boundaries_flag
-        );
-
-        EncSequenceParameterBufferH264::new(
-            0,                     // seq_parameter_set_id
-            self.get_h264_level(), // level_idc
-            IDR_INTERVAL,          // intra_period
-            IDR_INTERVAL,          // intra_idr_period
-            1,                     // ip_period
-            self.bitrate,          // bits_per_second
-            1,                     // max_num_ref_frames
-            mb_width,
-            mb_height,
-            &seq_fields,
-            0,        // bit_depth_luma_minus8
-            0,        // bit_depth_chroma_minus8
-            0,        // num_ref_frames_in_pic_order_cnt_cycle
-            0,        // offset_for_non_ref_pic
-            0,        // offset_for_top_to_bottom_field
-            [0; 256], // offset_for_ref_frame
-            None,     // frame_crop
-            Some(vui_fields),
-            0,            // aspect_ratio_idc
-            1,            // sar_width
-            1,            // sar_height
-            1,            // num_units_in_tick
-            self.fps * 2, // time_scale (2 * fps for progressive)
-        )
+    ) -> va::VAEncSequenceParameterBufferH264 {
+        let mut params: va::VAEncSequenceParameterBufferH264 = unsafe { mem::zeroed() };
+        params.seq_parameter_set_id = 0;
+        params.level_idc = self.get_h264_level();
+        params.intra_period = IDR_INTERVAL;
+        params.intra_idr_period = IDR_INTERVAL;
+        params.ip_period = 1;
+        params.bits_per_second = self.bitrate;
+        params.max_num_ref_frames = 1;
+        params.picture_width_in_mbs = mb_width;
+        params.picture_height_in_mbs = mb_height;
+        params.seq_fields = va::_VAEncSequenceParameterBufferH264__bindgen_ty_1 {
+            value: h264_seq_fields_value(),
+        };
+        params.bit_depth_luma_minus8 = 0;
+        params.bit_depth_chroma_minus8 = 0;
+        params.num_ref_frames_in_pic_order_cnt_cycle = 0;
+        params.offset_for_non_ref_pic = 0;
+        params.offset_for_top_to_bottom_field = 0;
+        params.offset_for_ref_frame = [0; 256];
+        params.frame_cropping_flag = 0;
+        params.vui_parameters_present_flag = 1;
+        params.vui_fields = va::_VAEncSequenceParameterBufferH264__bindgen_ty_2 {
+            value: h264_vui_fields_value(),
+        };
+        params.aspect_ratio_idc = 0;
+        params.sar_width = 1;
+        params.sar_height = 1;
+        params.num_units_in_tick = 1;
+        params.time_scale = self.fps * 2;
+        params
     }
 
     fn build_picture_params(
@@ -763,10 +918,8 @@ impl VaapiEncoder {
         is_idr: bool,
         frame_num: u16,
         poc: i32,
-    ) -> libva::EncPictureParameterBufferH264 {
-        use libva::{EncPictureParameterBufferH264, H264EncPicFields, PictureH264};
-
-        let curr_pic = PictureH264::new(
+    ) -> va::VAEncPictureParameterBufferH264 {
+        let curr_pic = picture_h264(
             recon_surface_id,
             frame_num as u32,
             VA_PICTURE_H264_SHORT_TERM_REFERENCE,
@@ -774,13 +927,13 @@ impl VaapiEncoder {
             poc,
         );
 
-        let mut reference_frames: [PictureH264; 16] = std::array::from_fn(|_| {
-            PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
+        let mut reference_frames: [va::VAPictureH264; 16] = std::array::from_fn(|_| {
+            picture_h264(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
         });
 
         let num_ref_l0 = if !is_idr {
             if let Some(ref entry) = self.last_ref {
-                reference_frames[0] = PictureH264::new(
+                reference_frames[0] = picture_h264(
                     entry.surface_id,
                     entry.frame_num as u32,
                     VA_PICTURE_H264_SHORT_TERM_REFERENCE,
@@ -795,41 +948,30 @@ impl VaapiEncoder {
             0u8
         };
 
-        let transform_8x8 = if self.profile == VAProfile::VAProfileH264High {
+        let transform_8x8 = if self.profile == sys::VA_PROFILE_H264_HIGH {
             1
         } else {
             0
         };
 
-        let pic_fields = H264EncPicFields::new(
-            if is_idr { 1 } else { 0 }, // idr_pic_flag
-            1,                          // reference_pic_flag
-            1,                          // entropy_coding_mode_flag (CABAC)
-            0,                          // weighted_pred_flag
-            0,                          // weighted_bipred_idc
-            0,                          // constrained_intra_pred_flag
-            transform_8x8,              // transform_8x8_mode_flag
-            1,                          // deblocking_filter_control_present_flag
-            0,                          // redundant_pic_cnt_present_flag
-            0,                          // pic_order_present_flag
-            0,                          // pic_scaling_matrix_present_flag
-        );
-
-        EncPictureParameterBufferH264::new(
-            curr_pic,
-            reference_frames,
-            coded_buf_id,
-            0, // pic_parameter_set_id
-            0, // seq_parameter_set_id
-            0, // last_picture
-            frame_num,
-            23,                                              // pic_init_qp
-            if num_ref_l0 > 0 { num_ref_l0 - 1 } else { 0 }, // num_ref_idx_l0_active_minus1
-            0,                                               // num_ref_idx_l1_active_minus1
-            0,                                               // chroma_qp_index_offset
-            0,                                               // second_chroma_qp_index_offset
-            &pic_fields,
-        )
+        let mut params: va::VAEncPictureParameterBufferH264 = unsafe { mem::zeroed() };
+        params.CurrPic = curr_pic;
+        params.ReferenceFrames = reference_frames;
+        params.coded_buf = coded_buf_id;
+        params.pic_parameter_set_id = 0;
+        params.seq_parameter_set_id = 0;
+        params.last_picture = 0;
+        params.frame_num = frame_num;
+        params.pic_init_qp =
+            vaapi_rate_control_policy(self.bitrate, self.quality, self.rate_control).pic_init_qp;
+        params.num_ref_idx_l0_active_minus1 = if num_ref_l0 > 0 { num_ref_l0 - 1 } else { 0 };
+        params.num_ref_idx_l1_active_minus1 = 0;
+        params.chroma_qp_index_offset = 0;
+        params.second_chroma_qp_index_offset = 0;
+        params.pic_fields = va::_VAEncPictureParameterBufferH264__bindgen_ty_1 {
+            value: h264_pic_fields_value(is_idr, transform_8x8),
+        };
+        params
     }
 
     fn build_slice_params(
@@ -838,21 +980,19 @@ impl VaapiEncoder {
         is_idr: bool,
         frame_num: u16,
         poc: i32,
-    ) -> libva::EncSliceParameterBufferH264 {
-        use libva::{EncSliceParameterBufferH264, PictureH264};
-
+    ) -> va::VAEncSliceParameterBufferH264 {
         let slice_type = if is_idr { SLICE_TYPE_I } else { SLICE_TYPE_P };
 
-        let mut ref_pic_list_0: [PictureH264; 32] = std::array::from_fn(|_| {
-            PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
+        let mut ref_pic_list_0: [va::VAPictureH264; 32] = std::array::from_fn(|_| {
+            picture_h264(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
         });
-        let ref_pic_list_1: [PictureH264; 32] = std::array::from_fn(|_| {
-            PictureH264::new(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
+        let ref_pic_list_1: [va::VAPictureH264; 32] = std::array::from_fn(|_| {
+            picture_h264(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
         });
 
         let (num_ref_override, num_ref_l0) = if !is_idr {
             if let Some(ref entry) = self.last_ref {
-                ref_pic_list_0[0] = PictureH264::new(
+                ref_pic_list_0[0] = picture_h264(
                     entry.surface_id,
                     entry.frame_num as u32,
                     VA_PICTURE_H264_SHORT_TERM_REFERENCE,
@@ -867,81 +1007,98 @@ impl VaapiEncoder {
             (0u8, 0u8)
         };
 
-        EncSliceParameterBufferH264::new(
-            0, // macroblock_address
-            num_macroblocks,
-            VA_INVALID_ID, // macroblock_info
-            slice_type,
-            0,          // pic_parameter_set_id
-            frame_num,  // idr_pic_id
-            poc as u16, // pic_order_cnt_lsb (already wrapped at call site)
-            0,          // delta_pic_order_cnt_bottom
-            [0, 0],     // delta_pic_order_cnt
-            0,          // direct_spatial_mv_pred_flag
-            num_ref_override,
-            num_ref_l0, // num_ref_idx_l0_active_minus1
-            0,          // num_ref_idx_l1_active_minus1
-            ref_pic_list_0,
-            ref_pic_list_1,
-            0, // luma_log2_weight_denom
-            0, // chroma_log2_weight_denom
-            0, // luma_weight_l0_flag
-            [0; 32],
-            [0; 32],
-            0, // chroma_weight_l0_flag
-            [[0; 2]; 32],
-            [[0; 2]; 32],
-            0, // luma_weight_l1_flag
-            [0; 32],
-            [0; 32],
-            0, // chroma_weight_l1_flag
-            [[0; 2]; 32],
-            [[0; 2]; 32],
-            0, // cabac_init_idc
-            0, // slice_qp_delta
-            0, // disable_deblocking_filter_idc
-            0, // slice_alpha_c0_offset_div2
-            0, // slice_beta_offset_div2
-        )
+        let mut params: va::VAEncSliceParameterBufferH264 = unsafe { mem::zeroed() };
+        params.macroblock_address = 0;
+        params.num_macroblocks = num_macroblocks;
+        params.macroblock_info = VA_INVALID_ID;
+        params.slice_type = slice_type;
+        params.pic_parameter_set_id = 0;
+        params.idr_pic_id = frame_num;
+        params.pic_order_cnt_lsb = poc as u16;
+        params.delta_pic_order_cnt_bottom = 0;
+        params.delta_pic_order_cnt = [0, 0];
+        params.direct_spatial_mv_pred_flag = 0;
+        params.num_ref_idx_active_override_flag = num_ref_override;
+        params.num_ref_idx_l0_active_minus1 = num_ref_l0;
+        params.num_ref_idx_l1_active_minus1 = 0;
+        params.RefPicList0 = ref_pic_list_0;
+        params.RefPicList1 = ref_pic_list_1;
+        params.luma_log2_weight_denom = 0;
+        params.chroma_log2_weight_denom = 0;
+        params.luma_weight_l0_flag = 0;
+        params.chroma_weight_l0_flag = 0;
+        params.luma_weight_l1_flag = 0;
+        params.chroma_weight_l1_flag = 0;
+        params.cabac_init_idc = 0;
+        params.slice_qp_delta = 0;
+        params.disable_deblocking_filter_idc = 0;
+        params.slice_alpha_c0_offset_div2 = 0;
+        params.slice_beta_offset_div2 = 0;
+        params
     }
 
-    fn build_rate_control_buffers(&self) -> Vec<BufferType> {
+    fn create_rate_control_buffers(&self) -> Result<Vec<VaBuffer>> {
         let mut buffers = Vec::with_capacity(3);
 
-        let rc = EncMiscParameterRateControl::new(
-            self.bitrate,
-            100,                                     // target_percentage (CBR)
-            1000,                                    // window_size
-            0,                                       // initial_qp
-            18,                                      // min_qp
-            0,                                       // basic_unit_size
-            RcFlags::new(0, 1, 0, 0, 0, 0, 0, 0, 0), // disable_frame_skip=1
-            0,                                       // icq_quality_factor
-            40,                                      // max_qp
-            0,                                       // quality_factor
-            0,                                       // target_frame_size
+        let policy = vaapi_rate_control_policy(self.bitrate, self.quality, self.rate_control);
+
+        let mut rc: va::VAEncMiscParameterRateControl = unsafe { mem::zeroed() };
+        rc.bits_per_second = policy.bits_per_second;
+        rc.target_percentage = policy.target_percentage;
+        rc.window_size = 1000;
+        rc.initial_qp = policy.initial_qp;
+        rc.min_qp = policy.min_qp;
+        rc.basic_unit_size = 0;
+        rc.rc_flags = va::_VAEncMiscParameterRateControl__bindgen_ty_1 { value: 1 << 1 };
+        rc.ICQ_quality_factor = 0;
+        rc.max_qp = policy.max_qp;
+        rc.quality_factor = 0;
+        rc.target_frame_size = 0;
+        buffers.push(
+            self.context
+                .create_misc_buffer(
+                    va::VAEncMiscParameterType_VAEncMiscParameterTypeRateControl,
+                    rc,
+                    "vaCreateBuffer (rate control)",
+                )
+                .context("Failed to create rate control buffer")?,
         );
-        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::RateControl(
-            rc,
-        )));
 
-        let hrd = EncMiscParameterHRD::new(self.bitrate / 2, self.bitrate);
-        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::HRD(hrd)));
+        let mut hrd: va::VAEncMiscParameterHRD = unsafe { mem::zeroed() };
+        hrd.initial_buffer_fullness = policy.bits_per_second / 2;
+        hrd.buffer_size = policy.bits_per_second;
+        buffers.push(
+            self.context
+                .create_misc_buffer(
+                    va::VAEncMiscParameterType_VAEncMiscParameterTypeHRD,
+                    hrd,
+                    "vaCreateBuffer (HRD)",
+                )
+                .context("Failed to create HRD buffer")?,
+        );
 
-        let fr = EncMiscParameterFrameRate::new(self.fps, 0);
-        buffers.push(BufferType::EncMiscParameter(EncMiscParameter::FrameRate(
-            fr,
-        )));
+        let mut fr: va::VAEncMiscParameterFrameRate = unsafe { mem::zeroed() };
+        fr.framerate = self.fps;
+        fr.framerate_flags = va::_VAEncMiscParameterFrameRate__bindgen_ty_1 { value: 0 };
+        buffers.push(
+            self.context
+                .create_misc_buffer(
+                    va::VAEncMiscParameterType_VAEncMiscParameterTypeFrameRate,
+                    fr,
+                    "vaCreateBuffer (frame rate)",
+                )
+                .context("Failed to create frame rate buffer")?,
+        );
 
-        buffers
+        Ok(buffers)
     }
 
     /// Generate SPS and PPS NAL units matching our encoder configuration.
     /// Used when the VA-API driver doesn't include them in the coded output.
     fn generate_sps_pps(&self) -> Vec<u8> {
         let profile_idc: u32 = match self.profile {
-            VAProfile::VAProfileH264High => 100,
-            VAProfile::VAProfileH264Main => 77,
+            sys::VA_PROFILE_H264_HIGH => 100,
+            sys::VA_PROFILE_H264_MAIN => 77,
             _ => 100,
         };
         let is_high_profile = profile_idc >= 100;
@@ -1048,7 +1205,9 @@ impl VaapiEncoder {
         bs.write_ue(0); // num_ref_idx_l1_default_active_minus1
         bs.write_bits(0, 1); // weighted_pred_flag
         bs.write_bits(0, 2); // weighted_bipred_idc
-        bs.write_se(-3); // pic_init_qp_minus26
+        let pic_init_qp = vaapi_rate_control_policy(self.bitrate, self.quality, self.rate_control)
+            .pic_init_qp as i32;
+        bs.write_se(pic_init_qp - 26); // pic_init_qp_minus26
         bs.write_se(0); // pic_init_qs_minus26
         bs.write_se(0); // chroma_qp_index_offset
         bs.write_bits(1, 1); // deblocking_filter_control_present_flag
@@ -1070,6 +1229,65 @@ impl VaapiEncoder {
 
         buf
     }
+}
+
+fn picture_h264(
+    picture_id: u32,
+    frame_idx: u32,
+    flags: u32,
+    top_field_order_cnt: i32,
+    bottom_field_order_cnt: i32,
+) -> va::VAPictureH264 {
+    let mut picture: va::VAPictureH264 = unsafe { mem::zeroed() };
+    picture.picture_id = picture_id;
+    picture.frame_idx = frame_idx;
+    picture.flags = flags;
+    picture.TopFieldOrderCnt = top_field_order_cnt;
+    picture.BottomFieldOrderCnt = bottom_field_order_cnt;
+    picture
+}
+
+fn h264_seq_fields_value() -> u32 {
+    let chroma_format_idc = 1; // 4:2:0
+    let frame_mbs_only_flag = 1;
+    let direct_8x8_inference_flag = 1;
+    let log2_max_frame_num_minus4 = 4;
+    let pic_order_cnt_type = 0;
+    let log2_max_pic_order_cnt_lsb_minus4 = 4;
+
+    chroma_format_idc
+        | (frame_mbs_only_flag << 2)
+        | (direct_8x8_inference_flag << 5)
+        | (log2_max_frame_num_minus4 << 6)
+        | (pic_order_cnt_type << 10)
+        | (log2_max_pic_order_cnt_lsb_minus4 << 12)
+}
+
+fn h264_vui_fields_value() -> u32 {
+    let timing_info_present_flag = 1;
+    let bitstream_restriction_flag = 1;
+    let log2_max_mv_length_horizontal = 16;
+    let log2_max_mv_length_vertical = 16;
+    let motion_vectors_over_pic_boundaries_flag = 1;
+
+    (timing_info_present_flag << 1)
+        | (bitstream_restriction_flag << 2)
+        | (log2_max_mv_length_horizontal << 3)
+        | (log2_max_mv_length_vertical << 8)
+        | (motion_vectors_over_pic_boundaries_flag << 15)
+}
+
+fn h264_pic_fields_value(is_idr: bool, transform_8x8_mode_flag: u32) -> u32 {
+    let idr_pic_flag = u32::from(is_idr);
+    let reference_pic_flag = 1;
+    let entropy_coding_mode_flag = 1;
+    let deblocking_filter_control_present_flag = 1;
+
+    idr_pic_flag
+        | (reference_pic_flag << 1)
+        | (entropy_coding_mode_flag << 3)
+        | (transform_8x8_mode_flag << 8)
+        | (deblocking_filter_control_present_flag << 9)
 }
 
 /// Bitstream writer for H.264 NAL unit construction.
@@ -1157,5 +1375,45 @@ impl BitWriter {
             }
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vaapi_vbr_policy_uses_requested_bitrate_and_quality_ceiling() {
+        let policy = vaapi_rate_control_policy(10_000_000, 23, H264RateControl::Vbr);
+
+        assert_eq!(policy.config_mode, sys::VA_RC_VBR);
+        assert_eq!(policy.bits_per_second, 10_000_000);
+        assert_eq!(policy.pic_init_qp, 23);
+        assert_eq!(policy.initial_qp, 23);
+        assert_eq!(policy.min_qp, 0);
+        assert_eq!(policy.target_percentage, 66);
+        assert_eq!(policy.max_qp, 23);
+    }
+
+    #[test]
+    fn vaapi_cqp_policy_pins_qp_and_disables_bitrate_target() {
+        let policy = vaapi_rate_control_policy(10_000_000, 32, H264RateControl::Cqp);
+
+        assert_eq!(policy.config_mode, sys::VA_RC_CQP);
+        assert_eq!(policy.bits_per_second, 0);
+        assert_eq!(policy.pic_init_qp, 32);
+        assert_eq!(policy.initial_qp, 32);
+        assert_eq!(policy.min_qp, 32);
+        assert_eq!(policy.max_qp, 32);
+    }
+
+    #[test]
+    fn vaapi_quality_is_clamped_to_h264_qp_range() {
+        let policy = vaapi_rate_control_policy(10_000_000, 99, H264RateControl::Cqp);
+
+        assert_eq!(policy.pic_init_qp, 51);
+        assert_eq!(policy.initial_qp, 51);
+        assert_eq!(policy.min_qp, 51);
+        assert_eq!(policy.max_qp, 51);
     }
 }

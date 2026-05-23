@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use ironrdp_server::{GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
-pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = u32::MAX;
+pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
 const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -35,6 +35,18 @@ pub(crate) enum EgfxFrameReadiness {
         in_flight: u32,
         client_queue_depth: u32,
     },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EgfxFrameFlowSnapshot {
+    pub(crate) last_queued_frame_id: u32,
+    pub(crate) last_acked_frame_id: u32,
+    pub(crate) frames_in_flight: u32,
+    pub(crate) client_queue_depth: u32,
+    pub(crate) frame_ack_suspended: bool,
+    pub(crate) frame_ack_stream_established: bool,
+    pub(crate) total_queued_frames: u64,
+    pub(crate) total_acked_frames: u64,
 }
 
 impl EgfxFrameReadiness {
@@ -76,7 +88,9 @@ pub struct EgfxShared {
     frames_in_flight: AtomicU32,
     client_queue_depth: AtomicU32,
     frame_ack_suspended: AtomicBool,
+    frame_ack_stream_established: AtomicBool,
     last_queued_frame_id: AtomicU32,
+    last_acked_frame_id: AtomicU32,
     ack_cutoff_frame_id: AtomicU32,
     ack_cutoff_active: AtomicBool,
     total_queued_frames: AtomicU64,
@@ -100,7 +114,9 @@ impl EgfxShared {
             frames_in_flight: AtomicU32::new(0),
             client_queue_depth: AtomicU32::new(0),
             frame_ack_suspended: AtomicBool::new(false),
+            frame_ack_stream_established: AtomicBool::new(false),
             last_queued_frame_id: AtomicU32::new(0),
+            last_acked_frame_id: AtomicU32::new(0),
             ack_cutoff_frame_id: AtomicU32::new(0),
             ack_cutoff_active: AtomicBool::new(false),
             total_queued_frames: AtomicU64::new(0),
@@ -186,23 +202,53 @@ impl EgfxShared {
         self.frame_ack_suspended.load(Ordering::Acquire)
     }
 
+    pub(crate) fn preferred_frame_rate(&self, target_fps: u32) -> u32 {
+        let target_fps = target_fps.max(1);
+        if self.frame_ack_suspended() {
+            return target_fps;
+        }
+
+        let in_flight = self.frames_in_flight();
+        if in_flight <= 1 {
+            return target_fps;
+        }
+
+        let freerdp_percent = 100 / in_flight.saturating_add(1);
+        target_fps
+            .saturating_mul(freerdp_percent)
+            .saturating_div(100)
+            .max(1)
+    }
+
+    #[cfg(test)]
+    pub(in crate::egfx) fn frame_ack_stream_established(&self) -> bool {
+        self.frame_ack_stream_established.load(Ordering::Acquire)
+    }
+
     pub(in crate::egfx) fn should_backpressure_frames(&self) -> bool {
         !self.frame_ack_suspended() && self.frames_in_flight() >= self.max_frames_in_flight()
     }
 
     pub(in crate::egfx) fn record_frame_queued(&self, frame_id: u32) {
         self.last_queued_frame_id.store(frame_id, Ordering::Release);
-        self.frames_in_flight.fetch_add(1, Ordering::AcqRel);
-        self.total_queued_frames.fetch_add(1, Ordering::AcqRel);
+        let in_flight = self.frames_in_flight.fetch_add(1, Ordering::AcqRel) + 1;
+        let total_queued = self.total_queued_frames.fetch_add(1, Ordering::AcqRel) + 1;
+        tracing::trace!(
+            frame_id,
+            in_flight,
+            total_queued,
+            client_queue_depth = self.client_queue_depth(),
+            ack_suspended = self.frame_ack_suspended(),
+            "EGFX: frame queued"
+        );
     }
 
     pub(in crate::egfx) fn record_frame_ack(&self, frame_id: u32, queue_depth: u32) {
         self.client_queue_depth
             .store(queue_depth, Ordering::Release);
-        self.frame_ack_suspended.store(
-            queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH,
-            Ordering::Release,
-        );
+        let ack_suspended = queue_depth == SUSPEND_FRAME_ACK_QUEUE_DEPTH;
+        self.frame_ack_suspended
+            .store(ack_suspended, Ordering::Release);
 
         if self.ack_cutoff_active.load(Ordering::Acquire)
             && frame_id <= self.ack_cutoff_frame_id.load(Ordering::Acquire)
@@ -215,6 +261,18 @@ impl EgfxShared {
             return;
         }
 
+        self.last_acked_frame_id.store(frame_id, Ordering::Release);
+        if ack_suspended {
+            let queued = self.total_queued_frames.load(Ordering::Acquire);
+            self.total_acked_frames.store(queued, Ordering::Release);
+            self.frames_in_flight.store(0, Ordering::Release);
+            self.frame_ack_stream_established
+                .store(false, Ordering::Release);
+            return;
+        }
+
+        self.frame_ack_stream_established
+            .store(true, Ordering::Release);
         let mut current = self.frames_in_flight.load(Ordering::Acquire);
         while current > 0 {
             match self.frames_in_flight.compare_exchange_weak(
@@ -251,11 +309,27 @@ impl EgfxShared {
         self.frames_in_flight.store(0, Ordering::Release);
         self.client_queue_depth.store(0, Ordering::Release);
         self.frame_ack_suspended.store(false, Ordering::Release);
+        self.frame_ack_stream_established
+            .store(false, Ordering::Release);
         self.last_queued_frame_id.store(0, Ordering::Release);
+        self.last_acked_frame_id.store(0, Ordering::Release);
         self.ack_cutoff_frame_id.store(0, Ordering::Release);
         self.ack_cutoff_active.store(false, Ordering::Release);
         self.total_queued_frames.store(0, Ordering::Release);
         self.total_acked_frames.store(0, Ordering::Release);
+    }
+
+    pub(crate) fn frame_flow_snapshot(&self) -> EgfxFrameFlowSnapshot {
+        EgfxFrameFlowSnapshot {
+            last_queued_frame_id: self.last_queued_frame_id.load(Ordering::Acquire),
+            last_acked_frame_id: self.last_acked_frame_id.load(Ordering::Acquire),
+            frames_in_flight: self.frames_in_flight.load(Ordering::Acquire),
+            client_queue_depth: self.client_queue_depth.load(Ordering::Acquire),
+            frame_ack_suspended: self.frame_ack_suspended.load(Ordering::Acquire),
+            frame_ack_stream_established: self.frame_ack_stream_established.load(Ordering::Acquire),
+            total_queued_frames: self.total_queued_frames.load(Ordering::Acquire),
+            total_acked_frames: self.total_acked_frames.load(Ordering::Acquire),
+        }
     }
 
     pub fn get_handle(&self) -> Option<GfxServerHandle> {

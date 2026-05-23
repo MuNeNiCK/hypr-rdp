@@ -26,6 +26,15 @@ mod wlr;
 
 use state::AppState;
 
+const WLR_BUFFER_PARAMETER_RESTART_LIMIT: u32 = 5;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CaptureRestartDecision {
+    Restart { restarts: u32 },
+    GiveUp { restarts: u32 },
+    Propagate,
+}
+
 struct MmapRegion {
     ptr: *mut libc::c_void,
     len: usize,
@@ -154,30 +163,64 @@ fn capture_thread(
 
         match result {
             Ok(()) => return Ok(()),
-            Err(err)
-                if wlr::is_buffer_parameters_changed(&err)
-                    && !stop_flag.load(std::sync::atomic::Ordering::Acquire) =>
-            {
-                restarts = restarts.saturating_add(1);
-                tracing::warn!(
-                    restarts,
-                    "WLR capture buffer parameters changed; restarting capture thread"
-                );
-                if restarts >= 5 {
-                    if let Some(tx) = info_tx.take() {
-                        let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
-                    }
+            Err(err) => match wlr_buffer_restart_decision(
+                &err,
+                stop_flag.load(std::sync::atomic::Ordering::Acquire),
+                restarts,
+            ) {
+                CaptureRestartDecision::Restart {
+                    restarts: next_restarts,
+                } => {
+                    restarts = next_restarts;
+                    tracing::warn!(
+                        restarts,
+                        "WLR capture buffer parameters changed; restarting capture thread"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                CaptureRestartDecision::GiveUp {
+                    restarts: next_restarts,
+                } => {
+                    restarts = next_restarts;
+                    tracing::warn!(
+                        restarts,
+                        "WLR capture buffer parameters changed; restart limit reached"
+                    );
+                    send_capture_start_error(&mut info_tx, &err);
                     return Err(err);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            Err(err) => {
-                if let Some(tx) = info_tx.take() {
-                    let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
+                CaptureRestartDecision::Propagate => {
+                    send_capture_start_error(&mut info_tx, &err);
+                    return Err(err);
                 }
-                return Err(err);
-            }
+            },
         }
+    }
+}
+
+fn wlr_buffer_restart_decision(
+    err: &anyhow::Error,
+    stop_flag_set: bool,
+    restarts: u32,
+) -> CaptureRestartDecision {
+    if !wlr::is_buffer_parameters_changed(err) || stop_flag_set {
+        return CaptureRestartDecision::Propagate;
+    }
+
+    let restarts = restarts.saturating_add(1);
+    if restarts >= WLR_BUFFER_PARAMETER_RESTART_LIMIT {
+        CaptureRestartDecision::GiveUp { restarts }
+    } else {
+        CaptureRestartDecision::Restart { restarts }
+    }
+}
+
+fn send_capture_start_error(
+    info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
+    err: &anyhow::Error,
+) {
+    if let Some(tx) = info_tx.take() {
+        let _ = tx.send(Err(anyhow::anyhow!("{:#}", err)));
     }
 }
 
@@ -344,5 +387,52 @@ fn is_wayland_would_block(err: &wayland_client::backend::WaylandError) -> bool {
             io.kind() == ErrorKind::WouldBlock || io.raw_os_error() == Some(libc::EAGAIN)
         }
         wayland_client::backend::WaylandError::Protocol(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{wlr, wlr_buffer_restart_decision, CaptureRestartDecision};
+
+    fn buffer_parameters_changed_error() -> anyhow::Error {
+        anyhow::Error::new(wlr::BufferParametersChanged)
+    }
+
+    #[test]
+    fn wlr_buffer_parameter_change_restarts_capture_until_limit() {
+        let err = buffer_parameters_changed_error();
+
+        assert_eq!(
+            wlr_buffer_restart_decision(&err, false, 0),
+            CaptureRestartDecision::Restart { restarts: 1 }
+        );
+        assert_eq!(
+            wlr_buffer_restart_decision(&err, false, 3),
+            CaptureRestartDecision::Restart { restarts: 4 }
+        );
+        assert_eq!(
+            wlr_buffer_restart_decision(&err, false, 4),
+            CaptureRestartDecision::GiveUp { restarts: 5 }
+        );
+    }
+
+    #[test]
+    fn wlr_buffer_parameter_change_does_not_restart_during_shutdown() {
+        let err = buffer_parameters_changed_error();
+
+        assert_eq!(
+            wlr_buffer_restart_decision(&err, true, 0),
+            CaptureRestartDecision::Propagate
+        );
+    }
+
+    #[test]
+    fn wlr_restart_policy_ignores_unrelated_errors() {
+        let err = anyhow::anyhow!("Wayland read failed");
+
+        assert_eq!(
+            wlr_buffer_restart_decision(&err, false, 0),
+            CaptureRestartDecision::Propagate
+        );
     }
 }

@@ -7,6 +7,8 @@ use tokio::sync::mpsc;
 
 use super::format::{BLOCK_ALIGN, CHANNELS, SAMPLE_RATE};
 
+type SpaAudioFormat = pipewire::spa::param::audio::AudioFormat;
+
 /// User data passed to PipeWire stream callbacks.
 struct CaptureData {
     format: pipewire::spa::param::audio::AudioInfoRaw,
@@ -129,53 +131,11 @@ pub(super) fn run_capture(
 
             let byte_count = size.min(slice.len());
 
-            // Convert captured audio to S16LE bytes for RDP
-            let pcm_bytes: Vec<u8> = match data.format.format() {
-                spa::param::audio::AudioFormat::S16LE => {
-                    slice[..byte_count].to_vec()
-                }
-                spa::param::audio::AudioFormat::S16BE => {
-                    // Swap bytes for each sample
-                    let mut out = Vec::with_capacity(byte_count);
-                    for pair in slice[..byte_count].chunks_exact(2) {
-                        out.push(pair[1]);
-                        out.push(pair[0]);
-                    }
-                    out
-                }
-                spa::param::audio::AudioFormat::F32LE | spa::param::audio::AudioFormat::F32BE => {
-                    let sample_count = byte_count / 4;
-                    let mut out = Vec::with_capacity(sample_count * 2);
-                    for i in 0..sample_count {
-                        let start = i * 4;
-                        if start + 4 > slice.len() {
-                            break;
-                        }
-                        let bytes: [u8; 4] = [
-                            slice[start], slice[start + 1], slice[start + 2], slice[start + 3],
-                        ];
-                        let f = if data.format.format() == spa::param::audio::AudioFormat::F32LE {
-                            f32::from_le_bytes(bytes)
-                        } else {
-                            f32::from_be_bytes(bytes)
-                        };
-                        let s16 = (f.clamp(-1.0, 1.0) * 32767.0) as i16;
-                        out.extend_from_slice(&s16.to_le_bytes());
-                    }
-                    out
-                }
-                _ => return,
+            let Some(pcm_bytes) = convert_to_s16le(data.format.format(), slice, byte_count) else {
+                return;
             };
 
-            if pcm_bytes.is_empty() {
-                return;
-            }
-
-            let samples = pcm_bytes.len() / (BLOCK_ALIGN as usize);
-            let _ = data.sender.send(ServerEvent::Rdpsnd(
-                RdpsndServerMessage::Wave(pcm_bytes, data.timestamp),
-            ));
-            data.timestamp = data.timestamp.wrapping_add(samples as u32);
+            emit_wave_chunk(&data.sender, &mut data.timestamp, pcm_bytes);
         })
         .register()
         .map_err(|_| anyhow::anyhow!("Failed to register stream listener"))?;
@@ -220,4 +180,157 @@ pub(super) fn run_capture(
 
     tracing::trace!("Audio: PipeWire capture stopped");
     Ok(())
+}
+
+fn convert_to_s16le(format: SpaAudioFormat, input: &[u8], byte_count: usize) -> Option<Vec<u8>> {
+    let byte_count = byte_count.min(input.len());
+    let pcm_bytes = match format {
+        SpaAudioFormat::S16LE => input[..byte_count].to_vec(),
+        SpaAudioFormat::S16BE => {
+            let mut out = Vec::with_capacity(byte_count);
+            for pair in input[..byte_count].chunks_exact(2) {
+                out.push(pair[1]);
+                out.push(pair[0]);
+            }
+            out
+        }
+        SpaAudioFormat::F32LE | SpaAudioFormat::F32BE => {
+            let mut out = Vec::with_capacity((byte_count / 4) * 2);
+            for chunk in input[..byte_count].chunks_exact(4) {
+                let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+                let sample = if format == SpaAudioFormat::F32LE {
+                    f32::from_le_bytes(bytes)
+                } else {
+                    f32::from_be_bytes(bytes)
+                };
+                let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
+                out.extend_from_slice(&s16.to_le_bytes());
+            }
+            out
+        }
+        _ => return None,
+    };
+
+    (!pcm_bytes.is_empty()).then_some(pcm_bytes)
+}
+
+fn emit_wave_chunk(
+    sender: &mpsc::UnboundedSender<ServerEvent>,
+    timestamp: &mut u32,
+    pcm_bytes: Vec<u8>,
+) {
+    if pcm_bytes.is_empty() {
+        return;
+    }
+
+    let samples = pcm_bytes.len() / (BLOCK_ALIGN as usize);
+    let _ = sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
+        pcm_bytes, *timestamp,
+    )));
+    *timestamp = timestamp.wrapping_add(samples as u32);
+}
+
+#[cfg(test)]
+mod tests {
+    use ironrdp_rdpsnd::server::RdpsndServerMessage;
+
+    use super::*;
+
+    fn f32le_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    fn f32be_bytes(values: &[f32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn convert_to_s16le_passes_through_little_endian_pcm() {
+        let input = [0x34, 0x12, 0x78, 0x56, 0xff];
+
+        let converted = convert_to_s16le(SpaAudioFormat::S16LE, &input, 4).unwrap();
+
+        assert_eq!(converted, vec![0x34, 0x12, 0x78, 0x56]);
+    }
+
+    #[test]
+    fn convert_to_s16le_swaps_big_endian_pcm_and_drops_trailing_byte() {
+        let input = [0x12, 0x34, 0x56, 0x78, 0xff];
+
+        let converted = convert_to_s16le(SpaAudioFormat::S16BE, &input, input.len()).unwrap();
+
+        assert_eq!(converted, vec![0x34, 0x12, 0x78, 0x56]);
+    }
+
+    #[test]
+    fn convert_to_s16le_converts_and_clamps_float_samples() {
+        let converted = convert_to_s16le(
+            SpaAudioFormat::F32LE,
+            &f32le_bytes(&[-2.0, -0.5, 0.0, 0.5, 2.0]),
+            20,
+        )
+        .unwrap();
+
+        let samples: Vec<i16> = converted
+            .chunks_exact(2)
+            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect();
+        assert_eq!(samples, vec![-32767, -16383, 0, 16383, 32767]);
+    }
+
+    #[test]
+    fn convert_to_s16le_reads_big_endian_float_samples() {
+        let converted = convert_to_s16le(SpaAudioFormat::F32BE, &f32be_bytes(&[1.0]), 4).unwrap();
+
+        assert_eq!(converted, 32767i16.to_le_bytes());
+    }
+
+    #[test]
+    fn convert_to_s16le_rejects_unsupported_or_empty_input() {
+        assert!(convert_to_s16le(SpaAudioFormat::U8, &[0x80], 1).is_none());
+        assert!(convert_to_s16le(SpaAudioFormat::S16LE, &[], 0).is_none());
+        assert!(convert_to_s16le(SpaAudioFormat::F32LE, &[0x00, 0x00, 0x00], 3).is_none());
+    }
+
+    #[test]
+    fn emit_wave_chunk_sends_timestamped_audio_and_advances_by_frames() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut timestamp = 7;
+
+        emit_wave_chunk(&sender, &mut timestamp, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+
+        match receiver.try_recv().unwrap() {
+            ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts)) => {
+                assert_eq!(data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+                assert_eq!(ts, 7);
+            }
+            other => panic!("unexpected server event: {other:?}"),
+        }
+        assert_eq!(timestamp, 9);
+    }
+
+    #[test]
+    fn emit_wave_chunk_drops_empty_input_and_wraps_timestamp() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut timestamp = u32::MAX;
+
+        emit_wave_chunk(&sender, &mut timestamp, Vec::new());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(timestamp, u32::MAX);
+
+        emit_wave_chunk(&sender, &mut timestamp, vec![1, 2, 3, 4]);
+        assert!(receiver.try_recv().is_ok());
+        assert_eq!(timestamp, 0);
+    }
+
+    #[test]
+    fn emit_wave_chunk_advances_even_when_receiver_is_closed() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let mut timestamp = 41;
+
+        emit_wave_chunk(&sender, &mut timestamp, vec![1, 2, 3, 4]);
+
+        assert_eq!(timestamp, 42);
+    }
 }

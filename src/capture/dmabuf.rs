@@ -10,7 +10,6 @@ use anyhow::{bail, Result};
 // DRM format constants (drm_fourcc.h)
 pub const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
 pub const DRM_FORMAT_ARGB8888: u32 = 0x34324152;
-pub const DRM_FORMAT_NV12: u32 = 0x3231564E;
 #[allow(dead_code)]
 pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 pub const DRM_FORMAT_MOD_INVALID: u64 = 0x00ffffffffffffff;

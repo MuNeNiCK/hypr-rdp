@@ -164,7 +164,9 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
     }
 
     fn max_frames_in_flight(&self) -> u32 {
-        self.shared.max_frames_in_flight()
+        // hypr-rdp applies the local window before encoding so unsent frames do
+        // not advance encoder references. IronRDP still owns wire-level tracking.
+        u32::MAX
     }
 
     fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {

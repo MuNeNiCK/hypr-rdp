@@ -22,7 +22,7 @@ pub(crate) use wayland::HeadlessOutputGuard;
 const OPENH264_MAX_LONG_DIMENSION: u32 = 3840;
 const OPENH264_MAX_SHORT_DIMENSION: u32 = 2160;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMode {
     /// ext-image-copy-capture-v1
     Ext,
