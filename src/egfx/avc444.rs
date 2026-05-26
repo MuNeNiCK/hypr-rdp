@@ -881,7 +881,11 @@ struct Yuv420Reference {
 type Region = (i32, i32, i32, i32);
 type Regions = Vec<Region>;
 
-fn region_area_pixels(regions: &[Region], width: usize, height: usize) -> u64 {
+pub(super) fn region_area_pixels(
+    regions: &[(i32, i32, i32, i32)],
+    width: usize,
+    height: usize,
+) -> u64 {
     regions
         .iter()
         .filter_map(|&(x, y, w, h)| {

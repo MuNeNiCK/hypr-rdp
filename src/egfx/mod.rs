@@ -18,7 +18,7 @@ pub(crate) mod test_support;
 
 #[cfg(test)]
 pub(crate) use avc420::avc420_full_frame_region;
-pub(crate) use avc444::{Avc444EncodedFrame, Avc444FrameEncoding};
+pub(crate) use avc444::Avc444FrameEncoding;
 pub use backend::{FrameEncoder, H264RateControl};
 pub use factory::HyprGfxFactory;
 pub(crate) use frame::{EgfxFrameCodec, EncodedEgfxFrame, EncodedFrameState};
