@@ -6,18 +6,21 @@ pkgdesc="Native RDP server for Hyprland"
 arch=('x86_64')
 url="https://github.com/MuNeNICK/hypr-rdp"
 license=('MIT')
+options=(!debug)
 depends=(
+    'ffmpeg'
+    'libva'
     'libxkbcommon'
-    'openh264'
+    'mesa'
     'pipewire'
+    'wayland'
 )
 makedepends=(
     'cargo'
-    'cmake'
     'clang'
+    'cmake'
 )
 optdepends=(
-    'libva: VA-API hardware encoding support'
     'intel-media-driver: VA-API hardware encoding for Intel GPUs'
     'libva-mesa-driver: VA-API hardware encoding for AMD GPUs'
 )
@@ -34,8 +37,8 @@ build() {
     cd "$pkgname-$pkgver"
     export RUSTUP_TOOLCHAIN=stable
     export CARGO_TARGET_DIR=target
-    # aws-lc-sys: use C fallback instead of Go/NASM assembly
-    export AWS_LC_SYS_NO_ASM=1
+    # Keep Rust/C build scripts isolated from makepkg hardening flags.
+    unset CFLAGS CXXFLAGS LDFLAGS
     cargo build --frozen --release
 }
 
