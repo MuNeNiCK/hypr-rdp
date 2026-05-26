@@ -1,7 +1,8 @@
 use anyhow::Result;
 
-use super::encoder;
+use super::avc444::{Avc444EncodedFrame, Avc444Encoder};
 use super::frame::{EgfxFrameCodec, EncodedEgfxFrame};
+use super::h264::H264Encoder;
 #[cfg(feature = "vaapi")]
 use super::vaapi;
 
@@ -15,7 +16,7 @@ pub enum H264RateControl {
     Cqp,
 }
 
-/// Encoder backend: hardware VAAPI, common H.264 software, or AVC444 wrapper.
+/// Encoder backend: hardware VAAPI, common H.264 software, or AVC444 software.
 pub enum FrameEncoder {
     #[cfg(feature = "vaapi")]
     Vaapi(Box<vaapi::VaapiEncoder>),
@@ -23,8 +24,8 @@ pub enum FrameEncoder {
     FailingVaapiForTest {
         force_idr_requests: u32,
     },
-    Software(Box<encoder::H264Encoder>),
-    SoftwareAvc444(Box<encoder::Avc444Encoder>),
+    Software(Box<H264Encoder>),
+    SoftwareAvc444(Box<Avc444Encoder>),
 }
 
 impl FrameEncoder {
@@ -50,7 +51,7 @@ impl FrameEncoder {
             }
         }
 
-        let enc = encoder::H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
+        let enc = H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using FFmpeg/libavcodec software H.264 encoder");
         Ok(Self::Software(Box::new(enc)))
     }
@@ -86,7 +87,7 @@ impl FrameEncoder {
         bgra: &[u8],
         stride: usize,
         candidate_regions: &[(i32, i32, i32, i32)],
-    ) -> Result<encoder::Avc444EncodedFrame> {
+    ) -> Result<Avc444EncodedFrame> {
         match self {
             Self::SoftwareAvc444(enc) => enc.encode(bgra, stride, candidate_regions),
             #[cfg(feature = "vaapi")]
@@ -187,7 +188,7 @@ impl FrameEncoder {
         quality: u8,
         rate_control: H264RateControl,
     ) -> Result<Self> {
-        let enc = encoder::H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
+        let enc = H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using FFmpeg/libavcodec software H.264 encoder (runtime fallback)");
         Ok(Self::Software(Box::new(enc)))
     }
@@ -219,14 +220,8 @@ impl FrameEncoder {
     ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
         {
-            match encoder::Avc444Encoder::new_with_vaapi(
-                width,
-                height,
-                bitrate,
-                fps,
-                quality,
-                rate_control,
-            ) {
+            match Avc444Encoder::new_with_vaapi(width, height, bitrate, fps, quality, rate_control)
+            {
                 Ok(enc) => {
                     tracing::info!("Using FFmpeg/VAAPI hardware AVC444 encoder");
                     return Ok(Self::SoftwareAvc444(Box::new(enc)));
@@ -240,7 +235,7 @@ impl FrameEncoder {
             }
         }
 
-        let enc = encoder::Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
+        let enc = Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
         Ok(Self::SoftwareAvc444(Box::new(enc)))
     }
@@ -253,7 +248,7 @@ impl FrameEncoder {
         quality: u8,
         rate_control: H264RateControl,
     ) -> Result<Self> {
-        let enc = encoder::Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
+        let enc = Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
         Ok(Self::SoftwareAvc444(Box::new(enc)))
     }

@@ -1,6 +1,6 @@
 use super::{
+    avc444::{Avc444EncodedFrame, Avc444FrameEncoding},
     backend::FrameEncoder,
-    encoder::{Avc444EncodedFrame, Avc444FrameEncoding},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

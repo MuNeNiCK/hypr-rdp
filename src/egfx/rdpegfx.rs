@@ -6,7 +6,7 @@ use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
-use super::{avc420, encoder::Avc444FrameEncoding, EgfxFrameReadiness, EgfxShared};
+use super::{avc420, Avc444FrameEncoding, EgfxFrameReadiness, EgfxShared};
 use super::{EncodedEgfxFrame, EncodedFrameState};
 
 pub(in crate::egfx) struct QueuedRdpegfxFrame {

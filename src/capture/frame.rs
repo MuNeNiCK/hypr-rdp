@@ -118,7 +118,7 @@ fn log_avc444_sent_frame(
     width: u32,
     height: u32,
     damage_regions: &[(i32, i32, i32, i32)],
-    frame: &crate::egfx::encoder::Avc444EncodedFrame,
+    frame: &crate::egfx::Avc444EncodedFrame,
 ) {
     if !avc444_perf_logging_enabled() {
         return;
@@ -947,7 +947,6 @@ impl FrameProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::egfx::encoder::{Avc444EncodedFrame, Avc444FrameEncoding};
     use crate::egfx::test_support::{
         ack_frame, drain_gfx_pdus, negotiated_avc444_egfx, negotiated_egfx_with_policy,
         negotiated_no_avc_egfx, process_avc444_capabilities, start_gfx_channel,
@@ -955,7 +954,8 @@ mod tests {
         ExpectedAvc444Encoding, TestQueueDepth,
     };
     use crate::egfx::{
-        EgfxCodecPolicy, H264RateControl, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT,
+        Avc444EncodedFrame, Avc444FrameEncoding, EgfxCodecPolicy, H264RateControl, HyprGfxFactory,
+        DEFAULT_MAX_FRAMES_IN_FLIGHT,
     };
     use ironrdp_server::{DisplayUpdate, PixelFormat};
     use ironrdp_server::{GfxServerFactory, ServerEventSender};

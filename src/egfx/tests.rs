@@ -877,10 +877,7 @@ fn avc444_rdpegfx_shape_rejects_stream2_for_single_stream_lc() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    for encoding in [
-        encoder::Avc444FrameEncoding::Luma,
-        encoder::Avc444FrameEncoding::Chroma,
-    ] {
+    for encoding in [Avc444FrameEncoding::Luma, Avc444FrameEncoding::Chroma] {
         assert!(super::rdpegfx::validate_avc444_send_shape(
             encoding,
             &stream1_regions,
@@ -896,7 +893,7 @@ fn avc444_rdpegfx_shape_rejects_lc0_without_stream2() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
 
     assert!(super::rdpegfx::validate_avc444_send_shape(
-        encoder::Avc444FrameEncoding::LumaAndChroma,
+        Avc444FrameEncoding::LumaAndChroma,
         &stream1_regions,
         None,
         None,
@@ -916,7 +913,7 @@ fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
         &session.handle,
         &session.event_tx,
         surface_id,
-        encoder::Avc444FrameEncoding::Luma,
+        Avc444FrameEncoding::Luma,
         &[1, 2, 3],
         &regions,
         None,
