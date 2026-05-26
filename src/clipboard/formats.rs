@@ -1,3 +1,7 @@
+use std::io::{self, Read};
+
+pub(super) const MAX_CLIPBOARD_SIZE: usize = 100 * 1024 * 1024;
+
 pub(super) const TEXT_MIME: &str = "text/plain;charset=utf-8";
 pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
@@ -7,6 +11,19 @@ pub(super) const IMAGE_PNG_MIME: &str = "image/png";
 pub(super) enum PendingWrite {
     Text(Vec<u8>),
     Image(Vec<u8>), // PNG bytes
+}
+
+pub(super) fn read_bounded_clipboard_data<R: Read>(
+    reader: R,
+    max_size: usize,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut data = Vec::new();
+    let mut bounded = reader.take((max_size as u64).saturating_add(1));
+    bounded.read_to_end(&mut data)?;
+    if data.len() > max_size {
+        return Ok(None);
+    }
+    Ok(Some(data))
 }
 
 /// Fix a CF_DIB with BI_BITFIELDS compression (common on Windows for 32-bit BGRA).
@@ -122,6 +139,22 @@ mod tests {
         not_bitfields[14..16].copy_from_slice(&32u16.to_le_bytes());
         not_bitfields[16..20].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(fix_bitfields_dib(&not_bitfields), None);
+    }
+
+    #[test]
+    fn bounded_clipboard_read_accepts_payload_at_limit() {
+        let data = read_bounded_clipboard_data(std::io::Cursor::new(b"abcd"), 4)
+            .expect("bounded read succeeds");
+
+        assert_eq!(data, Some(b"abcd".to_vec()));
+    }
+
+    #[test]
+    fn bounded_clipboard_read_rejects_payload_over_limit() {
+        let data = read_bounded_clipboard_data(std::io::Cursor::new(b"abcde"), 4)
+            .expect("bounded read succeeds");
+
+        assert_eq!(data, None);
     }
 
     proptest! {

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -16,7 +16,10 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1,
 };
 
-use super::formats::{PendingWrite, IMAGE_PNG_MIME, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME};
+use super::formats::{
+    read_bounded_clipboard_data, PendingWrite, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME,
+    TEXT_PLAIN_MIME, UTF8_MIME,
+};
 
 pub(super) fn clipboard_thread(
     event_sender: mpsc::UnboundedSender<ServerEvent>,
@@ -400,14 +403,21 @@ fn read_offer_data(
         return None;
     }
 
-    let mut data = Vec::new();
     let mut file = std::fs::File::from(read_fd);
-    if let Err(e) = file.read_to_end(&mut data) {
-        tracing::warn!("Clipboard: failed to read offer data: {}", e);
-        return None;
+    match read_bounded_clipboard_data(&mut file, MAX_CLIPBOARD_SIZE) {
+        Ok(Some(data)) => Some(data),
+        Ok(None) => {
+            tracing::warn!(
+                max = MAX_CLIPBOARD_SIZE,
+                "Clipboard: offer data too large, ignoring"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!("Clipboard: failed to read offer data: {}", e);
+            None
+        }
     }
-
-    Some(data)
 }
 
 impl Dispatch<zwlr_data_control_offer_v1::ZwlrDataControlOfferV1, ()> for ClipState {

@@ -13,10 +13,8 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::formats::{fix_bitfields_dib, utf16le_to_utf8, PendingWrite};
+use super::formats::{fix_bitfields_dib, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE};
 use super::wayland::clipboard_thread;
-
-const MAX_CLIPBOARD_SIZE: usize = 100 * 1024 * 1024;
 
 pub struct HyprCliprdrFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
