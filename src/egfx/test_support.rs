@@ -11,6 +11,10 @@ use openh264::OpenH264API;
 use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::mpsc;
+use yuv::{
+    bgra_to_yuv444, BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange,
+    YuvStandardMatrix,
+};
 
 use super::{EgfxCodecPolicy, EgfxShared, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 
@@ -344,6 +348,45 @@ impl Avc444PresentationOracle {
             "each synthetic AVC444 frame must produce a distinct reconstructed presentation image"
         );
     }
+
+    pub(crate) fn assert_trace_matches_bgra_with_bounded_yuv444_error(
+        &mut self,
+        trace: &GfxPduTrace,
+        frame_index: usize,
+        bgra: &[u8],
+        stride: usize,
+        max_mean_abs_error: f32,
+        max_large_error_ratio: f32,
+    ) {
+        let image = reconstruct_avc444_trace_yuv444(
+            trace,
+            &mut self.decoder,
+            self.width,
+            self.height,
+            &mut self.previous_luma,
+            &mut self.previous_chroma,
+        );
+        let expected = bgra_to_yuv444_reference(self.width, self.height, bgra, stride);
+        let metrics = yuv444_error_metrics(&expected, &image);
+
+        assert!(
+            metrics.mean_abs_error <= max_mean_abs_error,
+            "AVC444 reconstructed YUV444 mean abs error too high for frame {frame_index}: {} > {}",
+            metrics.mean_abs_error,
+            max_mean_abs_error
+        );
+        assert!(
+            metrics.large_error_ratio <= max_large_error_ratio,
+            "AVC444 reconstructed YUV444 large-error ratio too high for frame {frame_index}: {} > {}",
+            metrics.large_error_ratio,
+            max_large_error_ratio
+        );
+
+        let hash = stable_hash(&image);
+        self.hashes.push(hash);
+        self.previous_hash = Some(hash);
+        self.previous_image = Some(image);
+    }
 }
 
 fn test_openh264_decoder() -> Decoder {
@@ -572,6 +615,59 @@ fn significant_byte_delta(left: &[u8], right: &[u8]) -> usize {
         .zip(right)
         .filter(|(a, b)| a.abs_diff(**b) > 2)
         .count()
+}
+
+fn bgra_to_yuv444_reference(width: usize, height: usize, bgra: &[u8], stride: usize) -> Vec<u8> {
+    let mut y = vec![0u8; width * height];
+    let mut u = vec![0u8; width * height];
+    let mut v = vec![0u8; width * height];
+    let mut image = YuvPlanarImageMut {
+        y_plane: BufferStoreMut::Borrowed(&mut y),
+        y_stride: width as u32,
+        u_plane: BufferStoreMut::Borrowed(&mut u),
+        u_stride: width as u32,
+        v_plane: BufferStoreMut::Borrowed(&mut v),
+        v_stride: width as u32,
+        width: width as u32,
+        height: height as u32,
+    };
+
+    bgra_to_yuv444(
+        &mut image,
+        bgra,
+        stride as u32,
+        YuvRange::Full,
+        YuvStandardMatrix::Bt709,
+        YuvConversionMode::Balanced,
+    )
+    .expect("BGRA test frame converts to YUV444");
+
+    y.extend_from_slice(&u);
+    y.extend_from_slice(&v);
+    y
+}
+
+struct Yuv444ErrorMetrics {
+    mean_abs_error: f32,
+    large_error_ratio: f32,
+}
+
+fn yuv444_error_metrics(expected: &[u8], actual: &[u8]) -> Yuv444ErrorMetrics {
+    assert_eq!(expected.len(), actual.len());
+    let mut total_error = 0usize;
+    let mut large_errors = 0usize;
+    for (&expected, &actual) in expected.iter().zip(actual) {
+        let error = expected.abs_diff(actual) as usize;
+        total_error += error;
+        if error > 32 {
+            large_errors += 1;
+        }
+    }
+
+    Yuv444ErrorMetrics {
+        mean_abs_error: total_error as f32 / expected.len() as f32,
+        large_error_ratio: large_errors as f32 / expected.len() as f32,
+    }
 }
 
 pub(crate) fn decode_gfx_output(message: &ironrdp_dvc::DvcMessage) -> GfxPdu {

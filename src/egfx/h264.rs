@@ -11,8 +11,9 @@ use openh264_sys2::{
     API as _, RC_BITRATE_MODE, RC_OFF_MODE, SM_FIXEDSLCNUM_SLICE, UNSPECIFIED_BIT_RATE,
     VIDEO_CODING_LAYER,
 };
+use std::ffi::CString;
 use std::os::raw::c_int;
-use std::ptr::{from_mut, null};
+use std::ptr::{from_mut, null, null_mut};
 use yuv::{
     bgra_to_yuv420, BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange,
     YuvStandardMatrix,
@@ -131,7 +132,8 @@ impl H264Encoder {
                 fps,
                 quality = qp,
                 rate_control = ?rate_control,
-                "FFmpeg/libx264 H.264 encoder settings"
+                vaapi = options.ffmpeg_vaapi,
+                "FFmpeg/libavcodec H.264 encoder settings"
             );
             return Self::from_encoder_impl(
                 H264EncoderImpl::Ffmpeg(FfmpegH264Encoder::new(
@@ -141,6 +143,7 @@ impl H264Encoder {
                     fps,
                     qp,
                     rate_control,
+                    options.ffmpeg_backend(),
                 )?),
                 width,
                 height,
@@ -406,6 +409,7 @@ pub(super) struct H264EncoderOptions {
     pub(super) vbr_qp_clamp: bool,
     pub(super) freerdp_openh264_params: bool,
     pub(super) ffmpeg_libavcodec: bool,
+    pub(super) ffmpeg_vaapi: bool,
 }
 
 impl Default for H264EncoderOptions {
@@ -421,6 +425,17 @@ impl Default for H264EncoderOptions {
             vbr_qp_clamp: true,
             freerdp_openh264_params: false,
             ffmpeg_libavcodec: false,
+            ffmpeg_vaapi: false,
+        }
+    }
+}
+
+impl H264EncoderOptions {
+    fn ffmpeg_backend(self) -> FfmpegH264Backend {
+        if self.ffmpeg_vaapi {
+            FfmpegH264Backend::Vaapi
+        } else {
+            FfmpegH264Backend::Software
         }
     }
 }
@@ -437,6 +452,15 @@ pub(super) fn avc444_h264_encoder_options() -> H264EncoderOptions {
         vbr_qp_clamp: false,
         freerdp_openh264_params: false,
         ffmpeg_libavcodec: true,
+        ffmpeg_vaapi: false,
+    }
+}
+
+#[cfg(feature = "vaapi")]
+pub(super) fn avc444_h264_vaapi_encoder_options() -> H264EncoderOptions {
+    H264EncoderOptions {
+        ffmpeg_vaapi: true,
+        ..avc444_h264_encoder_options()
     }
 }
 
@@ -549,6 +573,9 @@ struct FfmpegH264Encoder {
     height: usize,
     frame_index: i64,
     force_idr: bool,
+    codec_headers: Option<Vec<u8>>,
+    backend: FfmpegH264Backend,
+    hw_device_ctx: *mut ffmpeg::ffi::AVBufferRef,
 }
 
 impl FfmpegH264Encoder {
@@ -559,12 +586,17 @@ impl FfmpegH264Encoder {
         fps: u32,
         qp: u8,
         rate_control: H264RateControl,
+        backend: FfmpegH264Backend,
     ) -> Result<Self> {
         ffmpeg::init().context("failed to initialize FFmpeg")?;
         ffmpeg::log::set_level(ffmpeg::log::Level::Quiet);
-        let codec = ffmpeg::encoder::find_by_name("libx264")
-            .or_else(|| ffmpeg::encoder::find(ffmpeg::codec::Id::H264))
-            .context("FFmpeg H.264 encoder not found")?;
+        let codec = match backend {
+            FfmpegH264Backend::Software => ffmpeg::encoder::find_by_name("libx264")
+                .or_else(|| ffmpeg::encoder::find(ffmpeg::codec::Id::H264))
+                .context("FFmpeg H.264 encoder not found")?,
+            FfmpegH264Backend::Vaapi => ffmpeg::encoder::find_by_name("h264_vaapi")
+                .context("FFmpeg h264_vaapi encoder not found")?,
+        };
         let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec)
             .encoder()
             .video()
@@ -572,7 +604,7 @@ impl FfmpegH264Encoder {
 
         encoder.set_width(width as u32);
         encoder.set_height(height as u32);
-        encoder.set_format(ffmpeg::format::Pixel::YUV420P);
+        encoder.set_format(backend.pixel_format());
         encoder.set_time_base(ffmpeg::Rational(1, fps as i32));
         encoder.set_frame_rate(Some(ffmpeg::Rational(fps as i32, 1)));
         encoder.set_max_b_frames(0);
@@ -587,27 +619,28 @@ impl FfmpegH264Encoder {
             encoder.set_bit_rate(bitrate as usize);
         }
 
-        let mut options = ffmpeg::Dictionary::new();
-        options.set("preset", "medium");
-        options.set("tune", "zerolatency");
-        options.set("repeat-headers", "1");
-        options.set("annexb", "1");
-        options.set("open-gop", "0");
-        if matches!(rate_control, H264RateControl::Cqp) {
-            let qp = qp.min(51).to_string();
-            options.set("qp", &qp);
+        let options = ffmpeg_h264_encoder_options(backend, rate_control, qp);
+
+        let mut hw_device_ctx = null_mut();
+        if matches!(backend, FfmpegH264Backend::Vaapi) {
+            hw_device_ctx = create_freerdp_vaapi_device()?;
+            configure_freerdp_vaapi_frames(&mut encoder, hw_device_ctx, width, height)?;
         }
 
         let encoder = encoder
             .open_as_with(codec, options)
             .context("failed to open FFmpeg H.264 encoder")?;
+        let codec_headers = h264_headers_from_avcodec_context(unsafe { encoder.as_ptr() });
 
         Ok(Self {
             encoder,
             width: width as usize,
             height: height as usize,
-            frame_index: 0,
-            force_idr: false,
+            frame_index: 1,
+            force_idr: true,
+            codec_headers,
+            backend,
+            hw_device_ctx,
         })
     }
 
@@ -617,56 +650,28 @@ impl FfmpegH264Encoder {
         cached_sps_pps: &mut Option<Vec<u8>>,
         prepend_cached_sps_pps: bool,
     ) -> Result<EncodedH264> {
-        let mut frame = ffmpeg::frame::Video::new(
-            ffmpeg::format::Pixel::YUV420P,
-            self.width as u32,
-            self.height as u32,
-        );
-        frame.set_pts(Some(self.frame_index));
-        frame.set_color_space(ffmpeg::color::Space::BT709);
-        frame.set_color_range(ffmpeg::color::Range::JPEG);
-        if self.force_idr {
-            frame.set_kind(ffmpeg::picture::Type::I);
+        let mut frame = self.create_input_frame(yuv)?;
+        set_freerdp_ffmpeg_frame_metadata(&mut frame, self.frame_index);
+        let forced_keyframe = self.force_idr;
+        if forced_keyframe {
+            mark_ffmpeg_h264_keyframe(&mut frame);
             self.force_idr = false;
         } else {
             frame.set_kind(ffmpeg::picture::Type::None);
         }
         self.frame_index = self.frame_index.saturating_add(1);
 
-        let y_stride = frame.stride(0);
-        let u_stride = frame.stride(1);
-        let v_stride = frame.stride(2);
-        copy_yuv_plane(
-            yuv.y(),
-            self.width,
-            frame.data_mut(0),
-            y_stride,
-            self.height,
-        );
-        copy_yuv_plane(
-            yuv.u(),
-            self.width / 2,
-            frame.data_mut(1),
-            u_stride,
-            self.height / 2,
-        );
-        copy_yuv_plane(
-            yuv.v(),
-            self.width / 2,
-            frame.data_mut(2),
-            v_stride,
-            self.height / 2,
-        );
-
         self.encoder
             .send_frame(&frame)
             .context("FFmpeg H.264 send_frame failed")?;
 
         let mut data = Vec::new();
+        let mut packet_key = false;
         loop {
             let mut packet = ffmpeg::Packet::empty();
             match self.encoder.receive_packet(&mut packet) {
                 Ok(()) => {
+                    packet_key |= packet.is_key();
                     if let Some(packet_data) = packet.data() {
                         data.extend_from_slice(packet_data);
                     }
@@ -676,11 +681,24 @@ impl FfmpegH264Encoder {
                 Err(error) => return Err(error).context("FFmpeg H.264 receive_packet failed"),
             }
         }
+        ensure_ffmpeg_vaapi_packet_progress(self.backend, &data)?;
+
+        if self.codec_headers.is_none() {
+            self.codec_headers =
+                h264_headers_from_avcodec_context(unsafe { self.encoder.as_ptr() });
+        }
+        prepend_codec_headers_for_bootstrap(
+            &mut data,
+            self.codec_headers.as_deref(),
+            forced_keyframe || packet_key,
+        );
 
         let frame_type = if data.is_empty() {
             FrameType::Skip
         } else if annex_b_nal_types(&data).contains(&5) {
             FrameType::IDR
+        } else if packet_key {
+            FrameType::I
         } else {
             FrameType::P
         };
@@ -696,6 +714,370 @@ impl FfmpegH264Encoder {
 
     fn force_intra_frame(&mut self) {
         self.force_idr = true;
+    }
+
+    fn create_input_frame(&mut self, yuv: &impl YUVSource) -> Result<ffmpeg::frame::Video> {
+        match self.backend {
+            FfmpegH264Backend::Software => {
+                let mut frame = ffmpeg::frame::Video::new(
+                    ffmpeg::format::Pixel::YUV420P,
+                    self.width as u32,
+                    self.height as u32,
+                );
+                copy_yuv420p_to_frame(yuv, &mut frame, self.width, self.height);
+                Ok(frame)
+            }
+            FfmpegH264Backend::Vaapi => self.create_vaapi_input_frame(yuv),
+        }
+    }
+
+    fn create_vaapi_input_frame(&mut self, yuv: &impl YUVSource) -> Result<ffmpeg::frame::Video> {
+        let mut software_frame = ffmpeg::frame::Video::new(
+            ffmpeg::format::Pixel::NV12,
+            self.width as u32,
+            self.height as u32,
+        );
+        set_freerdp_ffmpeg_frame_color(&mut software_frame);
+        copy_yuv420p_to_nv12_frame(yuv, &mut software_frame, self.width, self.height);
+
+        let mut hardware_frame = ffmpeg::frame::Video::empty();
+        let status = unsafe {
+            ffmpeg::ffi::av_hwframe_get_buffer(
+                (*self.encoder.as_mut_ptr()).hw_frames_ctx,
+                hardware_frame.as_mut_ptr(),
+                0,
+            )
+        };
+        anyhow::ensure!(
+            status >= 0,
+            "FFmpeg VAAPI av_hwframe_get_buffer failed: {}",
+            ffmpeg_status(status)
+        );
+
+        let status = unsafe {
+            ffmpeg::ffi::av_hwframe_transfer_data(
+                hardware_frame.as_mut_ptr(),
+                software_frame.as_ptr(),
+                0,
+            )
+        };
+        anyhow::ensure!(
+            status >= 0,
+            "FFmpeg VAAPI av_hwframe_transfer_data failed: {}",
+            ffmpeg_status(status)
+        );
+
+        Ok(hardware_frame)
+    }
+}
+
+fn ffmpeg_h264_encoder_options(
+    backend: FfmpegH264Backend,
+    rate_control: H264RateControl,
+    qp: u8,
+) -> ffmpeg::Dictionary<'static> {
+    let mut options = ffmpeg::Dictionary::new();
+    options.set("preset", backend.freerdp_preset());
+    options.set("tune", "zerolatency");
+    match backend {
+        FfmpegH264Backend::Software => {
+            options.set("repeat-headers", "1");
+            options.set("annexb", "1");
+            options.set("open-gop", "0");
+            // AVC444 alternates luma/chroma pictures in one H.264 sequence; an
+            // autonomous scene-cut on the chroma picture resets references mid-LC.
+            options.set("sc_threshold", "0");
+        }
+        FfmpegH264Backend::Vaapi => {
+            options.set("idr_interval", "1");
+            options.set("async_depth", "1");
+            options.set("quality", "1");
+            if matches!(rate_control, H264RateControl::Cqp) {
+                options.set("rc_mode", "CQP");
+            }
+        }
+    }
+    if matches!(rate_control, H264RateControl::Cqp) {
+        let qp = qp.min(51).to_string();
+        options.set("qp", &qp);
+    }
+    options
+}
+
+fn mark_ffmpeg_h264_keyframe(frame: &mut ffmpeg::frame::Video) {
+    frame.set_kind(ffmpeg::picture::Type::I);
+    unsafe {
+        (*frame.as_mut_ptr()).flags |= ffmpeg::ffi::AV_FRAME_FLAG_KEY;
+    }
+}
+
+fn ensure_ffmpeg_vaapi_packet_progress(backend: FfmpegH264Backend, data: &[u8]) -> Result<()> {
+    if data.is_empty() && matches!(backend, FfmpegH264Backend::Vaapi) {
+        bail!("FFmpeg VAAPI H.264 receive_packet produced no packet for the submitted frame");
+    }
+    Ok(())
+}
+
+fn set_freerdp_ffmpeg_frame_metadata(frame: &mut ffmpeg::frame::Video, pts: i64) {
+    frame.set_pts(Some(pts));
+    set_freerdp_ffmpeg_frame_color(frame);
+}
+
+fn set_freerdp_ffmpeg_frame_color(frame: &mut ffmpeg::frame::Video) {
+    frame.set_color_space(ffmpeg::color::Space::BT709);
+    frame.set_color_range(ffmpeg::color::Range::JPEG);
+    unsafe {
+        (*frame.as_mut_ptr()).chroma_location = ffmpeg::ffi::AVChromaLocation::AVCHROMA_LOC_LEFT;
+    }
+}
+
+fn h264_headers_from_avcodec_context(
+    context: *const ffmpeg::ffi::AVCodecContext,
+) -> Option<Vec<u8>> {
+    if context.is_null() {
+        return None;
+    }
+
+    let (extradata, extradata_size) = unsafe { ((*context).extradata, (*context).extradata_size) };
+    if extradata.is_null() || extradata_size <= 0 {
+        return None;
+    }
+
+    let extradata = unsafe { std::slice::from_raw_parts(extradata, extradata_size as usize) };
+    h264_headers_from_extradata(extradata)
+}
+
+fn h264_headers_from_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    if let Some(headers) = extract_sps_pps(extradata) {
+        return Some(headers);
+    }
+
+    h264_headers_from_avcc_extradata(extradata)
+}
+
+fn h264_headers_from_avcc_extradata(extradata: &[u8]) -> Option<Vec<u8>> {
+    if extradata.len() < 7 || extradata[0] != 1 {
+        return None;
+    }
+
+    let mut offset = 5;
+    let sps_count = extradata[offset] & 0x1f;
+    offset += 1;
+
+    let mut headers = Vec::new();
+    for _ in 0..sps_count {
+        append_avcc_parameter_set(extradata, &mut offset, &mut headers)?;
+    }
+
+    if offset >= extradata.len() {
+        return None;
+    }
+    let pps_count = extradata[offset];
+    offset += 1;
+    for _ in 0..pps_count {
+        append_avcc_parameter_set(extradata, &mut offset, &mut headers)?;
+    }
+
+    if headers.is_empty() {
+        None
+    } else {
+        Some(headers)
+    }
+}
+
+fn append_avcc_parameter_set(
+    extradata: &[u8],
+    offset: &mut usize,
+    headers: &mut Vec<u8>,
+) -> Option<()> {
+    if *offset + 2 > extradata.len() {
+        return None;
+    }
+    let len = u16::from_be_bytes([extradata[*offset], extradata[*offset + 1]]) as usize;
+    *offset += 2;
+    if len == 0 || *offset + len > extradata.len() {
+        return None;
+    }
+
+    headers.extend_from_slice(&[0, 0, 0, 1]);
+    headers.extend_from_slice(&extradata[*offset..*offset + len]);
+    *offset += len;
+    Some(())
+}
+
+fn prepend_codec_headers_for_bootstrap(
+    data: &mut Vec<u8>,
+    codec_headers: Option<&[u8]>,
+    bootstrap_frame: bool,
+) {
+    let Some(codec_headers) = codec_headers else {
+        return;
+    };
+    if data.is_empty()
+        || !bootstrap_frame
+        || extract_sps_pps(data).is_some()
+        || codec_headers.is_empty()
+    {
+        return;
+    }
+
+    let mut combined = Vec::with_capacity(codec_headers.len() + data.len());
+    combined.extend_from_slice(codec_headers);
+    combined.extend_from_slice(data);
+    *data = combined;
+}
+
+impl Drop for FfmpegH264Encoder {
+    fn drop(&mut self) {
+        if !self.hw_device_ctx.is_null() {
+            unsafe {
+                ffmpeg::ffi::av_buffer_unref(from_mut(&mut self.hw_device_ctx));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FfmpegH264Backend {
+    Software,
+    Vaapi,
+}
+
+impl FfmpegH264Backend {
+    fn pixel_format(self) -> ffmpeg::format::Pixel {
+        match self {
+            Self::Software => ffmpeg::format::Pixel::YUV420P,
+            Self::Vaapi => ffmpeg::format::Pixel::VAAPI,
+        }
+    }
+
+    fn freerdp_preset(self) -> &'static str {
+        match self {
+            Self::Software => "medium",
+            Self::Vaapi => "veryslow",
+        }
+    }
+}
+
+fn create_freerdp_vaapi_device() -> Result<*mut ffmpeg::ffi::AVBufferRef> {
+    let device = std::env::var("FREERDP_VAAPI_DEVICE")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/dev/dri/renderD128".to_owned());
+    let device = CString::new(device).context("VAAPI device path contains NUL byte")?;
+    let mut hw_device_ctx = null_mut();
+    let status = unsafe {
+        ffmpeg::ffi::av_hwdevice_ctx_create(
+            from_mut(&mut hw_device_ctx),
+            ffmpeg::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+            device.as_ptr(),
+            null_mut(),
+            0,
+        )
+    };
+    anyhow::ensure!(
+        status >= 0,
+        "FFmpeg VAAPI av_hwdevice_ctx_create failed: {}",
+        ffmpeg_status(status)
+    );
+    Ok(hw_device_ctx)
+}
+
+fn configure_freerdp_vaapi_frames(
+    encoder: &mut ffmpeg::codec::encoder::video::Video,
+    hw_device_ctx: *mut ffmpeg::ffi::AVBufferRef,
+    width: i32,
+    height: i32,
+) -> Result<()> {
+    let mut hw_frames_ctx = unsafe { ffmpeg::ffi::av_hwframe_ctx_alloc(hw_device_ctx) };
+    anyhow::ensure!(
+        !hw_frames_ctx.is_null(),
+        "failed to create VAAPI frame context"
+    );
+
+    let init_status = unsafe {
+        let frames = (*hw_frames_ctx)
+            .data
+            .cast::<ffmpeg::ffi::AVHWFramesContext>();
+        (*frames).format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_VAAPI;
+        (*frames).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
+        (*frames).width = width;
+        (*frames).height = height;
+        (*frames).initial_pool_size = FREERDP_VAAPI_INITIAL_POOL_SIZE;
+        ffmpeg::ffi::av_hwframe_ctx_init(hw_frames_ctx)
+    };
+
+    if init_status < 0 {
+        unsafe {
+            ffmpeg::ffi::av_buffer_unref(from_mut(&mut hw_frames_ctx));
+        }
+        anyhow::bail!(
+            "FFmpeg VAAPI av_hwframe_ctx_init failed: {}",
+            ffmpeg_status(init_status)
+        );
+    }
+
+    let hw_frames_ref = unsafe { ffmpeg::ffi::av_buffer_ref(hw_frames_ctx) };
+    unsafe {
+        ffmpeg::ffi::av_buffer_unref(from_mut(&mut hw_frames_ctx));
+    }
+    anyhow::ensure!(
+        !hw_frames_ref.is_null(),
+        "failed to reference VAAPI frame context"
+    );
+
+    unsafe {
+        (*encoder.as_mut_ptr()).hw_frames_ctx = hw_frames_ref;
+    }
+    Ok(())
+}
+
+const FREERDP_VAAPI_INITIAL_POOL_SIZE: c_int = 20;
+
+fn ffmpeg_status(status: c_int) -> String {
+    let mut buffer = [0i8; 128];
+    let result = unsafe { ffmpeg::ffi::av_strerror(status, buffer.as_mut_ptr(), buffer.len()) };
+    if result < 0 {
+        return format!("status {status}");
+    }
+
+    unsafe { std::ffi::CStr::from_ptr(buffer.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn copy_yuv420p_to_frame(
+    yuv: &impl YUVSource,
+    frame: &mut ffmpeg::frame::Video,
+    width: usize,
+    height: usize,
+) {
+    let y_stride = frame.stride(0);
+    let u_stride = frame.stride(1);
+    let v_stride = frame.stride(2);
+    copy_yuv_plane(yuv.y(), width, frame.data_mut(0), y_stride, height);
+    copy_yuv_plane(yuv.u(), width / 2, frame.data_mut(1), u_stride, height / 2);
+    copy_yuv_plane(yuv.v(), width / 2, frame.data_mut(2), v_stride, height / 2);
+}
+
+fn copy_yuv420p_to_nv12_frame(
+    yuv: &impl YUVSource,
+    frame: &mut ffmpeg::frame::Video,
+    width: usize,
+    height: usize,
+) {
+    let y_stride = frame.stride(0);
+    copy_yuv_plane(yuv.y(), width, frame.data_mut(0), y_stride, height);
+
+    let uv_stride = frame.stride(1);
+    let uv = frame.data_mut(1);
+    for row in 0..height / 2 {
+        let uv_row = row * uv_stride;
+        let plane_row = row * (width / 2);
+        for x in 0..width / 2 {
+            uv[uv_row + x * 2] = yuv.u()[plane_row + x];
+            uv[uv_row + x * 2 + 1] = yuv.v()[plane_row + x];
+        }
     }
 }
 
@@ -970,6 +1352,13 @@ pub(super) fn is_h264_keyframe(frame_type: FrameType) -> bool {
     frame_type == FrameType::IDR || frame_type == FrameType::I
 }
 
+#[cfg(any(feature = "vaapi", test))]
+pub(super) fn initial_h264_bootstrap_is_sendable(encoded: &EncodedH264) -> bool {
+    !encoded.data.is_empty()
+        && is_h264_keyframe(encoded.frame_type)
+        && extract_sps_pps(&encoded.data).is_some()
+}
+
 fn encode_yuv_source_with_options(
     encoder: &mut Encoder,
     cached_sps_pps: &mut Option<Vec<u8>>,
@@ -1124,6 +1513,7 @@ mod tests {
         assert!(options.vbr_qp_clamp);
         assert!(!options.freerdp_openh264_params);
         assert!(!options.ffmpeg_libavcodec);
+        assert!(!options.ffmpeg_vaapi);
     }
 
     #[test]
@@ -1161,8 +1551,15 @@ mod tests {
 
     #[test]
     fn ffmpeg_libavcodec_context_keeps_freerdp_loop_filter_and_delay_policy() {
-        let encoder = match FfmpegH264Encoder::new(64, 64, 1_000_000, 30, 23, H264RateControl::Vbr)
-        {
+        let encoder = match FfmpegH264Encoder::new(
+            64,
+            64,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Vbr,
+            FfmpegH264Backend::Software,
+        ) {
             Ok(encoder) => encoder,
             Err(error) if format!("{error:#}").contains("FFmpeg H.264 encoder not found") => {
                 return;
@@ -1183,6 +1580,100 @@ mod tests {
             "FreeRDP libavcodec sets AV_CODEC_FLAG_LOOP_FILTER"
         );
         assert_eq!(delay, 0, "FreeRDP libavcodec sets delay=0");
+    }
+
+    #[test]
+    fn ffmpeg_libavcodec_initial_frame_requests_keyframe_bootstrap() {
+        let encoder = match FfmpegH264Encoder::new(
+            64,
+            64,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Vbr,
+            FfmpegH264Backend::Software,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("FFmpeg H.264 encoder not found") => {
+                return;
+            }
+            Err(error) => panic!("FFmpeg H.264 encoder initialization failed: {error:#}"),
+        };
+
+        assert!(
+            encoder.force_idr,
+            "initial FFmpeg AVC stream must not start with a P-slice"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_forced_keyframe_sets_picture_type_and_frame_key_flag() {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, 64, 64);
+
+        mark_ffmpeg_h264_keyframe(&mut frame);
+
+        assert_eq!(frame.kind(), ffmpeg::picture::Type::I);
+        assert!(
+            frame.is_key(),
+            "FFmpeg 8 key frames are marked with AV_FRAME_FLAG_KEY"
+        );
+    }
+
+    #[test]
+    fn ffmpeg_vaapi_backend_policy_matches_freerdp_hardware_frames_path() {
+        assert_eq!(
+            FfmpegH264Backend::Vaapi.pixel_format(),
+            ffmpeg::format::Pixel::VAAPI
+        );
+        assert_eq!(FfmpegH264Backend::Vaapi.freerdp_preset(), "veryslow");
+        assert_eq!(FREERDP_VAAPI_INITIAL_POOL_SIZE, 20);
+    }
+
+    #[test]
+    fn ffmpeg_vaapi_vbr_options_leave_rate_control_to_libavcodec() {
+        let options =
+            ffmpeg_h264_encoder_options(FfmpegH264Backend::Vaapi, H264RateControl::Vbr, 23);
+
+        assert_eq!(options.get("preset"), Some("veryslow"));
+        assert_eq!(options.get("tune"), Some("zerolatency"));
+        assert_eq!(options.get("idr_interval"), Some("1"));
+        assert_eq!(options.get("async_depth"), Some("1"));
+        assert_eq!(options.get("quality"), Some("1"));
+        assert_eq!(options.get("rc_mode"), None);
+        assert_eq!(options.get("repeat-headers"), None);
+        assert_eq!(options.get("annexb"), None);
+    }
+
+    #[test]
+    fn ffmpeg_vaapi_cqp_options_select_cqp_rate_control() {
+        let options =
+            ffmpeg_h264_encoder_options(FfmpegH264Backend::Vaapi, H264RateControl::Cqp, 23);
+
+        assert_eq!(options.get("rc_mode"), Some("CQP"));
+        assert_eq!(options.get("qp"), Some("23"));
+        assert_eq!(options.get("quality"), Some("1"));
+    }
+
+    #[test]
+    fn ffmpeg_frame_metadata_matches_freerdp_libavcodec_input() {
+        let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, 64, 64);
+
+        set_freerdp_ffmpeg_frame_metadata(&mut frame, 1);
+
+        assert_eq!(frame.pts(), Some(1));
+        assert_eq!(frame.color_space(), ffmpeg::color::Space::BT709);
+        assert_eq!(frame.color_range(), ffmpeg::color::Range::JPEG);
+        assert_eq!(frame.chroma_location(), ffmpeg::chroma::Location::Left);
+    }
+
+    #[test]
+    fn ffmpeg_vaapi_no_packet_output_is_encode_failure() {
+        let error = ensure_ffmpeg_vaapi_packet_progress(FfmpegH264Backend::Vaapi, &[])
+            .expect_err("VAAPI no-packet output must not become a sendable skip");
+
+        assert!(format!("{error:#}").contains("produced no packet"));
+        assert!(ensure_ffmpeg_vaapi_packet_progress(FfmpegH264Backend::Software, &[]).is_ok());
+        assert!(ensure_ffmpeg_vaapi_packet_progress(FfmpegH264Backend::Vaapi, &[1]).is_ok());
     }
 
     #[test]
@@ -1328,6 +1819,67 @@ mod tests {
         ];
 
         assert_eq!(annex_b_nal_types(&stream), vec![7, 8]);
+    }
+
+    #[test]
+    fn avcc_extradata_is_converted_to_annex_b_sps_pps() {
+        let extradata = [
+            1, 0x64, 0, 0x1f, 0xff, 0xe1, 0x00, 0x03, 0x67, 0xaa, 0xbb, 0x01, 0x00, 0x02, 0x68,
+            0xcc,
+        ];
+
+        let headers = h264_headers_from_extradata(&extradata).expect("AVCC headers");
+
+        assert_eq!(
+            headers,
+            vec![0x00, 0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, 0x00, 0x00, 0x00, 0x01, 0x68, 0xcc,]
+        );
+        assert_eq!(annex_b_nal_types(&headers), vec![7, 8]);
+    }
+
+    #[test]
+    fn bootstrap_header_prepend_rejects_type_one_only_initial_output() {
+        let mut data = vec![0x00, 0x00, 0x01, 0x61, 0x11];
+        let headers = vec![0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x01, 0x68, 0xbb];
+
+        assert!(!initial_h264_bootstrap_is_sendable(&EncodedH264 {
+            data: data.clone(),
+            frame_type: FrameType::P,
+        }));
+
+        prepend_codec_headers_for_bootstrap(&mut data, Some(&headers), true);
+
+        assert_eq!(annex_b_nal_types(&data), vec![7, 8, 1]);
+        assert!(initial_h264_bootstrap_is_sendable(&EncodedH264 {
+            data,
+            frame_type: FrameType::I,
+        }));
+    }
+
+    #[test]
+    fn initial_bootstrap_requires_parameter_sets_and_key_picture() {
+        let idr_without_headers = EncodedH264 {
+            data: vec![0x00, 0x00, 0x01, 0x65, 0x11],
+            frame_type: FrameType::IDR,
+        };
+        let headers_with_delta = EncodedH264 {
+            data: vec![
+                0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x01, 0x68, 0xbb, 0x00, 0x00, 0x01, 0x61,
+                0xcc,
+            ],
+            frame_type: FrameType::P,
+        };
+        let complete = EncodedH264 {
+            data: vec![
+                0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x01, 0x68, 0xbb, 0x00, 0x00, 0x01, 0x65,
+                0xcc,
+            ],
+            frame_type: FrameType::IDR,
+        };
+
+        assert!(!initial_h264_bootstrap_is_sendable(&idr_without_headers));
+        assert!(!initial_h264_bootstrap_is_sendable(&headers_with_delta));
+        assert!(initial_h264_bootstrap_is_sendable(&complete));
     }
 
     proptest! {

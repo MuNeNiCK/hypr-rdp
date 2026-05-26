@@ -4,6 +4,9 @@ use super::encoder;
 #[cfg(feature = "vaapi")]
 use super::vaapi;
 
+#[cfg(feature = "vaapi")]
+const AVC444_VAAPI_OPT_IN_ENV: &str = "HYPR_RDP_AVC444_VAAPI";
+
 #[cfg(test)]
 pub(crate) type Avc444ReferenceRegions<'a> =
     (&'a [(i32, i32, i32, i32)], &'a [(i32, i32, i32, i32)]);
@@ -186,24 +189,31 @@ impl FrameEncoder {
     ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
         {
-            match encoder::Avc444Encoder::new_with_vaapi(
-                width,
-                height,
-                bitrate,
-                fps,
-                quality,
-                rate_control,
-            ) {
-                Ok(enc) => {
-                    tracing::info!("Using VA-API hardware AVC444 encoder");
-                    return Ok(Self::SoftwareAvc444(Box::new(enc)));
+            if std::env::var_os(AVC444_VAAPI_OPT_IN_ENV).is_some() {
+                match encoder::Avc444Encoder::new_with_vaapi(
+                    width,
+                    height,
+                    bitrate,
+                    fps,
+                    quality,
+                    rate_control,
+                ) {
+                    Ok(enc) => {
+                        tracing::info!("Using FFmpeg/VAAPI hardware AVC444 encoder");
+                        return Ok(Self::SoftwareAvc444(Box::new(enc)));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "VA-API AVC444 init failed, falling back to software: {:#}",
+                            e
+                        );
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        "VA-API AVC444 init failed, falling back to software: {:#}",
-                        e
-                    );
-                }
+            } else {
+                tracing::info!(
+                    env = AVC444_VAAPI_OPT_IN_ENV,
+                    "VA-API AVC444 is disabled unless explicitly opted in"
+                );
             }
         }
 

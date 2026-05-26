@@ -5,11 +5,18 @@ use std::time::{Duration, Instant};
 use ironrdp_egfx::pdu::{Avc420Region, Codec1Type, Encoding};
 use ironrdp_server::{EgfxServerMessage, ServerEvent};
 
+#[cfg(feature = "vaapi")]
+use super::h264::avc444_h264_vaapi_encoder_options;
+#[cfg(feature = "vaapi")]
+use super::h264::initial_h264_bootstrap_is_sendable;
 use super::h264::{
     annex_b_nal_types, avc444_h264_encoder_options, is_h264_keyframe, EncodedH264, H264Encoder,
     H264EncoderOptions,
 };
 use super::{avc420, EgfxShared, H264RateControl};
+
+#[cfg(feature = "vaapi")]
+const AVC444_VAAPI_VBR_BITRATE_MULTIPLIER: u32 = 4;
 
 pub struct Avc444EncodedFrame {
     pub encoding: Avc444FrameEncoding,
@@ -40,6 +47,12 @@ impl Avc444EncodedFrame {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Avc444FrameEncoding {
     LumaAndChroma,
+    Luma,
+    Chroma,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Avc444SubframeRole {
     Luma,
     Chroma,
 }
@@ -346,7 +359,11 @@ impl Avc444Encoder {
             h264_options,
         )?;
 
-        Self::new_with_encoder(width, height, Avc444H264Encoder::Software(encoder))
+        Self::new_with_encoder(
+            width,
+            height,
+            Avc444H264Encoder::Software(Box::new(encoder)),
+        )
     }
 
     #[cfg(feature = "vaapi")]
@@ -366,9 +383,38 @@ impl Avc444Encoder {
             );
         }
 
-        let encoder =
-            super::vaapi::VaapiEncoder::new(width, height, bitrate, fps, qp, rate_control)?;
-        Self::new_with_encoder(width, height, Avc444H264Encoder::Vaapi(Box::new(encoder)))
+        let effective_bitrate = avc444_vaapi_effective_bitrate(bitrate, rate_control);
+        tracing::info!(
+            requested_bitrate = bitrate,
+            effective_bitrate,
+            multiplier = AVC444_VAAPI_VBR_BITRATE_MULTIPLIER,
+            rate_control = ?rate_control,
+            "Configuring FFmpeg/VAAPI AVC444 bitrate"
+        );
+
+        Self::validate_vaapi_avc444_bootstrap(
+            width,
+            height,
+            effective_bitrate,
+            fps,
+            qp,
+            rate_control,
+        )?;
+
+        let encoder = H264Encoder::new_with_options(
+            width,
+            height,
+            effective_bitrate,
+            fps,
+            qp,
+            rate_control,
+            avc444_h264_vaapi_encoder_options(),
+        )?;
+        Self::new_with_encoder(
+            width,
+            height,
+            Avc444H264Encoder::FfmpegVaapi(Box::new(encoder)),
+        )
     }
 
     fn new_with_encoder(width: u32, height: u32, encoder: Avc444H264Encoder) -> Result<Self> {
@@ -396,6 +442,37 @@ impl Avc444Encoder {
             force_chroma_on_next_frame: true,
             perf_stats: Avc444PerfStats::new(),
         })
+    }
+
+    #[cfg(feature = "vaapi")]
+    fn validate_vaapi_avc444_bootstrap(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        qp: u8,
+        rate_control: H264RateControl,
+    ) -> Result<()> {
+        let mut encoder = H264Encoder::new_with_options(
+            width,
+            height,
+            bitrate,
+            fps,
+            qp,
+            rate_control,
+            avc444_h264_vaapi_encoder_options(),
+        )?;
+        let y = vec![16; width as usize * height as usize];
+        let uv = vec![128; (width as usize / 2) * (height as usize / 2)];
+        let encoded = encoder.encode_yuv420_raw(&y, &uv, &uv)?;
+        anyhow::ensure!(
+            initial_h264_bootstrap_is_sendable(&encoded),
+            "FFmpeg/VAAPI AVC444 initial H.264 stream is not decoder-bootstrap-safe: frame_type={:?}, nal_types={:?}, bytes={}",
+            encoded.frame_type,
+            annex_b_nal_types(&encoded.data),
+            encoded.data.len()
+        );
+        Ok(())
     }
 
     pub(crate) fn backend_name(&self) -> &'static str {
@@ -514,9 +591,12 @@ impl Avc444Encoder {
             stream2_encode_elapsed,
         ) = if !luma_regions.is_empty() {
             let stream1_encode_start = Instant::now();
-            let luma = self
-                .encoder
-                .encode_yuv420_raw(&self.y444, &self.main_u, &self.main_v)?;
+            let luma = self.encoder.encode_avc444_yuv420_raw(
+                Avc444SubframeRole::Luma,
+                &self.y444,
+                &self.main_u,
+                &self.main_v,
+            )?;
             let stream1_encode_elapsed = stream1_encode_start.elapsed();
             if chroma_protocol_regions.is_empty() {
                 self.last_chroma_encoded = false;
@@ -531,13 +611,13 @@ impl Avc444Encoder {
                     Duration::ZERO,
                 )
             } else {
-                if force_full_frame {
-                    self.encoder.force_idr();
-                }
                 let stream2_encode_start = Instant::now();
-                let chroma =
-                    self.encoder
-                        .encode_yuv420_raw(&self.aux_y, &self.aux_u, &self.aux_v)?;
+                let chroma = self.encoder.encode_avc444_yuv420_raw(
+                    Avc444SubframeRole::Chroma,
+                    &self.aux_y,
+                    &self.aux_u,
+                    &self.aux_v,
+                )?;
                 let stream2_encode_elapsed = stream2_encode_start.elapsed();
                 self.last_chroma_encoded = true;
                 self.debug_log_frame(&luma, &chroma, &luma_regions, &chroma_protocol_regions);
@@ -553,9 +633,12 @@ impl Avc444Encoder {
             }
         } else {
             let stream1_encode_start = Instant::now();
-            let chroma = self
-                .encoder
-                .encode_yuv420_raw(&self.aux_y, &self.aux_u, &self.aux_v)?;
+            let chroma = self.encoder.encode_avc444_yuv420_raw(
+                Avc444SubframeRole::Chroma,
+                &self.aux_y,
+                &self.aux_u,
+                &self.aux_v,
+            )?;
             let stream1_encode_elapsed = stream1_encode_start.elapsed();
             self.last_chroma_encoded = true;
             self.debug_log_frame(
@@ -700,18 +783,38 @@ impl Avc444Encoder {
     }
 }
 
+#[cfg(feature = "vaapi")]
+fn avc444_vaapi_effective_bitrate(bitrate: u32, rate_control: H264RateControl) -> u32 {
+    match rate_control {
+        H264RateControl::Vbr => bitrate.saturating_mul(AVC444_VAAPI_VBR_BITRATE_MULTIPLIER),
+        H264RateControl::Cqp => bitrate,
+    }
+}
+
 enum Avc444H264Encoder {
-    Software(H264Encoder),
+    Software(Box<H264Encoder>),
     #[cfg(feature = "vaapi")]
-    Vaapi(Box<super::vaapi::VaapiEncoder>),
+    FfmpegVaapi(Box<H264Encoder>),
 }
 
 impl Avc444H264Encoder {
-    fn encode_yuv420_raw(&mut self, y: &[u8], u: &[u8], v: &[u8]) -> Result<EncodedH264> {
+    fn encode_avc444_yuv420_raw(
+        &mut self,
+        role: Avc444SubframeRole,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<EncodedH264> {
         match self {
-            Self::Software(encoder) => encoder.encode_yuv420_raw(y, u, v),
+            Self::Software(encoder) => {
+                let _ = role;
+                encoder.encode_yuv420_raw(y, u, v)
+            }
             #[cfg(feature = "vaapi")]
-            Self::Vaapi(encoder) => encoder.encode_yuv420_raw(y, u, v),
+            Self::FfmpegVaapi(encoder) => {
+                let _ = role;
+                encoder.encode_yuv420_raw(y, u, v)
+            }
         }
     }
 
@@ -719,7 +822,7 @@ impl Avc444H264Encoder {
         match self {
             Self::Software(encoder) => encoder.force_idr(),
             #[cfg(feature = "vaapi")]
-            Self::Vaapi(encoder) => encoder.force_idr(),
+            Self::FfmpegVaapi(encoder) => encoder.force_idr(),
         }
     }
 
@@ -727,7 +830,7 @@ impl Avc444H264Encoder {
         match self {
             Self::Software(_) => "ffmpeg-avc444",
             #[cfg(feature = "vaapi")]
-            Self::Vaapi(_) => "vaapi-avc444",
+            Self::FfmpegVaapi(_) => "ffmpeg-vaapi-avc444",
         }
     }
 
@@ -735,7 +838,7 @@ impl Avc444H264Encoder {
         match self {
             Self::Software(_) => false,
             #[cfg(feature = "vaapi")]
-            Self::Vaapi(_) => true,
+            Self::FfmpegVaapi(_) => true,
         }
     }
 
@@ -744,7 +847,7 @@ impl Avc444H264Encoder {
         match self {
             Self::Software(encoder) => encoder.force_idr_requests_for_test(),
             #[cfg(feature = "vaapi")]
-            Self::Vaapi(_) => 0,
+            Self::FfmpegVaapi(encoder) => encoder.force_idr_requests_for_test(),
         }
     }
 }
@@ -1508,7 +1611,7 @@ fn detect_yuv420_regions(
                     tile_right,
                     tile_bottom,
                 ) {
-                    merge_region(
+                    push_unique_region(
                         &mut regions,
                         (
                             tile_x as i32,
@@ -1557,11 +1660,11 @@ fn detect_avc444_v2_chroma_regions(
         }
 
         for region in changed {
-            merge_region(&mut packed_regions, region);
+            push_unique_region(&mut packed_regions, region);
             for protocol_region in
                 avc444_v2_chroma_packed_region_to_protocol_regions(width, height, region)
             {
-                merge_region(&mut protocol_regions, protocol_region);
+                push_unique_region(&mut protocol_regions, protocol_region);
             }
         }
     }
@@ -1778,6 +1881,12 @@ fn merge_region(regions: &mut Vec<(i32, i32, i32, i32)>, region: (i32, i32, i32,
     regions.push(merged);
 }
 
+fn push_unique_region(regions: &mut Vec<(i32, i32, i32, i32)>, region: (i32, i32, i32, i32)) {
+    if !regions.contains(&region) {
+        regions.push(region);
+    }
+}
+
 fn regions_overlap_or_touch(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> bool {
     let a_right = a.0.saturating_add(a.2);
     let a_bottom = a.1.saturating_add(a.3);
@@ -1817,6 +1926,35 @@ mod tests {
         assert!(!options.vbr_qp_clamp);
         assert!(!options.freerdp_openh264_params);
         assert!(options.ffmpeg_libavcodec);
+        assert!(!options.ffmpeg_vaapi);
+    }
+
+    #[cfg(feature = "vaapi")]
+    #[test]
+    fn avc444_vaapi_options_use_freerdp_ffmpeg_h264_vaapi_policy() {
+        let options = avc444_h264_vaapi_encoder_options();
+
+        assert!(options.ffmpeg_libavcodec);
+        assert!(options.ffmpeg_vaapi);
+        assert!(!options.freerdp_openh264_params);
+        assert!(!options.vbr_qp_clamp);
+    }
+
+    #[cfg(feature = "vaapi")]
+    #[test]
+    fn avc444_vaapi_vbr_uses_effective_bitrate_for_two_subframe_stream() {
+        assert_eq!(
+            avc444_vaapi_effective_bitrate(10_000_000, H264RateControl::Vbr),
+            40_000_000
+        );
+        assert_eq!(
+            avc444_vaapi_effective_bitrate(10_000_000, H264RateControl::Cqp),
+            10_000_000
+        );
+        assert_eq!(
+            avc444_vaapi_effective_bitrate(u32::MAX, H264RateControl::Vbr),
+            u32::MAX
+        );
     }
 
     #[test]
@@ -2643,7 +2781,11 @@ mod tests {
             vec![(0, 0, width as i32, height as i32)]
         );
         assert!(annex_b_nal_types(&recovered.stream1).contains(&5));
-        assert!(annex_b_nal_types(&recovered.stream2).contains(&5));
+        assert!(
+            !annex_b_nal_types(&recovered.stream2).contains(&5),
+            "forced recovery must not insert a second IDR on the chroma subframe: {:?}",
+            annex_b_nal_types(&recovered.stream2)
+        );
         assert!(!recovered.stream2.is_empty());
     }
 
@@ -2715,12 +2857,16 @@ mod tests {
             vec![(0, 0, width as i32, height as i32)]
         );
         assert!(annex_b_nal_types(&recovered.stream1).contains(&5));
-        assert!(annex_b_nal_types(&recovered.stream2).contains(&5));
+        assert!(
+            !annex_b_nal_types(&recovered.stream2).contains(&5),
+            "forced recovery must not insert a second IDR on the chroma subframe: {:?}",
+            annex_b_nal_types(&recovered.stream2)
+        );
         assert!(!recovered.stream2.is_empty());
     }
 
     #[test]
-    fn avc444_vbr_force_idr_refresh_includes_chroma_idr() {
+    fn avc444_vbr_force_idr_refresh_does_not_insert_mid_lc_chroma_idr() {
         let width = 64;
         let height = 64;
         let stride = width * 4;
@@ -2764,10 +2910,63 @@ mod tests {
             annex_b_nal_types(&refresh.stream1)
         );
         assert!(
-            annex_b_nal_types(&refresh.stream2).contains(&5),
-            "refresh chroma must be IDR: {:?}",
+            !annex_b_nal_types(&refresh.stream2).contains(&5),
+            "LC=0 chroma must not receive an extra mid-frame IDR after luma: {:?}",
             annex_b_nal_types(&refresh.stream2)
         );
+    }
+
+    #[test]
+    fn avc444_vbr_motion_does_not_emit_stream2_only_idr() {
+        let width = 128;
+        let height = 128;
+        let stride = width * 4;
+        let mut encoder = match Avc444Encoder::new(
+            width as u32,
+            height as u32,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Vbr,
+        ) {
+            Ok(encoder) => encoder,
+            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
+        };
+
+        for frame_index in 0..90 {
+            let mut frame = gradient_bgra_frame(width, height, stride);
+            let offset = (frame_index * 7) % (width - 32);
+            for y in 32..96 {
+                for x in offset..offset + 32 {
+                    let color = if frame_index % 2 == 0 { 24 } else { 224 };
+                    write_bgra_pixel(&mut frame, stride, x, y, color, 255 - color, color / 2);
+                }
+            }
+
+            let encoded = encoder
+                .encode(&frame, stride, &[(0, 0, width as i32, height as i32)])
+                .expect("motion frame encodes");
+            assert_eq!(encoded.encoding, Avc444FrameEncoding::LumaAndChroma);
+            let stream1_has_idr = annex_b_nal_types(&encoded.stream1).contains(&5);
+            let stream2_has_idr = annex_b_nal_types(&encoded.stream2).contains(&5);
+
+            if frame_index == 0 {
+                assert!(
+                    stream1_has_idr,
+                    "initial luma stream must establish the H.264 sequence"
+                );
+            } else {
+                assert!(
+                    !stream2_has_idr || stream1_has_idr,
+                    "steady AVC444 motion must not emit a stream2-only IDR at frame {frame_index}: stream1={:?} stream2={:?}",
+                    annex_b_nal_types(&encoded.stream1),
+                    annex_b_nal_types(&encoded.stream2)
+                );
+            }
+
+            encoder.commit_reference();
+        }
     }
 
     #[test]
@@ -3257,6 +3456,39 @@ mod tests {
         );
 
         assert_eq!(regions, vec![(64, 0, 64, 64)]);
+    }
+
+    #[test]
+    fn yuv420_region_detection_preserves_l_shaped_tiles_without_outer_union() {
+        let width = 128;
+        let height = 128;
+        let y = vec![0; width * height];
+        let u = vec![128; (width / 2) * (height / 2)];
+        let v = vec![128; (width / 2) * (height / 2)];
+        let reference = Yuv420Reference {
+            y: y.clone(),
+            u: u.clone(),
+            v: v.clone(),
+        };
+
+        let mut changed_y = y;
+        changed_y[10 * width + 10] = 1;
+        changed_y[10 * width + 70] = 1;
+        changed_y[70 * width + 10] = 1;
+        let regions = detect_yuv420_regions(
+            width,
+            height,
+            &changed_y,
+            &u,
+            &v,
+            Some(&reference),
+            &[(0, 0, width as i32, height as i32)],
+        );
+
+        assert_eq!(
+            regions,
+            vec![(0, 0, 64, 64), (64, 0, 64, 64), (0, 64, 64, 64)]
+        );
     }
 
     #[test]

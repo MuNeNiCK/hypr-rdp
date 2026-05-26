@@ -13,9 +13,7 @@ use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 use libva_sys::va_display_drm as va;
-use openh264::encoder::FrameType;
 
-use super::h264::{annex_b_nal_types, EncodedH264};
 use super::vaapi_sys::{
     self as sys, VAConfigAttrib, VADRMPRIMESurfaceDescriptor, VAImageFormat, VAProfile, VaBuffer,
     VaConfig, VaContext, VaDisplay, VaImageMapping, VaSurface, VA_INVALID_ID, VA_INVALID_SURFACE,
@@ -24,13 +22,13 @@ use super::vaapi_sys::{
 use super::H264RateControl;
 
 const INPUT_SURFACE_POOL_SIZE: usize = 3;
-const RECON_SURFACE_POOL_SIZE: usize = 2;
 const CODED_BUFFER_COUNT: usize = 3;
 
 const SLICE_TYPE_I: u8 = 2;
 const SLICE_TYPE_P: u8 = 0;
 
 const IDR_INTERVAL: u32 = 30;
+const H264_DEFAULT_PIC_INIT_QP: u8 = 26;
 
 /// Scan /dev/dri/renderD* for a VA-API device that supports H.264 encoding.
 fn find_vaapi_device() -> Result<PathBuf> {
@@ -98,11 +96,95 @@ fn find_vaapi_device() -> Result<PathBuf> {
     )
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DpbEntry {
     surface_id: u32,
     frame_num: u16,
     poc: i32,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum VaapiAvc444Subframe {
+    Luma,
+    Chroma,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VaapiEncodeRole {
+    Generic,
+    #[cfg(test)]
+    Avc444(VaapiAvc444Subframe),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VaapiReferenceMode {
+    Single,
+    #[cfg(test)]
+    Avc444Subframes,
+}
+
+impl VaapiReferenceMode {
+    fn max_num_ref_frames(self) -> u32 {
+        1
+    }
+
+    fn recon_surface_pool_size(self) -> usize {
+        self.max_num_ref_frames() as usize + 1
+    }
+
+    fn uses_periodic_idr(self) -> bool {
+        self == Self::Single
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct VaapiReferenceState {
+    last: Option<DpbEntry>,
+    #[cfg(test)]
+    avc444_luma: Option<DpbEntry>,
+    #[cfg(test)]
+    avc444_chroma: Option<DpbEntry>,
+}
+
+impl VaapiReferenceState {
+    fn clear(&mut self) {
+        self.last = None;
+        #[cfg(test)]
+        {
+            self.avc444_luma = None;
+            self.avc444_chroma = None;
+        }
+    }
+
+    fn primary_reference(&self, role: VaapiEncodeRole) -> Option<DpbEntry> {
+        let _ = role;
+        self.last
+    }
+
+    fn reference_frames(&self, mode: VaapiReferenceMode, role: VaapiEncodeRole) -> Vec<DpbEntry> {
+        let mut refs = Vec::new();
+        if let Some(reference) = self.primary_reference(role) {
+            refs.push(reference);
+        }
+        let _ = mode;
+        refs
+    }
+
+    fn record(&mut self, role: VaapiEncodeRole, entry: DpbEntry) {
+        self.last = Some(entry);
+        match role {
+            VaapiEncodeRole::Generic => {}
+            #[cfg(test)]
+            VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Luma) => {
+                self.avc444_luma = Some(entry);
+            }
+            #[cfg(test)]
+            VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Chroma) => {
+                self.avc444_chroma = Some(entry);
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,6 +195,7 @@ struct VaapiRateControlPolicy {
     target_percentage: u32,
     initial_qp: u32,
     min_qp: u32,
+    rc_flags: u32,
     max_qp: u32,
 }
 
@@ -125,12 +208,13 @@ fn vaapi_rate_control_policy(
     match rate_control {
         H264RateControl::Vbr => VaapiRateControlPolicy {
             config_mode: sys::VA_RC_VBR,
-            pic_init_qp: qp,
+            pic_init_qp: H264_DEFAULT_PIC_INIT_QP,
             bits_per_second: bitrate,
-            target_percentage: 66,
-            initial_qp: qp.into(),
+            target_percentage: 100,
+            initial_qp: 0,
             min_qp: 0,
-            max_qp: u32::from(qp.max(1)),
+            rc_flags: 0,
+            max_qp: 0,
         },
         H264RateControl::Cqp => VaapiRateControlPolicy {
             config_mode: sys::VA_RC_CQP,
@@ -139,6 +223,7 @@ fn vaapi_rate_control_policy(
             target_percentage: 100,
             initial_qp: qp.into(),
             min_qp: qp.into(),
+            rc_flags: 1 << 1,
             max_qp: qp.into(),
         },
     }
@@ -155,7 +240,8 @@ pub struct VaapiEncoder {
     current_input_surface: usize,
     current_recon_surface: usize,
     current_coded_buffer: usize,
-    last_ref: Option<DpbEntry>,
+    references: VaapiReferenceState,
+    reference_mode: VaapiReferenceMode,
     cached_sps_pps: Option<Vec<u8>>,
     width: u32,
     height: u32,
@@ -177,6 +263,26 @@ impl VaapiEncoder {
         fps: u32,
         quality: u8,
         rate_control: H264RateControl,
+    ) -> Result<Self> {
+        Self::new_with_reference_mode(
+            width,
+            height,
+            bitrate,
+            fps,
+            quality,
+            rate_control,
+            VaapiReferenceMode::Single,
+        )
+    }
+
+    fn new_with_reference_mode(
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+        reference_mode: VaapiReferenceMode,
     ) -> Result<Self> {
         if width == 0 || height == 0 || !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
@@ -245,6 +351,7 @@ impl VaapiEncoder {
             )
             .map_err(|e| anyhow::anyhow!("Failed to create input surfaces: {}", e))?;
 
+        let recon_surface_count = reference_mode.recon_surface_pool_size();
         let recon_surfaces = display
             .create_surfaces(
                 VA_RT_FORMAT_YUV420,
@@ -252,7 +359,7 @@ impl VaapiEncoder {
                 width,
                 height,
                 Some(va::VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER),
-                RECON_SURFACE_POOL_SIZE,
+                recon_surface_count,
             )
             .map_err(|e| anyhow::anyhow!("Failed to create recon surfaces: {}", e))?;
 
@@ -298,7 +405,8 @@ impl VaapiEncoder {
             current_input_surface: 0,
             current_recon_surface: 0,
             current_coded_buffer: 0,
-            last_ref: None,
+            references: VaapiReferenceState::default(),
+            reference_mode,
             cached_sps_pps: None,
             width,
             height,
@@ -318,9 +426,15 @@ impl VaapiEncoder {
         self.force_idr = true;
     }
 
-    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
-        let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
+    fn is_idr_frame(&self) -> bool {
+        self.force_idr
+            || (self.reference_mode.uses_periodic_idr()
+                && self.frame_count.is_multiple_of(IDR_INTERVAL as u64))
+    }
 
+    pub fn encode(&mut self, bgra: &[u8], stride: usize) -> Result<Vec<u8>> {
+        let role = VaapiEncodeRole::Generic;
+        let is_idr = self.is_idr_frame();
         let input_idx = self.current_input_surface;
         self.current_input_surface = (self.current_input_surface + 1) % self.input_surfaces.len();
 
@@ -376,7 +490,7 @@ impl VaapiEncoder {
         let mut picture_buffers = Vec::new();
 
         if is_idr {
-            self.last_ref = None;
+            self.references.clear();
 
             let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
             let seq_buffer = self
@@ -398,6 +512,7 @@ impl VaapiEncoder {
             is_idr,
             frame_num,
             poc,
+            role,
         );
         let pic_buffer = self
             .context
@@ -409,7 +524,7 @@ impl VaapiEncoder {
             .context("Failed to create pic buffer")?;
         picture_buffers.push(pic_buffer);
 
-        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
+        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc, role);
         let slice_buffer = self
             .context
             .create_buffer(
@@ -424,11 +539,14 @@ impl VaapiEncoder {
             .render_picture(self.input_surfaces[input_idx].id(), &picture_buffers)?;
 
         // Update DPB
-        self.last_ref = Some(DpbEntry {
-            surface_id: self.recon_surfaces[recon_idx].id(),
-            frame_num,
-            poc,
-        });
+        self.references.record(
+            role,
+            DpbEntry {
+                surface_id: self.recon_surfaces[recon_idx].id(),
+                frame_num,
+                poc,
+            },
+        );
 
         // Read encoded bitstream
         let mut data = self.coded_buffers[coded_idx].read_coded()?;
@@ -461,126 +579,6 @@ impl VaapiEncoder {
         self.frame_count += 1;
 
         Ok(data)
-    }
-
-    pub(super) fn encode_yuv420_raw(
-        &mut self,
-        y: &[u8],
-        u: &[u8],
-        v: &[u8],
-    ) -> Result<EncodedH264> {
-        let y_len = (self.width * self.height) as usize;
-        let uv_len = ((self.width / 2) * (self.height / 2)) as usize;
-        anyhow::ensure!(y.len() >= y_len, "Y plane too small");
-        anyhow::ensure!(u.len() >= uv_len, "U plane too small");
-        anyhow::ensure!(v.len() >= uv_len, "V plane too small");
-
-        let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
-
-        let input_idx = self.current_input_surface;
-        self.current_input_surface = (self.current_input_surface + 1) % self.input_surfaces.len();
-
-        let recon_idx = self.current_recon_surface;
-        self.current_recon_surface = (self.current_recon_surface + 1) % self.recon_surfaces.len();
-
-        let coded_idx = self.current_coded_buffer;
-        self.current_coded_buffer = (self.current_coded_buffer + 1) % self.coded_buffers.len();
-
-        self.upload_yuv420_to_surface(input_idx, y, u, v)
-            .context("Failed to upload YUV420 planes to VA-API surface")?;
-
-        let mb_width = self.width.div_ceil(16);
-        let mb_height = self.height.div_ceil(16);
-        let num_macroblocks = mb_width * mb_height;
-        let frame_num = (self.frame_count % 256) as u16;
-        let poc = ((self.frame_count * 2) % 256) as i32;
-
-        let mut picture_buffers = Vec::new();
-
-        if is_idr {
-            self.last_ref = None;
-
-            let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
-            let seq_buffer = self
-                .context
-                .create_buffer(
-                    va::VABufferType_VAEncSequenceParameterBufferType,
-                    seq_param,
-                    "vaCreateBuffer (H.264 sequence)",
-                )
-                .context("Failed to create seq buffer")?;
-            picture_buffers.push(seq_buffer);
-
-            picture_buffers.extend(self.create_rate_control_buffers()?);
-        }
-
-        let pic_param = self.build_picture_params(
-            self.recon_surfaces[recon_idx].id(),
-            self.coded_buffers[coded_idx].id(),
-            is_idr,
-            frame_num,
-            poc,
-        );
-        let pic_buffer = self
-            .context
-            .create_buffer(
-                va::VABufferType_VAEncPictureParameterBufferType,
-                pic_param,
-                "vaCreateBuffer (H.264 picture)",
-            )
-            .context("Failed to create pic buffer")?;
-        picture_buffers.push(pic_buffer);
-
-        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
-        let slice_buffer = self
-            .context
-            .create_buffer(
-                va::VABufferType_VAEncSliceParameterBufferType,
-                slice_param,
-                "vaCreateBuffer (H.264 slice)",
-            )
-            .context("Failed to create slice buffer")?;
-        picture_buffers.push(slice_buffer);
-
-        self.context
-            .render_picture(self.input_surfaces[input_idx].id(), &picture_buffers)?;
-
-        self.last_ref = Some(DpbEntry {
-            surface_id: self.recon_surfaces[recon_idx].id(),
-            frame_num,
-            poc,
-        });
-
-        let mut data = self.coded_buffers[coded_idx].read_coded()?;
-
-        if is_idr {
-            if let Some(sps_pps) = super::extract_sps_pps(&data) {
-                self.cached_sps_pps = Some(sps_pps);
-            } else {
-                tracing::trace!("VA-API IDR missing SPS/PPS, synthesizing parameter sets");
-                let sps_pps = self.generate_sps_pps();
-                let mut combined = Vec::with_capacity(sps_pps.len() + data.len());
-                combined.extend_from_slice(&sps_pps);
-                combined.extend_from_slice(&data);
-                data = combined;
-                self.cached_sps_pps = Some(sps_pps);
-            }
-        }
-
-        if self.force_idr {
-            self.force_idr = false;
-        }
-        self.frame_count += 1;
-
-        let frame_type = if data.is_empty() {
-            FrameType::Skip
-        } else if annex_b_nal_types(&data).contains(&5) {
-            FrameType::IDR
-        } else {
-            FrameType::P
-        };
-
-        Ok(EncodedH264 { data, frame_type })
     }
 
     /// Encode from an NV12 DMA-BUF (zero-copy path).
@@ -638,7 +636,8 @@ impl VaapiEncoder {
             .as_ref()
             .expect("dmabuf_input_surface must be set before encode")
             .id();
-        let is_idr = self.force_idr || self.frame_count.is_multiple_of(IDR_INTERVAL as u64);
+        let role = VaapiEncodeRole::Generic;
+        let is_idr = self.is_idr_frame();
 
         let recon_idx = self.current_recon_surface;
         self.current_recon_surface = (self.current_recon_surface + 1) % self.recon_surfaces.len();
@@ -657,7 +656,7 @@ impl VaapiEncoder {
         let mut picture_buffers = Vec::new();
 
         if is_idr {
-            self.last_ref = None;
+            self.references.clear();
             let seq_param = self.build_sequence_params(mb_width as u16, mb_height as u16);
             let seq_buffer = self
                 .context
@@ -678,6 +677,7 @@ impl VaapiEncoder {
             is_idr,
             frame_num,
             poc,
+            role,
         );
         let pic_buffer = self
             .context
@@ -689,7 +689,7 @@ impl VaapiEncoder {
             .context("Failed to create pic buffer")?;
         picture_buffers.push(pic_buffer);
 
-        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc);
+        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc, role);
         let slice_buffer = self
             .context
             .create_buffer(
@@ -704,11 +704,14 @@ impl VaapiEncoder {
             .render_picture(dmabuf_surface_id, &picture_buffers)
             .map_err(|e| anyhow::anyhow!("VA-API render failed (dmabuf): {}", e))?;
 
-        self.last_ref = Some(DpbEntry {
-            surface_id: self.recon_surfaces[recon_idx].id(),
-            frame_num,
-            poc,
-        });
+        self.references.record(
+            role,
+            DpbEntry {
+                surface_id: self.recon_surfaces[recon_idx].id(),
+                frame_num,
+                poc,
+            },
+        );
 
         let mut data = self.coded_buffers[coded_idx].read_coded()?;
 
@@ -808,55 +811,6 @@ impl VaapiEncoder {
         }
     }
 
-    fn upload_yuv420_to_surface(
-        &self,
-        input_idx: usize,
-        y: &[u8],
-        u: &[u8],
-        v: &[u8],
-    ) -> Result<()> {
-        let mut image = VaImageMapping::create_from(
-            &self.input_surfaces[input_idx],
-            self.nv12_format,
-            self.width,
-            self.height,
-        )
-        .context("Failed to create VA image")?;
-
-        let (y_pitch, uv_pitch, y_offset, uv_offset) = {
-            let i = image.image();
-            (
-                i.pitches[0] as usize,
-                i.pitches[1] as usize,
-                i.offsets[0] as usize,
-                i.offsets[1] as usize,
-            )
-        };
-
-        let width = self.width as usize;
-        let height = self.height as usize;
-        let chroma_width = width / 2;
-        let chroma_height = height / 2;
-        let dst = image.data_mut();
-
-        for row in 0..height {
-            let src_start = row * width;
-            let dst_start = y_offset + row * y_pitch;
-            dst[dst_start..dst_start + width].copy_from_slice(&y[src_start..src_start + width]);
-        }
-
-        for row in 0..chroma_height {
-            let dst_start = uv_offset + row * uv_pitch;
-            let src_start = row * chroma_width;
-            for col in 0..chroma_width {
-                dst[dst_start + col * 2] = u[src_start + col];
-                dst[dst_start + col * 2 + 1] = v[src_start + col];
-            }
-        }
-
-        Ok(())
-    }
-
     fn get_h264_level(&self) -> u8 {
         let macroblocks_per_sec = (self.width / 16) * (self.height / 16) * self.fps;
         if macroblocks_per_sec <= 40500 {
@@ -886,7 +840,7 @@ impl VaapiEncoder {
         params.intra_idr_period = IDR_INTERVAL;
         params.ip_period = 1;
         params.bits_per_second = self.bitrate;
-        params.max_num_ref_frames = 1;
+        params.max_num_ref_frames = self.reference_mode.max_num_ref_frames();
         params.picture_width_in_mbs = mb_width;
         params.picture_height_in_mbs = mb_height;
         params.seq_fields = va::_VAEncSequenceParameterBufferH264__bindgen_ty_1 {
@@ -918,6 +872,7 @@ impl VaapiEncoder {
         is_idr: bool,
         frame_num: u16,
         poc: i32,
+        role: VaapiEncodeRole,
     ) -> va::VAEncPictureParameterBufferH264 {
         let curr_pic = picture_h264(
             recon_surface_id,
@@ -931,22 +886,20 @@ impl VaapiEncoder {
             picture_h264(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
         });
 
-        let num_ref_l0 = if !is_idr {
-            if let Some(ref entry) = self.last_ref {
-                reference_frames[0] = picture_h264(
-                    entry.surface_id,
-                    entry.frame_num as u32,
-                    VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-                    entry.poc,
-                    entry.poc,
-                );
-                1u8
-            } else {
-                0u8
-            }
+        let refs = if is_idr {
+            Vec::new()
         } else {
-            0u8
+            self.references.reference_frames(self.reference_mode, role)
         };
+        for (index, entry) in refs.iter().take(reference_frames.len()).enumerate() {
+            reference_frames[index] = picture_h264(
+                entry.surface_id,
+                entry.frame_num as u32,
+                VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+                entry.poc,
+                entry.poc,
+            );
+        }
 
         let transform_8x8 = if self.profile == sys::VA_PROFILE_H264_HIGH {
             1
@@ -964,7 +917,7 @@ impl VaapiEncoder {
         params.frame_num = frame_num;
         params.pic_init_qp =
             vaapi_rate_control_policy(self.bitrate, self.quality, self.rate_control).pic_init_qp;
-        params.num_ref_idx_l0_active_minus1 = if num_ref_l0 > 0 { num_ref_l0 - 1 } else { 0 };
+        params.num_ref_idx_l0_active_minus1 = 0;
         params.num_ref_idx_l1_active_minus1 = 0;
         params.chroma_qp_index_offset = 0;
         params.second_chroma_qp_index_offset = 0;
@@ -980,6 +933,7 @@ impl VaapiEncoder {
         is_idr: bool,
         frame_num: u16,
         poc: i32,
+        role: VaapiEncodeRole,
     ) -> va::VAEncSliceParameterBufferH264 {
         let slice_type = if is_idr { SLICE_TYPE_I } else { SLICE_TYPE_P };
 
@@ -990,19 +944,20 @@ impl VaapiEncoder {
             picture_h264(VA_INVALID_SURFACE, 0, VA_PICTURE_H264_INVALID, 0, 0)
         });
 
-        let (num_ref_override, num_ref_l0) = if !is_idr {
-            if let Some(ref entry) = self.last_ref {
-                ref_pic_list_0[0] = picture_h264(
-                    entry.surface_id,
-                    entry.frame_num as u32,
-                    VA_PICTURE_H264_SHORT_TERM_REFERENCE,
-                    entry.poc,
-                    entry.poc,
-                );
-                (1u8, 0u8)
-            } else {
-                (0u8, 0u8)
-            }
+        let primary_ref = if is_idr {
+            None
+        } else {
+            self.references.primary_reference(role)
+        };
+        let (num_ref_override, num_ref_l0) = if let Some(entry) = primary_ref {
+            ref_pic_list_0[0] = picture_h264(
+                entry.surface_id,
+                entry.frame_num as u32,
+                VA_PICTURE_H264_SHORT_TERM_REFERENCE,
+                entry.poc,
+                entry.poc,
+            );
+            (1u8, 0u8)
         } else {
             (0u8, 0u8)
         };
@@ -1049,7 +1004,9 @@ impl VaapiEncoder {
         rc.initial_qp = policy.initial_qp;
         rc.min_qp = policy.min_qp;
         rc.basic_unit_size = 0;
-        rc.rc_flags = va::_VAEncMiscParameterRateControl__bindgen_ty_1 { value: 1 << 1 };
+        rc.rc_flags = va::_VAEncMiscParameterRateControl__bindgen_ty_1 {
+            value: policy.rc_flags,
+        };
         rc.ICQ_quality_factor = 0;
         rc.max_qp = policy.max_qp;
         rc.quality_factor = 0;
@@ -1143,7 +1100,8 @@ impl VaapiEncoder {
         bs.write_ue(4); // log2_max_frame_num_minus4
         bs.write_ue(0); // pic_order_cnt_type
         bs.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4
-        bs.write_ue(1); // max_num_ref_frames
+        let max_num_ref_frames = self.reference_mode.max_num_ref_frames();
+        bs.write_ue(max_num_ref_frames); // max_num_ref_frames
         bs.write_bits(0, 1); // gaps_in_frame_num_value_allowed_flag
         bs.write_ue(mb_width - 1);
         bs.write_ue(mb_height - 1);
@@ -1185,7 +1143,7 @@ impl VaapiEncoder {
         bs.write_ue(16);
         bs.write_ue(16);
         bs.write_ue(0); // max_num_reorder_frames
-        bs.write_ue(1); // max_dec_frame_buffering
+        bs.write_ue(max_num_ref_frames); // max_dec_frame_buffering
 
         bs.write_rbsp_trailing_bits();
         buf.extend_from_slice(&bs.finish_with_emulation_prevention());
@@ -1382,17 +1340,91 @@ impl BitWriter {
 mod tests {
     use super::*;
 
+    fn dpb(surface_id: u32, frame_num: u16, poc: i32) -> DpbEntry {
+        DpbEntry {
+            surface_id,
+            frame_num,
+            poc,
+        }
+    }
+
     #[test]
-    fn vaapi_vbr_policy_uses_requested_bitrate_and_quality_ceiling() {
+    fn vaapi_avc444_reference_state_uses_single_h264_sequence_reference() {
+        let mut references = VaapiReferenceState::default();
+        let luma_0 = dpb(10, 0, 0);
+        let chroma_1 = dpb(11, 1, 2);
+
+        references.record(VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Luma), luma_0);
+        assert_eq!(
+            references.primary_reference(VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Chroma)),
+            Some(luma_0),
+            "the first chroma subframe after an IDR luma frame must continue the same H.264 sequence"
+        );
+
+        references.record(
+            VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Chroma),
+            chroma_1,
+        );
+
+        assert_eq!(
+            references.primary_reference(VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Luma)),
+            Some(chroma_1),
+            "the next luma subframe must use the immediately preceding chroma subframe as the single H.264 sequence reference"
+        );
+        assert_eq!(
+            references.primary_reference(VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Chroma)),
+            Some(chroma_1),
+            "the next chroma subframe must also use the immediately preceding H.264 sequence reference"
+        );
+
+        let luma_refs = references.reference_frames(
+            VaapiReferenceMode::Avc444Subframes,
+            VaapiEncodeRole::Avc444(VaapiAvc444Subframe::Luma),
+        );
+        assert_eq!(luma_refs, vec![chroma_1]);
+    }
+
+    #[test]
+    fn vaapi_avc444_reference_mode_matches_single_h264_sequence() {
+        assert_eq!(VaapiReferenceMode::Single.max_num_ref_frames(), 1);
+        assert_eq!(VaapiReferenceMode::Avc444Subframes.max_num_ref_frames(), 1);
+        assert!(VaapiReferenceMode::Single.uses_periodic_idr());
+        assert!(
+            !VaapiReferenceMode::Avc444Subframes.uses_periodic_idr(),
+            "AVC444 must not inject fixed IDR at subframe cadence"
+        );
+    }
+
+    #[test]
+    fn vaapi_avc444_recon_pool_keeps_current_surface_outside_single_ref() {
+        assert_eq!(VaapiReferenceMode::Single.recon_surface_pool_size(), 2);
+        assert_eq!(
+            VaapiReferenceMode::Avc444Subframes.recon_surface_pool_size(),
+            2
+        );
+
+        let pool_size = VaapiReferenceMode::Avc444Subframes.recon_surface_pool_size();
+        let previous_recon = 0;
+        let next_recon = 1 % pool_size;
+
+        assert_ne!(
+            next_recon, previous_recon,
+            "next CurrPic must not reuse the single active reference surface"
+        );
+    }
+
+    #[test]
+    fn vaapi_vbr_policy_uses_freerdp_bitrate_without_qp_controls() {
         let policy = vaapi_rate_control_policy(10_000_000, 23, H264RateControl::Vbr);
 
         assert_eq!(policy.config_mode, sys::VA_RC_VBR);
         assert_eq!(policy.bits_per_second, 10_000_000);
-        assert_eq!(policy.pic_init_qp, 23);
-        assert_eq!(policy.initial_qp, 23);
+        assert_eq!(policy.pic_init_qp, H264_DEFAULT_PIC_INIT_QP);
+        assert_eq!(policy.initial_qp, 0);
         assert_eq!(policy.min_qp, 0);
-        assert_eq!(policy.target_percentage, 66);
-        assert_eq!(policy.max_qp, 23);
+        assert_eq!(policy.target_percentage, 100);
+        assert_eq!(policy.rc_flags, 0);
+        assert_eq!(policy.max_qp, 0);
     }
 
     #[test]
@@ -1404,6 +1436,7 @@ mod tests {
         assert_eq!(policy.pic_init_qp, 32);
         assert_eq!(policy.initial_qp, 32);
         assert_eq!(policy.min_qp, 32);
+        assert_eq!(policy.rc_flags, 1 << 1);
         assert_eq!(policy.max_qp, 32);
     }
 

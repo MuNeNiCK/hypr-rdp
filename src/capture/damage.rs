@@ -110,7 +110,7 @@ impl FrameDiffDamageDetector {
                     let tile_w = DAMAGE_TILE_SIZE.min(right - tile_x);
                     let tile = (tile_x, tile_y, tile_w, tile_h);
                     if frame_tile_changed(data, reference, stride, tile) {
-                        merge_nearby_damage_region(&mut regions, tile, DAMAGE_MERGE_DISTANCE);
+                        push_unique_damage_region(&mut regions, tile);
                     }
                     tile_x += DAMAGE_TILE_SIZE;
                 }
@@ -152,19 +152,15 @@ pub(super) fn merge_damage_region(
     pending: &mut Vec<(i32, i32, i32, i32)>,
     region: (i32, i32, i32, i32),
 ) {
-    if let Some((left, top, width, height)) = pending.first_mut() {
-        let right = (*left)
-            .saturating_add(*width)
-            .max(region.0.saturating_add(region.2));
-        let bottom = (*top)
-            .saturating_add(*height)
-            .max(region.1.saturating_add(region.3));
-        *left = (*left).min(region.0);
-        *top = (*top).min(region.1);
-        *width = right - *left;
-        *height = bottom - *top;
-    } else {
-        pending.push(region);
+    merge_nearby_damage_region(pending, region, DAMAGE_MERGE_DISTANCE);
+}
+
+fn push_unique_damage_region(
+    regions: &mut Vec<(i32, i32, i32, i32)>,
+    region: (i32, i32, i32, i32),
+) {
+    if !regions.contains(&region) {
+        regions.push(region);
     }
 }
 
@@ -298,7 +294,7 @@ mod tests {
     }
 
     #[test]
-    fn damage_region_clamp_and_merge_keeps_pending_union() {
+    fn damage_region_merge_preserves_separated_pending_regions() {
         let mut pending = Vec::new();
         let first = clamp_damage_region(-10, 5, 30, 10, 1280, 720).unwrap();
         let second = clamp_damage_region(100, 50, 20, 20, 1280, 720).unwrap();
@@ -306,7 +302,17 @@ mod tests {
         merge_damage_region(&mut pending, first);
         merge_damage_region(&mut pending, second);
 
-        assert_eq!(pending, vec![(0, 5, 120, 65)]);
+        assert_eq!(pending, vec![(0, 5, 20, 10), (100, 50, 20, 20)]);
+    }
+
+    #[test]
+    fn damage_region_merge_coalesces_nearby_pending_regions() {
+        let mut pending = Vec::new();
+
+        merge_damage_region(&mut pending, (0, 0, 20, 20));
+        merge_damage_region(&mut pending, (25, 10, 20, 10));
+
+        assert_eq!(pending, vec![(0, 0, 45, 20)]);
     }
 
     #[test]
@@ -374,6 +380,33 @@ mod tests {
         );
 
         assert_eq!(regions, vec![(64, 64, 64, 64)]);
+    }
+
+    #[test]
+    fn frame_diff_detector_preserves_l_shaped_changed_tiles_without_outer_union() {
+        let width = 128;
+        let height = 128;
+        let stride = width * 4;
+        let reference = vec![0; stride * height];
+        let mut current = reference.clone();
+        current[(10 * stride) + (10 * 4)] = 1;
+        current[(10 * stride) + (70 * 4)] = 1;
+        current[(70 * stride) + (10 * 4)] = 1;
+
+        let mut detector = FrameDiffDamageDetector::new();
+        detector.update_reference(&reference, height as u32, stride);
+        let regions = detector.detect(
+            &current,
+            width as u32,
+            height as u32,
+            stride,
+            &[(0, 0, width as i32, height as i32)],
+        );
+
+        assert_eq!(
+            regions,
+            vec![(0, 0, 64, 64), (64, 0, 64, 64), (0, 64, 64, 64)]
+        );
     }
 
     #[test]
@@ -470,7 +503,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_diff_detector_merges_overlapping_candidate_regions_without_touching_padding() {
+    fn frame_diff_detector_preserves_overlapping_candidate_tiles_without_touching_padding() {
         let width = 96;
         let height = 80;
         let stride = width * 4 + 20;
@@ -496,7 +529,7 @@ mod tests {
             &[(0, 0, 64, 64), (16, 16, 64, 64)],
         );
 
-        assert_eq!(regions, vec![(0, 0, 80, 80)]);
+        assert_eq!(regions, vec![(0, 0, 64, 64), (16, 16, 64, 64)]);
     }
 
     #[test]

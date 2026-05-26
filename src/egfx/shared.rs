@@ -229,6 +229,20 @@ impl EgfxShared {
         !self.frame_ack_suspended() && self.frames_in_flight() >= self.max_frames_in_flight()
     }
 
+    pub(crate) fn full_frame_refresh_readiness(&self) -> EgfxFrameReadiness {
+        let in_flight = self.frames_in_flight();
+        if self.frame_ack_suspended() || in_flight == 0 {
+            return EgfxFrameReadiness::Ready;
+        }
+
+        EgfxFrameReadiness::LocalBackpressure {
+            in_flight,
+            max: 1,
+            client_queue_depth: self.client_queue_depth(),
+            ack_suspended: false,
+        }
+    }
+
     pub(in crate::egfx) fn record_frame_queued(&self, frame_id: u32) {
         self.last_queued_frame_id.store(frame_id, Ordering::Release);
         let in_flight = self.frames_in_flight.fetch_add(1, Ordering::AcqRel) + 1;

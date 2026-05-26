@@ -17,6 +17,7 @@ use super::damage::{
 
 /// Maximum consecutive encode failures before falling back to software encoder.
 const MAX_ENCODE_FAILURES: u32 = 5;
+const AVC444_LOG_REGION_SAMPLE_LIMIT: usize = 4;
 
 pub(super) fn avc444_dimensions_supported(width: u32, height: u32) -> bool {
     width != 0 && height != 0 && width.is_multiple_of(4) && height.is_multiple_of(2)
@@ -196,6 +197,12 @@ fn log_avc444_sent_frame(
 
     let stream1_nal_types = frame.stream1_nal_types();
     let stream2_nal_types = frame.stream2_nal_types();
+    let damage_area_pct = region_area_pct(damage_regions, width, height);
+    let stream1_area_pct = region_area_pct(&frame.stream1_regions, width, height);
+    let stream2_area_pct = region_area_pct(&frame.stream2_regions, width, height);
+    let damage_sample = sampled_regions(damage_regions);
+    let stream1_sample = sampled_regions(&frame.stream1_regions);
+    let stream2_sample = sampled_regions(&frame.stream2_regions);
     tracing::info!(
         target: "hypr_rdp::avc444_perf",
         frame_id,
@@ -206,10 +213,16 @@ fn log_avc444_sent_frame(
         codec_id = "AVC444v2",
         encoding = ?frame.encoding,
         damage_regions = damage_regions.len(),
+        damage_area_pct,
+        damage_sample = %damage_sample,
         stream1_bytes = frame.stream1.len(),
         stream2_bytes = frame.stream2.len(),
         stream1_regions = frame.stream1_regions.len(),
         stream2_regions = frame.stream2_regions.len(),
+        stream1_area_pct,
+        stream2_area_pct,
+        stream1_sample = %stream1_sample,
+        stream2_sample = %stream2_sample,
         stream1_empty = frame.stream1.is_empty(),
         stream2_empty = frame.stream2.is_empty(),
         stream1_has_idr = frame.stream1_has_idr(),
@@ -218,6 +231,31 @@ fn log_avc444_sent_frame(
         stream2_nal_types = ?stream2_nal_types,
         "AVC444v2 frame sent"
     );
+}
+
+fn region_area_pct(regions: &[(i32, i32, i32, i32)], width: u32, height: u32) -> f64 {
+    let frame_pixels = u64::from(width).saturating_mul(u64::from(height));
+    if frame_pixels == 0 {
+        return 0.0;
+    }
+
+    damage_area_pixels(regions, width, height) as f64 * 100.0 / frame_pixels as f64
+}
+
+fn sampled_regions(regions: &[(i32, i32, i32, i32)]) -> String {
+    let mut sample = regions
+        .iter()
+        .take(AVC444_LOG_REGION_SAMPLE_LIMIT)
+        .map(|&(x, y, w, h)| format!("{x},{y},{w},{h}"))
+        .collect::<Vec<_>>()
+        .join(";");
+    if regions.len() > AVC444_LOG_REGION_SAMPLE_LIMIT {
+        if !sample.is_empty() {
+            sample.push(';');
+        }
+        sample.push_str("...");
+    }
+    sample
 }
 
 impl FrameStats {
@@ -691,6 +729,24 @@ impl FrameProcessor {
                 }
             }
 
+            if ready && shared.full_frame_requested() {
+                let readiness = shared.full_frame_refresh_readiness();
+                if !readiness.is_ready() {
+                    tracing::trace!(
+                        ?readiness,
+                        reason = readiness.reason(),
+                        "EGFX full-frame refresh waiting for ACK window to drain"
+                    );
+                    self.stats.record_send_unavailable(
+                        readiness,
+                        shared.frame_flow_snapshot(),
+                        self.width,
+                        self.height,
+                    );
+                    return true;
+                }
+            }
+
             let force_full_frame = if ready {
                 shared.take_full_frame_request()
             } else {
@@ -1051,6 +1107,23 @@ mod tests {
             )
             .state(),
             EncodedFrameState::Skipped
+        );
+    }
+
+    #[test]
+    fn avc444_log_region_summary_is_bounded_and_reports_area() {
+        let regions = vec![
+            (0, 0, 10, 10),
+            (20, 20, 10, 10),
+            (40, 40, 10, 10),
+            (60, 60, 10, 10),
+            (80, 80, 10, 10),
+        ];
+
+        assert_eq!(region_area_pct(&regions[..1], 100, 100), 1.0);
+        assert_eq!(
+            sampled_regions(&regions),
+            "0,0,10,10;20,20,10,10;40,40,10,10;60,60,10,10;..."
         );
     }
 
@@ -1852,7 +1925,8 @@ mod tests {
         let width = 64;
         let height = 64;
         let stride = width * 4;
-        let (shared, mut event_rx) = negotiated_avc444_egfx(width as u16, height as u16);
+        let mut session = tracked_avc444_session(width as u16, height as u16, 3);
+        let shared = Arc::clone(&session.shared);
         let (display_tx, mut display_rx) = mpsc::channel(4);
         let frame = gradient_bgra_frame(width, height, stride);
 
@@ -1873,8 +1947,14 @@ mod tests {
         assert!(processor.sent_first_frame);
         assert!(!processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
-        let initial_pdus = drain_gfx_pdus(&mut event_rx);
+        let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
         initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        let initial_frame_id = initial_pdus.frame_id();
+        ack_frame(
+            &mut session.bridge,
+            initial_frame_id,
+            TestQueueDepth::AvailableBytes(1),
+        );
 
         shared.request_full_frame();
         assert!(processor.process(&frame, &display_tx));
@@ -1882,7 +1962,7 @@ mod tests {
         assert!(!processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
 
-        let refresh_pdus = drain_gfx_pdus(&mut event_rx);
+        let refresh_pdus = drain_gfx_pdus(&mut session.event_rx);
         refresh_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
         let (last_luma_regions, last_chroma_regions) = processor
             .h264_encoder
@@ -1890,6 +1970,85 @@ mod tests {
             .and_then(crate::egfx::FrameEncoder::avc444_last_reference_regions_for_test)
             .expect("AVC444 region state exists");
         let full_frame = [(0, 0, width as i32, height as i32)];
+        assert_eq!(last_luma_regions, full_frame);
+        assert_eq!(last_chroma_regions, full_frame);
+    }
+
+    #[test]
+    fn frame_processor_keeps_repeated_capabilities_refresh_pending_until_ack_window_drains() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let mut session = tracked_avc444_session(width as u16, height as u16, 3);
+        let shared = Arc::clone(&session.shared);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        let mut third = first.clone();
+        for y in 8..16 {
+            for x in 8..16 {
+                write_bgra_pixel(&mut second, stride, x, y, 192, 192, 192);
+                write_bgra_pixel(&mut third, stride, x, y, 64, 192, 64);
+            }
+        }
+
+        let mut processor = FrameProcessor::new(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Cqp,
+            30,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+        assert!(processor.process(&first, &display_tx));
+        let first_pdus = drain_gfx_pdus(&mut session.event_rx);
+        let first_frame_id = first_pdus.frame_id();
+        ack_frame(
+            &mut session.bridge,
+            first_frame_id,
+            TestQueueDepth::AvailableBytes(1),
+        );
+        assert_eq!(shared.frame_flow_snapshot().frames_in_flight, 0);
+
+        processor.queue_damage(&[(8, 8, 8, 8)]);
+        assert!(processor.process(&second, &display_tx));
+        let second_pdus = drain_gfx_pdus(&mut session.event_rx);
+        let second_frame_id = second_pdus.frame_id();
+        assert_eq!(shared.frame_flow_snapshot().frames_in_flight, 1);
+        assert!(shared.can_send_frame(&session.handle));
+
+        shared.request_full_frame();
+        processor.queue_damage(&[(8, 8, 8, 8)]);
+        assert!(processor.process(&third, &display_tx));
+        assert!(shared.full_frame_requested());
+        assert!(processor.has_pending_damage());
+        assert_eq!(processor.stats.skipped_local_backpressure, 1);
+        drain_gfx_pdus(&mut session.event_rx).assert_empty();
+
+        ack_frame(
+            &mut session.bridge,
+            second_frame_id,
+            TestQueueDepth::AvailableBytes(1),
+        );
+        assert_eq!(shared.frame_flow_snapshot().frames_in_flight, 0);
+        assert!(processor.process(&third, &display_tx));
+        assert!(!shared.full_frame_requested());
+        assert!(!processor.has_pending_damage());
+        assert!(display_rx.try_recv().is_err());
+
+        let refresh_pdus = drain_gfx_pdus(&mut session.event_rx);
+        refresh_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        let full_frame = [(0, 0, width as i32, height as i32)];
+        let (last_luma_regions, last_chroma_regions) = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_last_reference_regions_for_test)
+            .expect("AVC444 region state exists");
         assert_eq!(last_luma_regions, full_frame);
         assert_eq!(last_chroma_regions, full_frame);
     }
@@ -2231,6 +2390,139 @@ mod tests {
         assert_eq!(processor.stats.sent_frames, 6);
         assert_eq!(processor.stats.skipped_backpressure, 0);
         assert_eq!(processor.stats.skipped_encoder, 0);
+    }
+
+    #[test]
+    fn frame_processor_repeated_avc444_frames_keep_bounded_yuv444_error() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let mut oracle = Avc444PresentationOracle::new(width, height);
+        let mut session = tracked_avc444_session(width as u16, height as u16, 1);
+        let shared = Arc::clone(&session.shared);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let mut frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            10_000_000,
+            18,
+            H264RateControl::Cqp,
+            30,
+        );
+
+        for index in 0..6 {
+            mutate_bgra_tile(&mut frame, width, height, stride, index + 1);
+            processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+
+            assert!(
+                processor.process(&frame, &display_tx),
+                "frame {index} processed"
+            );
+            assert_eq!(processor.egfx_codec, Some(EgfxCodec::Avc444));
+            assert!(processor.sent_first_frame);
+            assert!(!processor.has_pending_damage());
+            assert!(display_rx.try_recv().is_err());
+
+            let pdus = drain_gfx_pdus(&mut session.event_rx);
+            if index == 0 {
+                pdus.assert_initial_surface_setup_precedes_logical_frame(
+                    width as u16,
+                    height as u16,
+                );
+            }
+            pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+            oracle.assert_trace_matches_bgra_with_bounded_yuv444_error(
+                &pdus, index, &frame, stride, 16.0, 0.10,
+            );
+
+            let frame_id = pdus.frame_id();
+            assert!(!shared.can_send_frame(&session.handle));
+            ack_frame(
+                &mut session.bridge,
+                frame_id,
+                TestQueueDepth::AvailableBytes(1),
+            );
+            assert!(shared.can_send_frame(&session.handle));
+        }
+
+        oracle.assert_distinct_reconstructed_frames(6);
+        assert_eq!(processor.stats.sent_frames, 6);
+        assert_eq!(processor.stats.skipped_backpressure, 0);
+        assert_eq!(processor.stats.skipped_encoder, 0);
+    }
+
+    #[test]
+    fn frame_processor_preserves_separated_avc444_damage_regions_without_outer_union() {
+        let width = 192;
+        let height = 64;
+        let stride = width * 4;
+        let mut oracle = Avc444PresentationOracle::new(width, height);
+        let mut session = tracked_avc444_session(width as u16, height as u16, 1);
+        let shared = Arc::clone(&session.shared);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut second = first.clone();
+        second[(10 * stride) + (10 * 4)] ^= 0x7f;
+        second[(10 * stride) + (150 * 4)] ^= 0x7f;
+
+        let mut processor = FrameProcessor::new(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            10_000_000,
+            18,
+            H264RateControl::Cqp,
+            30,
+        );
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&first, &display_tx));
+        assert!(display_rx.try_recv().is_err());
+        let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
+        initial_pdus
+            .assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
+        initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        oracle.assert_trace_matches_bgra_with_bounded_yuv444_error(
+            &initial_pdus,
+            0,
+            &first,
+            stride,
+            16.0,
+            0.10,
+        );
+        ack_frame(
+            &mut session.bridge,
+            initial_pdus.frame_id(),
+            TestQueueDepth::AvailableBytes(1),
+        );
+
+        processor.queue_damage(&[(10, 10, 1, 1), (150, 10, 1, 1)]);
+        assert!(processor.process(&second, &display_tx));
+        assert!(!processor.has_pending_damage());
+        assert!(display_rx.try_recv().is_err());
+        let followup_pdus = drain_gfx_pdus(&mut session.event_rx);
+        followup_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::Luma);
+        oracle.assert_trace_matches_bgra_with_bounded_yuv444_error(
+            &followup_pdus,
+            1,
+            &second,
+            stride,
+            16.0,
+            0.10,
+        );
+
+        let (last_luma_regions, _last_chroma_regions) = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::avc444_last_reference_regions_for_test)
+            .expect("AVC444 region state exists");
+        assert_eq!(last_luma_regions, [(8, 10, 4, 2), (148, 10, 4, 2)]);
     }
 
     #[test]
