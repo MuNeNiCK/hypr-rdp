@@ -7,8 +7,8 @@ use ironrdp_server::{BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat};
 use tokio::sync::mpsc;
 
 use crate::egfx::{
-    EgfxFrameCodec as EgfxCodec, EgfxFrameFlowSnapshot, EgfxFrameReadiness, EgfxShared,
-    EncodedFrameState, H264RateControl,
+    avc444_dimensions_supported, EgfxFrameCodec as EgfxCodec, EgfxFrameFlowSnapshot,
+    EgfxFrameReadiness, EgfxShared, EncodedFrameState, H264RateControl,
 };
 
 use super::damage::{
@@ -17,10 +17,6 @@ use super::damage::{
 
 /// Maximum consecutive encode failures before falling back to software encoder.
 const MAX_ENCODE_FAILURES: u32 = 5;
-
-pub(super) fn avc444_dimensions_supported(width: u32, height: u32) -> bool {
-    width != 0 && height != 0 && width.is_multiple_of(4) && height.is_multiple_of(2)
-}
 
 /// Common frame processing: EGFX H.264/RFX encoding or bitmap fallback.
 pub(super) struct FrameProcessor {
@@ -1063,14 +1059,6 @@ mod tests {
         assert!(stats.frame_ack_stream_established);
         assert_eq!(stats.total_queued_frames, 12);
         assert_eq!(stats.total_acked_frames, 9);
-    }
-
-    #[test]
-    fn avc444_dimension_gate_matches_local_packing_constraints() {
-        assert!(avc444_dimensions_supported(1920, 1200));
-        assert!(!avc444_dimensions_supported(18, 16));
-        assert!(!avc444_dimensions_supported(64, 15));
-        assert!(!avc444_dimensions_supported(0, 64));
     }
 
     #[test]

@@ -17,6 +17,10 @@ use super::H264RateControl;
 #[cfg(feature = "vaapi")]
 const AVC444_VAAPI_VBR_BITRATE_MULTIPLIER: u32 = 4;
 
+pub(crate) fn avc444_dimensions_supported(width: u32, height: u32) -> bool {
+    width != 0 && height != 0 && width.is_multiple_of(4) && height.is_multiple_of(2)
+}
+
 pub struct Avc444EncodedFrame {
     pub encoding: Avc444FrameEncoding,
     pub stream1: Vec<u8>,
@@ -105,7 +109,7 @@ impl Avc444Encoder {
         rate_control: H264RateControl,
         h264_options: H264EncoderOptions,
     ) -> Result<Self> {
-        if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(2) {
+        if !avc444_dimensions_supported(width, height) {
             bail!(
                 "AVC444v2 dimensions must be non-zero, width must be divisible by 4, and height must be even: {}x{}",
                 width,
@@ -139,7 +143,7 @@ impl Avc444Encoder {
         qp: u8,
         rate_control: H264RateControl,
     ) -> Result<Self> {
-        if width == 0 || height == 0 || !width.is_multiple_of(4) || !height.is_multiple_of(2) {
+        if !avc444_dimensions_supported(width, height) {
             bail!(
                 "AVC444v2 dimensions must be non-zero, width must be divisible by 4, and height must be even: {}x{}",
                 width,
@@ -1675,6 +1679,14 @@ fn union_region(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, 
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn avc444_dimension_gate_matches_local_packing_constraints() {
+        assert!(avc444_dimensions_supported(1920, 1200));
+        assert!(!avc444_dimensions_supported(18, 16));
+        assert!(!avc444_dimensions_supported(64, 15));
+        assert!(!avc444_dimensions_supported(0, 64));
+    }
 
     #[test]
     fn avc444_v2_encoder_options_use_ffmpeg_libavcodec_backend_policy() {
