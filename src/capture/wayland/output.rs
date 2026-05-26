@@ -147,8 +147,18 @@ pub(crate) fn output_info(output_name: &str) -> Result<CaptureInfo> {
         .find(|m| m["name"].as_str() == Some(output_name))
         .with_context(|| format!("output '{}' not found in Hyprland monitors", output_name))?;
 
-    let width = monitor["width"].as_u64().unwrap_or(0) as u32;
-    let height = monitor["height"].as_u64().unwrap_or(0) as u32;
+    let width = u32::try_from(
+        monitor["width"]
+            .as_u64()
+            .context("output width is missing or invalid")?,
+    )
+    .context("output width is out of range")?;
+    let height = u32::try_from(
+        monitor["height"]
+            .as_u64()
+            .context("output height is missing or invalid")?,
+    )
+    .context("output height is out of range")?;
     if width == 0 || height == 0 {
         bail!(
             "output '{}' has invalid dimensions: {}x{}",
@@ -191,5 +201,20 @@ mod tests {
 
         assert_eq!(output_dimensions(&monitors, "hypr-rdp-1"), Some((0, 1200)));
         assert!(!output_has_dimensions(&monitors, "hypr-rdp-1", 0, 1200));
+    }
+
+    #[test]
+    fn output_dimensions_rejects_missing_invalid_or_overflowing_dimensions() {
+        let missing = json!([{ "name": "hypr-rdp-1", "height": 1200 }]);
+        let invalid = json!([{ "name": "hypr-rdp-1", "width": "1920", "height": 1200 }]);
+        let overflowing = json!([{
+            "name": "hypr-rdp-1",
+            "width": u64::MAX,
+            "height": 1200
+        }]);
+
+        assert_eq!(output_dimensions(&missing, "hypr-rdp-1"), None);
+        assert_eq!(output_dimensions(&invalid, "hypr-rdp-1"), None);
+        assert_eq!(output_dimensions(&overflowing, "hypr-rdp-1"), None);
     }
 }
