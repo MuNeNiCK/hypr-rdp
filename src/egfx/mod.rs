@@ -21,7 +21,7 @@ pub(crate) mod test_support;
 pub(crate) use avc420::avc420_full_frame_region;
 pub use backend::{FrameEncoder, H264RateControl};
 pub use factory::HyprGfxFactory;
-pub(crate) use frame::{EncodedEgfxFrame, EncodedFrameState};
+pub(crate) use frame::{EgfxFrameCodec, EncodedEgfxFrame, EncodedFrameState};
 #[cfg(feature = "vaapi")]
 pub(crate) use h264::extract_sps_pps;
 pub use shared::{EgfxCodecPolicy, EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT};

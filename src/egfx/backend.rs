@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use super::encoder;
+use super::frame::{EgfxFrameCodec, EncodedEgfxFrame};
 #[cfg(feature = "vaapi")]
 use super::vaapi;
 
@@ -62,6 +63,21 @@ impl FrameEncoder {
             Self::FailingVaapiForTest { .. } => anyhow::bail!("test VA-API encode failure"),
             Self::Software(enc) => enc.encode(bgra, stride),
             Self::SoftwareAvc444(_) => anyhow::bail!("AVC444 encoder requires encode_avc444"),
+        }
+    }
+
+    pub(crate) fn encode_egfx_frame(
+        &mut self,
+        codec: EgfxFrameCodec,
+        bgra: &[u8],
+        stride: usize,
+        candidate_regions: &[(i32, i32, i32, i32)],
+    ) -> Result<EncodedEgfxFrame> {
+        match codec {
+            EgfxFrameCodec::Avc420 => self.encode(bgra, stride).map(EncodedEgfxFrame::Avc420),
+            EgfxFrameCodec::Avc444 => self
+                .encode_avc444(bgra, stride, candidate_regions)
+                .map(EncodedEgfxFrame::Avc444),
         }
     }
 
@@ -176,6 +192,23 @@ impl FrameEncoder {
         Ok(Self::Software(Box::new(enc)))
     }
 
+    pub(crate) fn new_for_egfx_codec(
+        codec: EgfxFrameCodec,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
+        match codec {
+            EgfxFrameCodec::Avc420 => Self::new(width, height, bitrate, fps, quality, rate_control),
+            EgfxFrameCodec::Avc444 => {
+                Self::new_avc444(width, height, bitrate, fps, quality, rate_control)
+            }
+        }
+    }
+
     pub fn new_avc444(
         width: u32,
         height: u32,
@@ -223,6 +256,25 @@ impl FrameEncoder {
         let enc = encoder::Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
         tracing::info!("Using FFmpeg/libx264 software AVC444 encoder");
         Ok(Self::SoftwareAvc444(Box::new(enc)))
+    }
+
+    pub(crate) fn new_software_only_for_egfx_codec(
+        codec: EgfxFrameCodec,
+        width: u32,
+        height: u32,
+        bitrate: u32,
+        fps: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+    ) -> Result<Self> {
+        match codec {
+            EgfxFrameCodec::Avc420 => {
+                Self::new_software_only(width, height, bitrate, fps, quality, rate_control)
+            }
+            EgfxFrameCodec::Avc444 => {
+                Self::new_avc444_software_only(width, height, bitrate, fps, quality, rate_control)
+            }
+        }
     }
 
     #[cfg(test)]

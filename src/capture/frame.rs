@@ -7,8 +7,8 @@ use ironrdp_server::{BitmapUpdate, DesktopSize, DisplayUpdate, PixelFormat};
 use tokio::sync::mpsc;
 
 use crate::egfx::{
-    EgfxFrameFlowSnapshot, EgfxFrameReadiness, EgfxShared, EncodedEgfxFrame, EncodedFrameState,
-    H264RateControl,
+    EgfxFrameCodec as EgfxCodec, EgfxFrameFlowSnapshot, EgfxFrameReadiness, EgfxShared,
+    EncodedEgfxFrame, EncodedFrameState, H264RateControl,
 };
 
 use super::damage::{
@@ -50,12 +50,6 @@ pub(super) struct FrameProcessor {
     damage_detector: FrameDiffDamageDetector,
     pub(super) stats: FrameStats,
     pending_initial_resize: Option<DesktopSize>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum EgfxCodec {
-    Avc420,
-    Avc444,
 }
 
 pub(super) struct FrameStats {
@@ -626,24 +620,15 @@ impl FrameProcessor {
                 self.damage_detector.invalidate();
                 if ready {
                     let selected_codec = codec.unwrap_or(EgfxCodec::Avc420);
-                    let encoder_result = match selected_codec {
-                        EgfxCodec::Avc444 => crate::egfx::FrameEncoder::new_avc444(
-                            self.width,
-                            self.height,
-                            self.bitrate,
-                            self.fps,
-                            self.quality,
-                            self.rate_control,
-                        ),
-                        EgfxCodec::Avc420 => crate::egfx::FrameEncoder::new(
-                            self.width,
-                            self.height,
-                            self.bitrate,
-                            self.fps,
-                            self.quality,
-                            self.rate_control,
-                        ),
-                    };
+                    let encoder_result = crate::egfx::FrameEncoder::new_for_egfx_codec(
+                        selected_codec,
+                        self.width,
+                        self.height,
+                        self.bitrate,
+                        self.fps,
+                        self.quality,
+                        self.rate_control,
+                    );
 
                     match encoder_result {
                         Ok(enc) => {
@@ -766,13 +751,13 @@ impl FrameProcessor {
                             enc.force_idr();
                         }
                     }
-                    let encode_result = self.h264_encoder.as_mut().map(|enc| match codec {
-                        EgfxCodec::Avc420 => enc
-                            .encode(data, self.stride as usize)
-                            .map(EncodedEgfxFrame::Avc420),
-                        EgfxCodec::Avc444 => enc
-                            .encode_avc444(data, self.stride as usize, &frame_damage_regions)
-                            .map(EncodedEgfxFrame::Avc444),
+                    let encode_result = self.h264_encoder.as_mut().map(|enc| {
+                        enc.encode_egfx_frame(
+                            codec,
+                            data,
+                            self.stride as usize,
+                            &frame_damage_regions,
+                        )
                     });
                     let encode_elapsed = encode_start.elapsed();
                     match encode_result {
@@ -907,26 +892,16 @@ impl FrameProcessor {
                             "VA-API encode failed {} consecutive times, switching to software encoder",
                             self.encode_failures
                         );
-                        let fallback_result = match self.egfx_codec.unwrap_or(EgfxCodec::Avc420) {
-                            EgfxCodec::Avc444 => {
-                                crate::egfx::FrameEncoder::new_avc444_software_only(
-                                    self.width,
-                                    self.height,
-                                    self.bitrate,
-                                    self.fps,
-                                    self.quality,
-                                    self.rate_control,
-                                )
-                            }
-                            EgfxCodec::Avc420 => crate::egfx::FrameEncoder::new_software_only(
+                        let fallback_result =
+                            crate::egfx::FrameEncoder::new_software_only_for_egfx_codec(
+                                self.egfx_codec.unwrap_or(EgfxCodec::Avc420),
                                 self.width,
                                 self.height,
                                 self.bitrate,
                                 self.fps,
                                 self.quality,
                                 self.rate_control,
-                            ),
-                        };
+                            );
                         match fallback_result {
                             Ok(enc) => {
                                 self.h264_encoder = Some(enc);

@@ -1,5 +1,11 @@
 use super::encoder::{Avc444EncodedFrame, Avc444FrameEncoding};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EgfxFrameCodec {
+    Avc420,
+    Avc444,
+}
+
 pub(crate) enum EncodedEgfxFrame {
     Avc420(Vec<u8>),
     Avc444(Avc444EncodedFrame),
