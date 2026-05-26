@@ -89,7 +89,7 @@ fn frame_send_before_surface_init_is_rejected_without_queueing() {
         negotiated_avc420_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    assert!(!shared.send_tracked_avc420_frame_with_regions(
+    assert!(!shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         0,
@@ -157,21 +157,21 @@ fn surface_reinit_after_resize_emits_create_map_without_second_reset() {
 }
 
 #[test]
-fn avc420_send_wrapper_emits_logical_frame_wire_shape() {
-    let (handle, surface_id, event_tx, mut event_rx) = ready_avc420_session(64, 64);
+fn avc420_rdpegfx_queue_emits_logical_frame_wire_shape() {
+    let (handle, surface_id, _event_tx, mut event_rx) = ready_avc420_session(64, 64);
     let _ = drain_gfx_pdus(&mut event_rx);
 
     let regions = [Avc420Region::new(4, 6, 20, 22, 19, 81)];
-    assert!(EgfxShared::send_avc420_frame_with_regions(
+    let queued = EgfxShared::queue_avc420_rdpegfx_frame(
         &handle,
-        &event_tx,
         surface_id,
         &[0, 0, 1, 0x65, 0xaa, 0xbb],
         &regions,
         123,
-    ));
+    )
+    .expect("AVC420 frame queues");
 
-    let pdus = drain_gfx_pdus(&mut event_rx);
+    let pdus: Vec<_> = queued.dvc_messages.iter().map(decode_gfx_output).collect();
     let wire = assert_wire_to_surface_frame(&pdus, surface_id, Codec1Type::Avc420);
     let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
     let bitmap = Avc420BitmapStream::decode(&mut bitmap_cursor).expect("AVC420 payload decodes");
@@ -200,7 +200,7 @@ fn tracked_frame_ack_releases_local_queue_depth() {
     let _ = drain_gfx_pdus(&mut event_rx);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -231,7 +231,7 @@ fn tracked_frame_ack_releases_local_queue_depth() {
     assert_eq!(shared.client_queue_depth(), 8);
     assert!(shared.can_send_frame(&handle));
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -263,7 +263,7 @@ fn frame_readiness_distinguishes_transport_backpressure_from_local_queue_policy(
         .set_max_frames_in_flight(1);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -303,7 +303,7 @@ fn default_queue_policy_backpressures_before_first_frame_ack() {
 
     for index in 0..DEFAULT_MAX_FRAMES_IN_FLIGHT {
         assert!(
-            shared.send_tracked_avc420_frame_with_regions(
+            shared.send_tracked_avc420_rdpegfx_frame(
                 &handle,
                 &event_tx,
                 surface_id,
@@ -327,7 +327,7 @@ fn default_queue_policy_backpressures_before_first_frame_ack() {
         }
     );
     assert!(!shared.can_send_frame(&handle));
-    assert!(!shared.send_tracked_avc420_frame_with_regions(
+    assert!(!shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -344,7 +344,7 @@ fn tracked_queue_policy_backpressures_after_ack_stream_stalls() {
     let _ = drain_gfx_pdus(&mut event_rx);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -372,7 +372,7 @@ fn tracked_queue_policy_backpressures_after_ack_stream_stalls() {
 
     for index in 0..DEFAULT_MAX_FRAMES_IN_FLIGHT {
         assert!(
-            shared.send_tracked_avc420_frame_with_regions(
+            shared.send_tracked_avc420_rdpegfx_frame(
                 &handle,
                 &event_tx,
                 surface_id,
@@ -395,7 +395,7 @@ fn tracked_queue_policy_backpressures_after_ack_stream_stalls() {
         }
     );
     assert!(!shared.can_send_frame(&handle));
-    assert!(!shared.send_tracked_avc420_frame_with_regions(
+    assert!(!shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -414,7 +414,7 @@ fn preferred_frame_rate_drops_as_ack_window_fills() {
 
     assert_eq!(shared.preferred_frame_rate(30), 30);
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -425,7 +425,7 @@ fn preferred_frame_rate_drops_as_ack_window_fills() {
     assert_eq!(shared.frames_in_flight(), 1);
     assert_eq!(shared.preferred_frame_rate(30), 30);
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -436,7 +436,7 @@ fn preferred_frame_rate_drops_as_ack_window_fills() {
     assert_eq!(shared.frames_in_flight(), 2);
     assert_eq!(shared.preferred_frame_rate(30), 9);
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -465,7 +465,7 @@ fn tracked_queue_policy_honors_client_ack_suspend() {
     let _ = drain_gfx_pdus(&mut event_rx);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -484,7 +484,7 @@ fn tracked_queue_policy_honors_client_ack_suspend() {
     assert_eq!(shared.frames_in_flight(), 0);
     assert!(shared.can_send_frame(&handle));
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -492,7 +492,7 @@ fn tracked_queue_policy_honors_client_ack_suspend() {
         &regions,
         124,
     ));
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -511,7 +511,7 @@ fn resize_generation_ignores_stale_frame_ack() {
     let _ = drain_gfx_pdus(&mut event_rx);
     let regions = [Avc420Region::new(0, 0, 64, 64, 21, 79)];
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         surface_id,
@@ -533,7 +533,7 @@ fn resize_generation_ignores_stale_frame_ack() {
         EgfxShared::init_surface(&handle, &event_tx, 64, 64).expect("surface reinit");
     let _ = drain_gfx_pdus(&mut event_rx);
 
-    assert!(shared.send_tracked_avc420_frame_with_regions(
+    assert!(shared.send_tracked_avc420_rdpegfx_frame(
         &handle,
         &event_tx,
         new_surface_id,
@@ -557,15 +557,15 @@ fn resize_generation_ignores_stale_frame_ack() {
 }
 
 #[test]
-fn avc444v2_send_wrapper_emits_logical_frame_wire_shape() {
+fn avc444v2_rdpegfx_queue_emits_logical_frame_wire_shape() {
     let (handle, surface_id) = ready_avc444_handle(64, 64);
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    let queued = EgfxShared::queue_avc444_frame_with_regions(
+    let queued = EgfxShared::queue_avc444_rdpegfx_frame(
         &handle,
         surface_id,
-        encoder::Avc444FrameEncoding::LumaAndChroma,
+        Encoding::LUMA_AND_CHROMA,
         &[1, 2, 3],
         &stream1_regions,
         Some(&[4, 5]),
@@ -751,15 +751,15 @@ fn wire_to_surface1_roundtrips_avc444v2_bitmap_payload() {
 }
 
 #[test]
-fn avc444_send_wrapper_maps_luma_and_chroma_to_wire_payload() {
+fn avc444_rdpegfx_queue_maps_luma_and_chroma_to_wire_payload() {
     let (handle, surface_id) = ready_avc444_handle(64, 64);
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    let queued = EgfxShared::queue_avc444_frame_with_regions(
+    let queued = EgfxShared::queue_avc444_rdpegfx_frame(
         &handle,
         surface_id,
-        encoder::Avc444FrameEncoding::LumaAndChroma,
+        Encoding::LUMA_AND_CHROMA,
         &[1, 2, 3],
         &stream1_regions,
         Some(&[4, 5]),
@@ -803,15 +803,15 @@ fn avc444_send_wrapper_maps_luma_and_chroma_to_wire_payload() {
 }
 
 #[test]
-fn avc444_send_wrapper_allows_empty_h264_payloads_with_regions() {
+fn avc444_rdpegfx_queue_allows_empty_h264_payloads_with_regions() {
     let (handle, surface_id) = ready_avc444_handle(64, 64);
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    let queued = EgfxShared::queue_avc444_frame_with_regions(
+    let queued = EgfxShared::queue_avc444_rdpegfx_frame(
         &handle,
         surface_id,
-        encoder::Avc444FrameEncoding::LumaAndChroma,
+        Encoding::LUMA_AND_CHROMA,
         &[],
         &stream1_regions,
         Some(&[]),
@@ -835,25 +835,17 @@ fn avc444_send_wrapper_allows_empty_h264_payloads_with_regions() {
 }
 
 #[test]
-fn avc444_send_wrapper_maps_luma_only_and_chroma_only_to_stream1() {
-    for (local_encoding, wire_encoding, payload) in [
-        (
-            encoder::Avc444FrameEncoding::Luma,
-            Encoding::LUMA,
-            &[0x10, 0x11][..],
-        ),
-        (
-            encoder::Avc444FrameEncoding::Chroma,
-            Encoding::CHROMA,
-            &[0x20, 0x21, 0x22][..],
-        ),
+fn avc444_rdpegfx_queue_maps_luma_only_and_chroma_only_to_stream1() {
+    for (wire_encoding, payload) in [
+        (Encoding::LUMA, &[0x10, 0x11][..]),
+        (Encoding::CHROMA, &[0x20, 0x21, 0x22][..]),
     ] {
         let (handle, surface_id) = ready_avc444_handle(64, 64);
         let regions = [Avc420Region::new(4, 6, 20, 22, 18, 82)];
-        let queued = EgfxShared::queue_avc444_frame_with_regions(
+        let queued = EgfxShared::queue_avc444_rdpegfx_frame(
             &handle,
             surface_id,
-            local_encoding,
+            wire_encoding,
             payload,
             &regions,
             None,
@@ -881,8 +873,7 @@ fn avc444_send_wrapper_maps_luma_only_and_chroma_only_to_stream1() {
 }
 
 #[test]
-fn avc444_send_wrapper_rejects_stream2_for_single_stream_lc() {
-    let (handle, surface_id) = ready_avc444_handle(64, 64);
+fn avc444_rdpegfx_shape_rejects_stream2_for_single_stream_lc() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
@@ -890,48 +881,40 @@ fn avc444_send_wrapper_rejects_stream2_for_single_stream_lc() {
         encoder::Avc444FrameEncoding::Luma,
         encoder::Avc444FrameEncoding::Chroma,
     ] {
-        assert!(EgfxShared::queue_avc444_frame_with_regions(
-            &handle,
-            surface_id,
+        assert!(super::rdpegfx::validate_avc444_send_shape(
             encoding,
-            &[1, 2, 3],
             &stream1_regions,
             Some(&[4, 5]),
             Some(&stream2_regions),
-            123,
         )
         .is_none());
     }
 }
 
 #[test]
-fn avc444_send_wrapper_rejects_lc0_without_stream2() {
-    let (handle, surface_id) = ready_avc444_handle(64, 64);
+fn avc444_rdpegfx_shape_rejects_lc0_without_stream2() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
 
-    assert!(EgfxShared::queue_avc444_frame_with_regions(
-        &handle,
-        surface_id,
+    assert!(super::rdpegfx::validate_avc444_send_shape(
         encoder::Avc444FrameEncoding::LumaAndChroma,
-        &[1, 2, 3],
         &stream1_regions,
         None,
         None,
-        123,
     )
     .is_none());
 }
 
 #[test]
 fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
-    let (handle, surface_id) = ready_avc444_handle(64, 64);
-    let (event_tx, event_rx) = mpsc::unbounded_channel();
-    drop(event_rx);
+    let session = tracked_avc444_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    let surface_id =
+        EgfxShared::init_surface(&session.handle, &session.event_tx, 64, 64).expect("surface init");
+    drop(session.event_rx);
     let regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
 
-    assert!(!EgfxShared::send_avc444_frame_with_regions(
-        &handle,
-        &event_tx,
+    assert!(!session.shared.send_tracked_avc444_rdpegfx_frame(
+        &session.handle,
+        &session.event_tx,
         surface_id,
         encoder::Avc444FrameEncoding::Luma,
         &[1, 2, 3],
@@ -940,7 +923,7 @@ fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
         None,
         123,
     ));
-    let server = handle.lock().expect("server lock");
+    let server = session.handle.lock().expect("server lock");
     assert_eq!(server.frames_in_flight(), 0);
 }
 

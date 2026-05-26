@@ -2,8 +2,6 @@ use anyhow::{bail, Result};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
-use ironrdp_egfx::pdu::{Avc420Region, Codec1Type, Encoding};
-
 #[cfg(feature = "vaapi")]
 use super::h264::avc444_h264_vaapi_encoder_options;
 #[cfg(feature = "vaapi")]
@@ -14,7 +12,7 @@ use super::h264::{
     annex_b_nal_types, avc444_h264_encoder_options, is_h264_keyframe, EncodedH264, H264Encoder,
     H264EncoderOptions,
 };
-use super::{avc420, EgfxShared, H264RateControl};
+use super::H264RateControl;
 
 #[cfg(feature = "vaapi")]
 const AVC444_VAAPI_VBR_BITRATE_MULTIPLIER: u32 = 4;
@@ -56,186 +54,6 @@ pub enum Avc444FrameEncoding {
 enum Avc444SubframeRole {
     Luma,
     Chroma,
-}
-
-impl EgfxShared {
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_tracked_avc444_frame_with_regions(
-        &self,
-        handle: &ironrdp_server::GfxServerHandle,
-        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
-        surface_id: u16,
-        encoding: Avc444FrameEncoding,
-        stream1_data: &[u8],
-        stream1_regions: &[Avc420Region],
-        stream2_data: Option<&[u8]>,
-        stream2_regions: Option<&[Avc420Region]>,
-        timestamp_ms: u32,
-    ) -> bool {
-        if Self::rdpegfx_event_sender_closed(sender, "send_avc444_frame") {
-            return false;
-        }
-
-        let Some(send_encoding) =
-            validate_avc444_send_shape(encoding, stream1_regions, stream2_data, stream2_regions)
-        else {
-            return false;
-        };
-
-        self.send_tracked_rdpegfx_frame(handle, sender, "AVC444", "send_avc444_frame", |server| {
-            server
-                .send_avc444_frame_with_encoding(
-                    Codec1Type::Avc444v2,
-                    surface_id,
-                    send_encoding,
-                    stream1_data,
-                    stream1_regions,
-                    stream2_data,
-                    stream2_regions,
-                    timestamp_ms,
-                )
-                .or_else(|| {
-                    tracing::trace!("send_avc444_frame: send_avc444v2_frame returned None");
-                    None
-                })
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_tracked_avc444_frame_with_damage(
-        &self,
-        handle: &ironrdp_server::GfxServerHandle,
-        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
-        surface_id: u16,
-        encoding: Avc444FrameEncoding,
-        stream1_data: &[u8],
-        stream1_damage_regions: &[(i32, i32, i32, i32)],
-        stream2_data: Option<&[u8]>,
-        stream2_damage_regions: Option<&[(i32, i32, i32, i32)]>,
-        timestamp_ms: u32,
-        width: u16,
-        height: u16,
-        quality: u8,
-    ) -> bool {
-        let stream1_regions =
-            avc420::damage_regions_to_avc420(stream1_damage_regions, width, height, quality);
-        let stream2_regions = stream2_damage_regions
-            .map(|regions| avc420::damage_regions_to_avc420(regions, width, height, quality));
-
-        self.send_tracked_avc444_frame_with_regions(
-            handle,
-            sender,
-            surface_id,
-            encoding,
-            stream1_data,
-            &stream1_regions,
-            stream2_data,
-            stream2_regions.as_deref(),
-            timestamp_ms,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(super) fn queue_avc444_frame_with_regions(
-        handle: &ironrdp_server::GfxServerHandle,
-        surface_id: u16,
-        encoding: Avc444FrameEncoding,
-        stream1_data: &[u8],
-        stream1_regions: &[Avc420Region],
-        stream2_data: Option<&[u8]>,
-        stream2_regions: Option<&[Avc420Region]>,
-        timestamp_ms: u32,
-    ) -> Option<super::rdpegfx::QueuedRdpegfxFrame> {
-        let encoding =
-            validate_avc444_send_shape(encoding, stream1_regions, stream2_data, stream2_regions)?;
-
-        Self::queue_rdpegfx_frame(handle, "send_avc444_frame", |server| {
-            server
-                .send_avc444_frame_with_encoding(
-                    Codec1Type::Avc444v2,
-                    surface_id,
-                    encoding,
-                    stream1_data,
-                    stream1_regions,
-                    stream2_data,
-                    stream2_regions,
-                    timestamp_ms,
-                )
-                .or_else(|| {
-                    tracing::trace!("send_avc444_frame: send_avc444v2_frame returned None");
-                    None
-                })
-        })
-    }
-
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
-    pub fn send_avc444_frame_with_regions(
-        handle: &ironrdp_server::GfxServerHandle,
-        sender: &tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>,
-        surface_id: u16,
-        encoding: Avc444FrameEncoding,
-        stream1_data: &[u8],
-        stream1_regions: &[Avc420Region],
-        stream2_data: Option<&[u8]>,
-        stream2_regions: Option<&[Avc420Region]>,
-        timestamp_ms: u32,
-    ) -> bool {
-        if Self::rdpegfx_event_sender_closed(sender, "send_avc444_frame") {
-            return false;
-        }
-
-        let Some(queued) = Self::queue_avc444_frame_with_regions(
-            handle,
-            surface_id,
-            encoding,
-            stream1_data,
-            stream1_regions,
-            stream2_data,
-            stream2_regions,
-            timestamp_ms,
-        ) else {
-            return false;
-        };
-
-        Self::send_rdpegfx_dvc_messages(sender, queued, "AVC444", "send_avc444_frame")
-    }
-}
-
-fn validate_avc444_send_shape(
-    encoding: Avc444FrameEncoding,
-    stream1_regions: &[Avc420Region],
-    stream2_data: Option<&[u8]>,
-    stream2_regions: Option<&[Avc420Region]>,
-) -> Option<Encoding> {
-    let has_stream2_data = stream2_data.is_some();
-    let has_stream2_regions = stream2_regions.is_some_and(|regions| !regions.is_empty());
-    match encoding {
-        Avc444FrameEncoding::LumaAndChroma => {
-            if !has_stream2_data || !has_stream2_regions {
-                tracing::trace!("send_avc444_frame_with_regions: LC=0 requires stream2");
-                return None;
-            }
-        }
-        Avc444FrameEncoding::Luma | Avc444FrameEncoding::Chroma => {
-            if stream2_data.is_some() || stream2_regions.is_some() {
-                tracing::trace!("send_avc444_frame_with_regions: LC=1/2 forbids stream2");
-                return None;
-            }
-        }
-    }
-
-    if stream1_regions.is_empty() {
-        tracing::trace!("send_avc444_frame_with_regions: no regions");
-        return None;
-    }
-
-    Some(match encoding {
-        Avc444FrameEncoding::LumaAndChroma => Encoding::LUMA_AND_CHROMA,
-        Avc444FrameEncoding::Luma => Encoding::LUMA,
-        Avc444FrameEncoding::Chroma => Encoding::CHROMA,
-    })
 }
 
 pub struct Avc444Encoder {

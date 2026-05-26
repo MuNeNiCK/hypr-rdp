@@ -13,7 +13,7 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use super::state::AppState;
 use super::{poll_dispatch, POLL_TIMEOUT_MS};
 use crate::capture::frame::FramePacer;
-use crate::egfx::{EgfxShared, H264RateControl};
+use crate::egfx::{EgfxShared, EncodedEgfxFrame, H264RateControl};
 
 const MAX_ENCODE_FAILURES: u32 = 5;
 const MIN_SENDABLE_H264_BYTES: usize = 32;
@@ -479,58 +479,58 @@ pub(super) fn capture_loop_ext_dmabuf(
                         };
 
                         match encode_result {
-                            Some(Ok(ref h264_data)) => {
-                                match classify_dmabuf_h264_output(h264_data) {
-                                    DmaBufEncodeProgress::Sendable => {
-                                        encode_failures.reset_window();
-                                        if let (Some(handle), Some(sender)) =
-                                            (&egfx_handle, &egfx_sender)
-                                        {
-                                            let timestamp = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis()
-                                                as u32;
-                                            let sent = shared.send_tracked_avc420_frame(
-                                                handle,
-                                                sender,
-                                                sid,
-                                                width as u16,
-                                                height as u16,
-                                                h264_data,
-                                                timestamp,
-                                                metadata_qp,
-                                            );
-                                            if sent {
-                                                sent_first_frame = true;
-                                            } else if let Some(enc) = &mut h264_encoder {
-                                                enc.force_idr();
-                                            }
-                                        }
-                                    }
-                                    DmaBufEncodeProgress::NoProgress => {
-                                        let action = encode_failures.record_no_progress();
-                                        tracing::trace!(
-                                            failures = encode_failures.failures(),
-                                            max = MAX_ENCODE_FAILURES,
-                                            bytes = h264_data.len(),
-                                            "DMA-BUF encode produced no sendable H.264 output"
+                            Some(Ok(h264_data)) => match classify_dmabuf_h264_output(&h264_data) {
+                                DmaBufEncodeProgress::Sendable => {
+                                    encode_failures.reset_window();
+                                    if let (Some(handle), Some(sender)) =
+                                        (&egfx_handle, &egfx_sender)
+                                    {
+                                        let timestamp = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis()
+                                            as u32;
+                                        let encoded = EncodedEgfxFrame::Avc420(h264_data);
+                                        let sent = shared.send_tracked_encoded_egfx_frame(
+                                            handle,
+                                            sender,
+                                            sid,
+                                            &encoded,
+                                            &[(0, 0, width as i32, height as i32)],
+                                            timestamp,
+                                            width as u16,
+                                            height as u16,
+                                            metadata_qp,
                                         );
-                                        if let Some(enc) = &mut h264_encoder {
+                                        if sent {
+                                            sent_first_frame = true;
+                                        } else if let Some(enc) = &mut h264_encoder {
                                             enc.force_idr();
-                                        }
-                                        if action == DmaBufEncodeFailureAction::FallBackToShm {
-                                            frame.destroy();
-                                            bail!(
-                                                "VA-API encode produced no sendable H.264 output \
-                                                 {} consecutive times in DMA-BUF mode, falling \
-                                                 back to SHM",
-                                                encode_failures.failures()
-                                            );
                                         }
                                     }
                                 }
-                            }
+                                DmaBufEncodeProgress::NoProgress => {
+                                    let action = encode_failures.record_no_progress();
+                                    tracing::trace!(
+                                        failures = encode_failures.failures(),
+                                        max = MAX_ENCODE_FAILURES,
+                                        bytes = h264_data.len(),
+                                        "DMA-BUF encode produced no sendable H.264 output"
+                                    );
+                                    if let Some(enc) = &mut h264_encoder {
+                                        enc.force_idr();
+                                    }
+                                    if action == DmaBufEncodeFailureAction::FallBackToShm {
+                                        frame.destroy();
+                                        bail!(
+                                            "VA-API encode produced no sendable H.264 output \
+                                                 {} consecutive times in DMA-BUF mode, falling \
+                                                 back to SHM",
+                                            encode_failures.failures()
+                                        );
+                                    }
+                                }
+                            },
                             Some(Err(e)) => {
                                 let action = encode_failures.record_no_progress();
                                 tracing::warn!(

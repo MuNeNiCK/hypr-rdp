@@ -1,11 +1,13 @@
 use std::sync::atomic::Ordering;
 
 use ironrdp_dvc::DvcMessage;
+use ironrdp_egfx::pdu::{Avc420Region, Codec1Type, Encoding};
 use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
-use super::{EgfxFrameReadiness, EgfxShared};
+use super::{avc420, encoder::Avc444FrameEncoding, EgfxFrameReadiness, EgfxShared};
+use super::{EncodedEgfxFrame, EncodedFrameState};
 
 pub(in crate::egfx) struct QueuedRdpegfxFrame {
     pub(in crate::egfx) frame_id: u32,
@@ -220,29 +222,206 @@ impl EgfxShared {
         false
     }
 
-    pub(in crate::egfx) fn send_tracked_rdpegfx_frame(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_tracked_encoded_egfx_frame(
         &self,
         handle: &GfxServerHandle,
         sender: &mpsc::UnboundedSender<ServerEvent>,
-        codec_name: &'static str,
-        trace_name: &'static str,
-        queue_frame: impl FnOnce(&mut GraphicsPipelineServer) -> Option<u32>,
+        surface_id: u16,
+        frame: &EncodedEgfxFrame,
+        damage_regions: &[(i32, i32, i32, i32)],
+        timestamp_ms: u32,
+        width: u16,
+        height: u16,
+        quality: u8,
+    ) -> bool {
+        if frame.state() != EncodedFrameState::Sendable {
+            return false;
+        }
+
+        match frame {
+            EncodedEgfxFrame::Avc420(h264_data) => {
+                let regions =
+                    avc420::damage_regions_to_avc420(damage_regions, width, height, quality);
+                if regions.is_empty() {
+                    let full_frame_region =
+                        [avc420::avc420_full_frame_region(width, height, quality)];
+                    self.send_tracked_avc420_rdpegfx_frame(
+                        handle,
+                        sender,
+                        surface_id,
+                        h264_data,
+                        &full_frame_region,
+                        timestamp_ms,
+                    )
+                } else {
+                    self.send_tracked_avc420_rdpegfx_frame(
+                        handle,
+                        sender,
+                        surface_id,
+                        h264_data,
+                        &regions,
+                        timestamp_ms,
+                    )
+                }
+            }
+            EncodedEgfxFrame::Avc444(frame) => {
+                let stream1_regions = avc420::damage_regions_to_avc420(
+                    &frame.stream1_regions,
+                    width,
+                    height,
+                    quality,
+                );
+                let stream2_regions = (!frame.stream2_regions.is_empty()).then(|| {
+                    avc420::damage_regions_to_avc420(&frame.stream2_regions, width, height, quality)
+                });
+                self.send_tracked_avc444_rdpegfx_frame(
+                    handle,
+                    sender,
+                    surface_id,
+                    frame.encoding,
+                    &frame.stream1,
+                    &stream1_regions,
+                    (!frame.stream2_regions.is_empty()).then_some(&frame.stream2[..]),
+                    stream2_regions.as_deref(),
+                    timestamp_ms,
+                )
+            }
+        }
+    }
+
+    pub(in crate::egfx) fn send_tracked_avc420_rdpegfx_frame(
+        &self,
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        surface_id: u16,
+        h264_data: &[u8],
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
     ) -> bool {
         if !self.can_send_frame(handle) {
             return false;
         }
 
-        let Some(queued) = Self::queue_rdpegfx_frame(handle, trace_name, queue_frame) else {
+        if regions.is_empty() {
+            tracing::trace!("queue_avc420_rdpegfx_frame: no regions");
+            return false;
+        }
+
+        let Some(queued) =
+            Self::queue_avc420_rdpegfx_frame(handle, surface_id, h264_data, regions, timestamp_ms)
+        else {
             return false;
         };
 
         let frame_id = queued.frame_id;
-        if Self::send_rdpegfx_dvc_messages(sender, queued, codec_name, trace_name) {
+        if Self::send_rdpegfx_dvc_messages(sender, queued, "AVC420", "avc420_rdpegfx_frame") {
             self.record_frame_queued(frame_id);
             true
         } else {
             false
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::egfx) fn send_tracked_avc444_rdpegfx_frame(
+        &self,
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        surface_id: u16,
+        encoding: Avc444FrameEncoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> bool {
+        if Self::rdpegfx_event_sender_closed(sender, "avc444_rdpegfx_frame") {
+            return false;
+        }
+
+        if !self.can_send_frame(handle) {
+            return false;
+        }
+
+        let Some(send_encoding) =
+            validate_avc444_send_shape(encoding, stream1_regions, stream2_data, stream2_regions)
+        else {
+            return false;
+        };
+
+        let Some(queued) = Self::queue_avc444_rdpegfx_frame(
+            handle,
+            surface_id,
+            send_encoding,
+            stream1_data,
+            stream1_regions,
+            stream2_data,
+            stream2_regions,
+            timestamp_ms,
+        ) else {
+            return false;
+        };
+
+        let frame_id = queued.frame_id;
+        if Self::send_rdpegfx_dvc_messages(sender, queued, "AVC444", "avc444_rdpegfx_frame") {
+            self.record_frame_queued(frame_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(in crate::egfx) fn queue_avc420_rdpegfx_frame(
+        handle: &GfxServerHandle,
+        surface_id: u16,
+        h264_data: &[u8],
+        regions: &[Avc420Region],
+        timestamp_ms: u32,
+    ) -> Option<QueuedRdpegfxFrame> {
+        if regions.is_empty() {
+            tracing::trace!("queue_avc420_rdpegfx_frame: no regions");
+            return None;
+        }
+
+        Self::queue_rdpegfx_frame(handle, "avc420_rdpegfx_frame", |server| {
+            server
+                .send_avc420_frame(surface_id, h264_data, regions, timestamp_ms)
+                .or_else(|| {
+                    tracing::trace!("avc420_rdpegfx_frame: send returned None");
+                    None
+                })
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::egfx) fn queue_avc444_rdpegfx_frame(
+        handle: &GfxServerHandle,
+        surface_id: u16,
+        encoding: Encoding,
+        stream1_data: &[u8],
+        stream1_regions: &[Avc420Region],
+        stream2_data: Option<&[u8]>,
+        stream2_regions: Option<&[Avc420Region]>,
+        timestamp_ms: u32,
+    ) -> Option<QueuedRdpegfxFrame> {
+        Self::queue_rdpegfx_frame(handle, "avc444_rdpegfx_frame", |server| {
+            server
+                .send_avc444_frame_with_encoding(
+                    Codec1Type::Avc444v2,
+                    surface_id,
+                    encoding,
+                    stream1_data,
+                    stream1_regions,
+                    stream2_data,
+                    stream2_regions,
+                    timestamp_ms,
+                )
+                .or_else(|| {
+                    tracing::trace!("avc444_rdpegfx_frame: avc444 frame returned None");
+                    None
+                })
+        })
     }
 
     pub(in crate::egfx) fn queue_rdpegfx_frame(
@@ -321,4 +500,39 @@ impl EgfxShared {
 
         true
     }
+}
+
+pub(in crate::egfx) fn validate_avc444_send_shape(
+    encoding: Avc444FrameEncoding,
+    stream1_regions: &[Avc420Region],
+    stream2_data: Option<&[u8]>,
+    stream2_regions: Option<&[Avc420Region]>,
+) -> Option<Encoding> {
+    let has_stream2_data = stream2_data.is_some();
+    let has_stream2_regions = stream2_regions.is_some_and(|regions| !regions.is_empty());
+    match encoding {
+        Avc444FrameEncoding::LumaAndChroma => {
+            if !has_stream2_data || !has_stream2_regions {
+                tracing::trace!("validate_avc444_rdpegfx_shape: LC=0 requires stream2");
+                return None;
+            }
+        }
+        Avc444FrameEncoding::Luma | Avc444FrameEncoding::Chroma => {
+            if stream2_data.is_some() || stream2_regions.is_some() {
+                tracing::trace!("validate_avc444_rdpegfx_shape: LC=1/2 forbids stream2");
+                return None;
+            }
+        }
+    }
+
+    if stream1_regions.is_empty() {
+        tracing::trace!("validate_avc444_rdpegfx_shape: no regions");
+        return None;
+    }
+
+    Some(match encoding {
+        Avc444FrameEncoding::LumaAndChroma => Encoding::LUMA_AND_CHROMA,
+        Avc444FrameEncoding::Luma => Encoding::LUMA,
+        Avc444FrameEncoding::Chroma => Encoding::CHROMA,
+    })
 }

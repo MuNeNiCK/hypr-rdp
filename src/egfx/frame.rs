@@ -1,4 +1,7 @@
-use super::encoder::{Avc444EncodedFrame, Avc444FrameEncoding};
+use super::{
+    backend::FrameEncoder,
+    encoder::{Avc444EncodedFrame, Avc444FrameEncoding},
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EgfxFrameCodec {
@@ -67,6 +70,12 @@ impl EncodedEgfxFrame {
                     _ => EncodedFrameState::Invalid,
                 }
             }
+        }
+    }
+
+    pub(crate) fn commit_after_send(&self, encoder: &mut FrameEncoder) {
+        if matches!(self, Self::Avc444(_)) {
+            encoder.commit_avc444_reference();
         }
     }
 }

@@ -772,37 +772,17 @@ impl FrameProcessor {
                                     .as_millis()
                                     as u32;
                                 let send_start = Instant::now();
-                                sent_via_egfx = match encoded {
-                                    EncodedEgfxFrame::Avc420(h264_data) => shared
-                                        .send_tracked_avc420_frame_with_damage(
-                                            handle,
-                                            sender,
-                                            sid,
-                                            self.width as u16,
-                                            self.height as u16,
-                                            h264_data,
-                                            &frame_damage_regions,
-                                            timestamp,
-                                            self.metadata_qp(),
-                                        ),
-                                    EncodedEgfxFrame::Avc444(frame) => shared
-                                        .send_tracked_avc444_frame_with_damage(
-                                            handle,
-                                            sender,
-                                            sid,
-                                            frame.encoding,
-                                            &frame.stream1,
-                                            &frame.stream1_regions,
-                                            (!frame.stream2_regions.is_empty())
-                                                .then_some(&frame.stream2[..]),
-                                            (!frame.stream2_regions.is_empty())
-                                                .then_some(&frame.stream2_regions[..]),
-                                            timestamp,
-                                            self.width as u16,
-                                            self.height as u16,
-                                            self.metadata_qp(),
-                                        ),
-                                };
+                                sent_via_egfx = shared.send_tracked_encoded_egfx_frame(
+                                    handle,
+                                    sender,
+                                    sid,
+                                    encoded,
+                                    &frame_damage_regions,
+                                    timestamp,
+                                    self.width as u16,
+                                    self.height as u16,
+                                    self.metadata_qp(),
+                                );
                                 let send_elapsed = send_start.elapsed();
                                 if !sent_via_egfx {
                                     if let Some(enc) = &mut self.h264_encoder {
@@ -820,10 +800,8 @@ impl FrameProcessor {
                                             frame,
                                         );
                                     }
-                                    if matches!(encoded, EncodedEgfxFrame::Avc444(_)) {
-                                        if let Some(enc) = &mut self.h264_encoder {
-                                            enc.commit_avc444_reference();
-                                        }
+                                    if let Some(enc) = &mut self.h264_encoder {
+                                        encoded.commit_after_send(enc);
                                     }
                                     self.damage_detector.update_reference_regions(
                                         data,
