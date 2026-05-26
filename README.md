@@ -82,7 +82,7 @@ hypr-rdp -u user -p pass --capture-mode ext
 bind = "0.0.0.0:3389"
 username = "user"
 password = "pass"
-resolution = "1920x1080"
+# resolution = "1920x1080"
 capture_mode = "wlr"
 bitrate = 10000000
 quality = 23
@@ -102,7 +102,7 @@ CLI arguments override config file values.
 | `--key` | TLS private key (PEM) | Auto-generated |
 | `-u`, `--username` | RDP username | _(none)_ |
 | `-p`, `--password` | RDP password | _(none)_ |
-| `--resolution`, `-r` | Session resolution | `1920x1080` |
+| `--resolution`, `-r` | Fixed session resolution. When omitted for a managed headless output, the session starts at `1920x1080` and may resize to the client-requested size. | Auto client size |
 | `--capture-mode` | `wlr` or `ext` | `wlr` |
 | `--bitrate` | H.264 bitrate (bps) | `10000000` |
 | `--quality` | H.264 quality (0-51) | `23` |
