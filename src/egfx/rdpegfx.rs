@@ -15,6 +15,118 @@ pub(in crate::egfx) struct QueuedRdpegfxFrame {
     pub(in crate::egfx) channel_id: u32,
 }
 
+#[derive(Default)]
+pub(crate) struct EgfxFrameSession {
+    ready: bool,
+    generation: u32,
+    handle: Option<GfxServerHandle>,
+    sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    surface_id: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct EgfxFrameSessionRefresh {
+    pub(crate) ready: bool,
+    pub(crate) became_unready: bool,
+    pub(crate) generation_changed: bool,
+}
+
+impl EgfxFrameSession {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn refresh(&mut self, shared: &EgfxShared) -> EgfxFrameSessionRefresh {
+        let ready = shared.is_ready() && shared.is_avc_enabled();
+        let became_unready = self.ready && !ready;
+        let generation = shared.generation();
+        let generation_changed = generation != self.generation;
+
+        self.ready = ready;
+        if became_unready {
+            self.reset_transport();
+        }
+
+        if generation_changed {
+            self.generation = generation;
+            self.surface_id = None;
+        }
+
+        if ready && (self.handle.is_none() || self.sender.is_none()) {
+            self.handle = shared.get_handle();
+            self.sender = shared.get_event_sender();
+        }
+
+        EgfxFrameSessionRefresh {
+            ready,
+            became_unready,
+            generation_changed,
+        }
+    }
+
+    pub(crate) fn ensure_surface(&mut self, shared: &EgfxShared, width: u16, height: u16) -> bool {
+        if !self.ready {
+            return false;
+        }
+
+        if self.surface_id.is_some() {
+            return true;
+        }
+
+        let (Some(handle), Some(sender)) = (&self.handle, &self.sender) else {
+            return false;
+        };
+
+        self.surface_id = shared.init_or_reuse_surface(handle, sender, width, height);
+        self.surface_id.is_some()
+    }
+
+    #[cfg(feature = "vaapi")]
+    pub(crate) fn frame_readiness(&self, shared: &EgfxShared) -> EgfxFrameReadiness {
+        let Some(handle) = &self.handle else {
+            return EgfxFrameReadiness::TransportUnavailable;
+        };
+
+        shared.frame_readiness(handle)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn send_encoded_frame(
+        &self,
+        shared: &EgfxShared,
+        frame: &EncodedEgfxFrame,
+        damage_regions: &[(i32, i32, i32, i32)],
+        timestamp_ms: u32,
+        width: u16,
+        height: u16,
+        quality: u8,
+    ) -> bool {
+        let (Some(handle), Some(sender), Some(surface_id)) =
+            (&self.handle, &self.sender, self.surface_id)
+        else {
+            return false;
+        };
+
+        shared.send_tracked_encoded_egfx_frame(
+            handle,
+            sender,
+            surface_id,
+            frame,
+            damage_regions,
+            timestamp_ms,
+            width,
+            height,
+            quality,
+        )
+    }
+
+    fn reset_transport(&mut self) {
+        self.handle = None;
+        self.sender = None;
+        self.surface_id = None;
+    }
+}
+
 impl EgfxShared {
     /// Prepare EGFX state for a resize (Deactivation-Reactivation).
     /// Deletes all old surfaces, sends ResetGraphics at the new dimensions,

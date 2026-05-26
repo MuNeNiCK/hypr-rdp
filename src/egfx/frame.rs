@@ -24,6 +24,10 @@ pub(crate) enum EncodedFrameState {
 }
 
 impl EncodedEgfxFrame {
+    pub(crate) fn avc420(data: Vec<u8>) -> Self {
+        Self::Avc420(data)
+    }
+
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::Avc420(data) => data.len(),

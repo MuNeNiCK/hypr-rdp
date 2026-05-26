@@ -13,29 +13,16 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use super::state::AppState;
 use super::{poll_dispatch, POLL_TIMEOUT_MS};
 use crate::capture::frame::FramePacer;
-use crate::egfx::{EgfxShared, EncodedEgfxFrame, H264RateControl};
+use crate::egfx::{
+    EgfxFrameSession, EgfxShared, EncodedEgfxFrame, EncodedFrameState, H264RateControl,
+};
 
 const MAX_ENCODE_FAILURES: u32 = 5;
-const MIN_SENDABLE_H264_BYTES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DmaBufEncodeFailureAction {
     Retry,
     FallBackToShm,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DmaBufEncodeProgress {
-    Sendable,
-    NoProgress,
-}
-
-fn classify_dmabuf_h264_output(h264_data: &[u8]) -> DmaBufEncodeProgress {
-    if h264_data.len() > MIN_SENDABLE_H264_BYTES {
-        DmaBufEncodeProgress::Sendable
-    } else {
-        DmaBufEncodeProgress::NoProgress
-    }
 }
 
 #[derive(Debug)]
@@ -294,15 +281,9 @@ pub(super) fn capture_loop_ext_dmabuf(
     let mut cap_idx: usize = 0;
     let mut sent_first_frame = false;
 
-    // EGFX state (mirrors FrameProcessor but for DMA-BUF path)
+    // EGFX transport and surface state live behind the EGFX session helper.
+    let mut egfx_session = EgfxFrameSession::new();
     let mut h264_encoder: Option<crate::egfx::FrameEncoder> = None;
-    let mut egfx_handle: Option<ironrdp_server::GfxServerHandle> = None;
-    let mut egfx_sender: Option<tokio::sync::mpsc::UnboundedSender<ironrdp_server::ServerEvent>> =
-        None;
-    let mut egfx_surface_id: Option<u16> = None;
-    let mut egfx_active = false;
-    let mut egfx_ready = false;
-    let mut egfx_generation: u32 = 0;
     let mut encode_failures = DmaBufEncodeFailureTracker::new(MAX_ENCODE_FAILURES);
     let metadata_qp = match rate_control {
         H264RateControl::Vbr => 0,
@@ -377,144 +358,112 @@ pub(super) fn capture_loop_ext_dmabuf(
                     }
                 }
 
-                let ready = shared.is_ready() && shared.is_avc_enabled();
-                let gen = shared.generation();
-
-                if ready != egfx_ready {
-                    egfx_ready = ready;
-                    if !ready {
-                        egfx_active = false;
-                        egfx_handle = None;
-                        egfx_sender = None;
-                        egfx_surface_id = None;
-                        h264_encoder = None;
-                        encode_failures.reset_window();
-                    }
-                }
-
-                if gen != egfx_generation {
-                    egfx_generation = gen;
-                    egfx_surface_id = None;
+                let session_refresh = egfx_session.refresh(shared);
+                if session_refresh.became_unready {
                     h264_encoder = None;
                     encode_failures.reset_window();
-                    if ready {
-                        match crate::egfx::FrameEncoder::new(
-                            width,
-                            height,
-                            bitrate,
-                            fps,
-                            quality,
-                            rate_control,
-                        ) {
-                            Ok(enc) => {
-                                tracing::info!(
-                                    width,
-                                    height,
-                                    backend = enc.backend_name(),
-                                    gen,
-                                    "H.264 encoder initialized (DMA-BUF path)"
-                                );
-                                h264_encoder = Some(enc);
-                            }
-                            Err(e) => {
-                                // DMA-BUF path requires a working encoder; bail to SHM fallback
-                                frame.destroy();
-                                bail!("H.264 encoder init failed in DMA-BUF mode, falling back to SHM: {:#}", e);
-                            }
-                        }
-                    }
                 }
 
-                if ready && !egfx_active {
-                    egfx_handle = shared.get_handle();
-                    egfx_sender = shared.get_event_sender();
-                    if h264_encoder.is_some() && egfx_handle.is_some() && egfx_sender.is_some() {
-                        egfx_active = true;
-                        tracing::trace!("EGFX transport ready (DMA-BUF path)");
-                    }
-                }
-
-                if egfx_active {
-                    // Surface initialization (separate borrow scope)
-                    if egfx_surface_id.is_none() {
-                        if let (Some(handle), Some(sender)) = (&egfx_handle, &egfx_sender) {
-                            egfx_surface_id = EgfxShared::init_surface(
-                                handle,
-                                sender,
-                                width as u16,
-                                height as u16,
+                if session_refresh.ready
+                    && (session_refresh.generation_changed || h264_encoder.is_none())
+                {
+                    encode_failures.reset_window();
+                    match crate::egfx::FrameEncoder::new(
+                        width,
+                        height,
+                        bitrate,
+                        fps,
+                        quality,
+                        rate_control,
+                    ) {
+                        Ok(enc) => {
+                            tracing::info!(
+                                width,
+                                height,
+                                backend = enc.backend_name(),
+                                gen = shared.generation(),
+                                "H.264 encoder initialized (DMA-BUF path)"
                             );
+                            h264_encoder = Some(enc);
+                        }
+                        Err(e) => {
+                            // DMA-BUF path requires a working encoder; bail to SHM fallback
+                            frame.destroy();
+                            bail!("H.264 encoder init failed in DMA-BUF mode, falling back to SHM: {:#}", e);
                         }
                     }
+                }
 
-                    if let Some(sid) = egfx_surface_id {
-                        if let Some(handle) = &egfx_handle {
-                            if !shared.can_send_frame(handle) {
-                                tracing::trace!("EGFX frame skipped before DMA-BUF encode");
-                                continue;
-                            }
+                if session_refresh.ready && h264_encoder.is_some() {
+                    if !egfx_session.ensure_surface(shared, width as u16, height as u16) {
+                        continue;
+                    }
+
+                    let readiness = egfx_session.frame_readiness(shared);
+                    if !readiness.is_ready() {
+                        tracing::trace!(
+                            ?readiness,
+                            reason = readiness.reason(),
+                            "EGFX frame skipped before DMA-BUF encode"
+                        );
+                        continue;
+                    }
+
+                    // Zero-copy encode pipeline:
+                    // 1. VPP: XRGB DMA-BUF -> NV12 (GPU)
+                    // 2. Encoder: NV12 DMA-BUF -> H.264 (GPU)
+                    let vpp_result = dmabuf_ctx.vpp.convert(completed_idx);
+                    let encode_result = match vpp_result {
+                        Ok(()) => {
+                            let nv12 = &dmabuf_ctx.nv12_info;
+                            h264_encoder.as_mut().map(|enc| {
+                                enc.encode_dmabuf(
+                                    nv12.fd,
+                                    nv12.width,
+                                    nv12.height,
+                                    nv12.stride,
+                                    nv12.offset,
+                                    nv12.modifier,
+                                    nv12.uv_stride,
+                                    nv12.uv_offset,
+                                )
+                            })
                         }
+                        Err(e) => Some(Err(e)),
+                    };
 
-                        // Zero-copy encode pipeline:
-                        // 1. VPP: XRGB DMA-BUF -> NV12 (GPU)
-                        // 2. Encoder: NV12 DMA-BUF -> H.264 (GPU)
-                        let vpp_result = dmabuf_ctx.vpp.convert(completed_idx);
-                        let encode_result = match vpp_result {
-                            Ok(()) => {
-                                let nv12 = &dmabuf_ctx.nv12_info;
-                                h264_encoder.as_mut().map(|enc| {
-                                    enc.encode_dmabuf(
-                                        nv12.fd,
-                                        nv12.width,
-                                        nv12.height,
-                                        nv12.stride,
-                                        nv12.offset,
-                                        nv12.modifier,
-                                        nv12.uv_stride,
-                                        nv12.uv_offset,
-                                    )
-                                })
-                            }
-                            Err(e) => Some(Err(e)),
-                        };
-
-                        match encode_result {
-                            Some(Ok(h264_data)) => match classify_dmabuf_h264_output(&h264_data) {
-                                DmaBufEncodeProgress::Sendable => {
+                    match encode_result {
+                        Some(Ok(h264_data)) => {
+                            let encoded = EncodedEgfxFrame::avc420(h264_data);
+                            match encoded.state() {
+                                EncodedFrameState::Sendable => {
                                     encode_failures.reset_window();
-                                    if let (Some(handle), Some(sender)) =
-                                        (&egfx_handle, &egfx_sender)
-                                    {
-                                        let timestamp = std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis()
-                                            as u32;
-                                        let encoded = EncodedEgfxFrame::Avc420(h264_data);
-                                        let sent = shared.send_tracked_encoded_egfx_frame(
-                                            handle,
-                                            sender,
-                                            sid,
-                                            &encoded,
-                                            &[(0, 0, width as i32, height as i32)],
-                                            timestamp,
-                                            width as u16,
-                                            height as u16,
-                                            metadata_qp,
-                                        );
-                                        if sent {
-                                            sent_first_frame = true;
-                                        } else if let Some(enc) = &mut h264_encoder {
-                                            enc.force_idr();
-                                        }
+                                    let timestamp = std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_millis()
+                                        as u32;
+                                    let sent = egfx_session.send_encoded_frame(
+                                        shared,
+                                        &encoded,
+                                        &[(0, 0, width as i32, height as i32)],
+                                        timestamp,
+                                        width as u16,
+                                        height as u16,
+                                        metadata_qp,
+                                    );
+                                    if sent {
+                                        sent_first_frame = true;
+                                    } else if let Some(enc) = &mut h264_encoder {
+                                        enc.force_idr();
                                     }
                                 }
-                                DmaBufEncodeProgress::NoProgress => {
+                                EncodedFrameState::Skipped | EncodedFrameState::Invalid => {
                                     let action = encode_failures.record_no_progress();
                                     tracing::trace!(
                                         failures = encode_failures.failures(),
                                         max = MAX_ENCODE_FAILURES,
-                                        bytes = h264_data.len(),
+                                        bytes = encoded.len(),
                                         "DMA-BUF encode produced no sendable H.264 output"
                                     );
                                     if let Some(enc) = &mut h264_encoder {
@@ -530,30 +479,30 @@ pub(super) fn capture_loop_ext_dmabuf(
                                         );
                                     }
                                 }
-                            },
-                            Some(Err(e)) => {
-                                let action = encode_failures.record_no_progress();
-                                tracing::warn!(
-                                    failures = encode_failures.failures(),
-                                    max = MAX_ENCODE_FAILURES,
-                                    "DMA-BUF encode pipeline failed: {:#}",
-                                    e
-                                );
-                                if let Some(enc) = &mut h264_encoder {
-                                    enc.force_idr();
-                                }
-                                if action == DmaBufEncodeFailureAction::FallBackToShm {
-                                    // Destroy the in-flight frame before dropping DMA-BUF resources
-                                    frame.destroy();
-                                    bail!(
-                                        "VA-API encode failed {} consecutive times in DMA-BUF mode, \
-                                         falling back to SHM",
-                                        encode_failures.failures()
-                                    );
-                                }
                             }
-                            None => {}
                         }
+                        Some(Err(e)) => {
+                            let action = encode_failures.record_no_progress();
+                            tracing::warn!(
+                                failures = encode_failures.failures(),
+                                max = MAX_ENCODE_FAILURES,
+                                "DMA-BUF encode pipeline failed: {:#}",
+                                e
+                            );
+                            if let Some(enc) = &mut h264_encoder {
+                                enc.force_idr();
+                            }
+                            if action == DmaBufEncodeFailureAction::FallBackToShm {
+                                // Destroy the in-flight frame before dropping DMA-BUF resources
+                                frame.destroy();
+                                bail!(
+                                    "VA-API encode failed {} consecutive times in DMA-BUF mode, \
+                                         falling back to SHM",
+                                    encode_failures.failures()
+                                );
+                            }
+                        }
+                        None => {}
                     }
                 }
             }
@@ -609,14 +558,6 @@ mod tests {
     fn dmabuf_encode_tracker_falls_back_after_unsendable_h264_outputs() {
         let mut tracker = DmaBufEncodeFailureTracker::new(2);
 
-        assert_eq!(
-            classify_dmabuf_h264_output(&[0; MIN_SENDABLE_H264_BYTES]),
-            DmaBufEncodeProgress::NoProgress
-        );
-        assert_eq!(
-            classify_dmabuf_h264_output(&[0; MIN_SENDABLE_H264_BYTES + 1]),
-            DmaBufEncodeProgress::Sendable
-        );
         assert_eq!(
             tracker.record_no_progress(),
             DmaBufEncodeFailureAction::Retry

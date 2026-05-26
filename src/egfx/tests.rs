@@ -84,6 +84,34 @@ fn surface_reuse_does_not_emit_duplicate_create_or_map_for_same_size() {
 }
 
 #[test]
+fn frame_session_owns_surface_and_encoded_send() {
+    let (shared, _bridge, _handle, _event_tx, mut event_rx) =
+        negotiated_avc420_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+    let mut session = EgfxFrameSession::new();
+
+    let refresh = session.refresh(&shared);
+    assert!(refresh.ready);
+    assert!(session.ensure_surface(&shared, 64, 64));
+
+    let setup_pdus = drain_gfx_pdus(&mut event_rx);
+    assert_eq!(setup_pdus.len(), 3);
+    let surface_id = shared
+        .current_surface_id(64, 64)
+        .expect("session initialized surface");
+
+    let encoded = EncodedEgfxFrame::avc420(vec![0; 33]);
+    assert_eq!(encoded.state(), EncodedFrameState::Sendable);
+    assert!(session.send_encoded_frame(&shared, &encoded, &[(0, 0, 64, 64)], 123, 64, 64, 21,));
+
+    let frame_pdus = drain_gfx_pdus(&mut event_rx);
+    let wire = assert_wire_to_surface_frame(&frame_pdus, surface_id, Codec1Type::Avc420);
+    assert_eq!(wire.destination_rectangle.left, 0);
+    assert_eq!(wire.destination_rectangle.top, 0);
+    assert_eq!(wire.destination_rectangle.right, 64);
+    assert_eq!(wire.destination_rectangle.bottom, 64);
+}
+
+#[test]
 fn frame_send_before_surface_init_is_rejected_without_queueing() {
     let (shared, _bridge, handle, event_tx, mut event_rx) =
         negotiated_avc420_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
