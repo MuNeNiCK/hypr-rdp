@@ -562,7 +562,7 @@ fn avc444v2_send_wrapper_emits_logical_frame_wire_shape() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    let (_frame_id, dvc_messages, _channel_id) = EgfxShared::queue_avc444_frame_with_regions(
+    let queued = EgfxShared::queue_avc444_frame_with_regions(
         &handle,
         surface_id,
         encoder::Avc444FrameEncoding::LumaAndChroma,
@@ -573,7 +573,7 @@ fn avc444v2_send_wrapper_emits_logical_frame_wire_shape() {
         123,
     )
     .expect("LC=0 AVC444v2 frame queues");
-    let pdus: Vec<_> = dvc_messages.iter().map(decode_gfx_output).collect();
+    let pdus: Vec<_> = queued.dvc_messages.iter().map(decode_gfx_output).collect();
     let wire = assert_wire_to_surface_frame(&pdus, surface_id, Codec1Type::Avc444v2);
     let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
     let bitmap = Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
@@ -756,7 +756,7 @@ fn avc444_send_wrapper_maps_luma_and_chroma_to_wire_payload() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    let (_frame_id, dvc_messages, _channel_id) = EgfxShared::queue_avc444_frame_with_regions(
+    let queued = EgfxShared::queue_avc444_frame_with_regions(
         &handle,
         surface_id,
         encoder::Avc444FrameEncoding::LumaAndChroma,
@@ -768,16 +768,16 @@ fn avc444_send_wrapper_maps_luma_and_chroma_to_wire_payload() {
     )
     .expect("LC=0 AVC444v2 frame queues");
 
-    assert_eq!(dvc_messages.len(), 3);
+    assert_eq!(queued.dvc_messages.len(), 3);
     assert!(matches!(
-        decode_gfx_output(&dvc_messages[0]),
+        decode_gfx_output(&queued.dvc_messages[0]),
         GfxPdu::StartFrame(_)
     ));
     assert!(matches!(
-        decode_gfx_output(&dvc_messages[2]),
+        decode_gfx_output(&queued.dvc_messages[2]),
         GfxPdu::EndFrame(_)
     ));
-    let wire = decode_avc444_wire_to_surface(&dvc_messages[1]);
+    let wire = decode_avc444_wire_to_surface(&queued.dvc_messages[1]);
     let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
     let bitmap = Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
     let stream_info = u32::from_le_bytes(wire.bitmap_data[0..4].try_into().unwrap());
@@ -808,7 +808,7 @@ fn avc444_send_wrapper_allows_empty_h264_payloads_with_regions() {
     let stream1_regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
     let stream2_regions = [Avc420Region::new(16, 8, 64, 48, 22, 78)];
 
-    let (_frame_id, dvc_messages, _channel_id) = EgfxShared::queue_avc444_frame_with_regions(
+    let queued = EgfxShared::queue_avc444_frame_with_regions(
         &handle,
         surface_id,
         encoder::Avc444FrameEncoding::LumaAndChroma,
@@ -820,7 +820,7 @@ fn avc444_send_wrapper_allows_empty_h264_payloads_with_regions() {
     )
     .expect("LC=0 AVC444v2 frame with metadata queues");
 
-    let wire = decode_avc444_wire_to_surface(&dvc_messages[1]);
+    let wire = decode_avc444_wire_to_surface(&queued.dvc_messages[1]);
     let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
     let bitmap = Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
 
@@ -850,7 +850,7 @@ fn avc444_send_wrapper_maps_luma_only_and_chroma_only_to_stream1() {
     ] {
         let (handle, surface_id) = ready_avc444_handle(64, 64);
         let regions = [Avc420Region::new(4, 6, 20, 22, 18, 82)];
-        let (_frame_id, dvc_messages, _channel_id) = EgfxShared::queue_avc444_frame_with_regions(
+        let queued = EgfxShared::queue_avc444_frame_with_regions(
             &handle,
             surface_id,
             local_encoding,
@@ -862,8 +862,8 @@ fn avc444_send_wrapper_maps_luma_only_and_chroma_only_to_stream1() {
         )
         .expect("single-stream AVC444v2 frame queues");
 
-        assert_eq!(dvc_messages.len(), 3);
-        let wire = decode_avc444_wire_to_surface(&dvc_messages[1]);
+        assert_eq!(queued.dvc_messages.len(), 3);
+        let wire = decode_avc444_wire_to_surface(&queued.dvc_messages[1]);
         let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
         let bitmap =
             Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");

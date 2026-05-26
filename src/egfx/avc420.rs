@@ -1,5 +1,5 @@
 use ironrdp_egfx::pdu::Avc420Region;
-use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
+use ironrdp_server::{GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
 use super::EgfxShared;
@@ -74,26 +74,19 @@ impl EgfxShared {
         regions: &[Avc420Region],
         timestamp_ms: u32,
     ) -> bool {
-        if !self.can_send_frame(handle) {
+        if regions.is_empty() {
+            tracing::trace!("send_avc420_frame_with_regions: no regions");
             return false;
         }
 
-        let Some((frame_id, dvc_messages, channel_id)) = Self::queue_avc420_frame_with_regions(
-            handle,
-            surface_id,
-            h264_data,
-            regions,
-            timestamp_ms,
-        ) else {
-            return false;
-        };
-
-        if Self::send_encoded_frame(sender, channel_id, dvc_messages, "AVC420") {
-            self.record_frame_queued(frame_id);
-            true
-        } else {
-            false
-        }
+        self.send_tracked_rdpegfx_frame(handle, sender, "AVC420", "send_avc420_frame", |server| {
+            server
+                .send_avc420_frame(surface_id, h264_data, regions, timestamp_ms)
+                .or_else(|| {
+                    tracing::trace!("send_avc420_frame: send_avc420_frame returned None");
+                    None
+                })
+        })
     }
 
     #[cfg(test)]
@@ -115,7 +108,7 @@ impl EgfxShared {
             return false;
         }
 
-        let Some((_frame_id, dvc_messages, channel_id)) = Self::queue_avc420_frame_with_regions(
+        let Some(queued) = Self::queue_avc420_frame_with_regions(
             handle,
             surface_id,
             h264_data,
@@ -125,95 +118,30 @@ impl EgfxShared {
             return false;
         };
 
-        Self::send_encoded_frame(sender, channel_id, dvc_messages, "AVC420")
+        Self::send_rdpegfx_dvc_messages(sender, queued, "AVC420", "send_avc420_frame")
     }
 
+    #[cfg(test)]
     fn queue_avc420_frame_with_regions(
         handle: &GfxServerHandle,
         surface_id: u16,
         h264_data: &[u8],
         regions: &[Avc420Region],
         timestamp_ms: u32,
-    ) -> Option<(u32, Vec<ironrdp_dvc::DvcMessage>, u32)> {
+    ) -> Option<super::rdpegfx::QueuedRdpegfxFrame> {
         if regions.is_empty() {
             tracing::trace!("send_avc420_frame_with_regions: no regions");
             return None;
         }
 
-        let (_frame_id, dvc_messages, channel_id) = {
-            let Ok(mut server) = handle.lock() else {
-                return None;
-            };
-
-            if !server.is_ready() {
-                tracing::trace!("send_avc420_frame: server not ready");
-                return None;
-            }
-            if server.should_backpressure() {
-                tracing::trace!(
-                    in_flight = server.frames_in_flight(),
-                    "send_avc420_frame: backpressure"
-                );
-                return None;
-            }
-
-            let channel_id = match server.channel_id() {
-                Some(id) => id,
-                None => {
-                    tracing::trace!("send_avc420_frame: no channel_id");
-                    return None;
-                }
-            };
-
-            let frame_id =
-                match server.send_avc420_frame(surface_id, h264_data, regions, timestamp_ms) {
-                    Some(id) => id,
-                    None => {
-                        tracing::trace!("send_avc420_frame: send_avc420_frame returned None");
-                        return None;
-                    }
-                };
-
-            let dvc_messages = server.drain_output();
-            (frame_id, dvc_messages, channel_id)
-        };
-
-        if dvc_messages.is_empty() {
-            return None;
-        }
-
-        Some((_frame_id, dvc_messages, channel_id))
-    }
-
-    fn send_encoded_frame(
-        sender: &mpsc::UnboundedSender<ServerEvent>,
-        channel_id: u32,
-        dvc_messages: Vec<ironrdp_dvc::DvcMessage>,
-        codec_name: &'static str,
-    ) -> bool {
-        match ironrdp_dvc::encode_dvc_messages(
-            channel_id,
-            dvc_messages,
-            ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
-        ) {
-            Ok(svc_messages) => {
-                if sender
-                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
-                        messages: svc_messages,
-                    }))
-                    .is_err()
-                {
-                    tracing::trace!("send_avc420_frame: EGFX event channel closed");
-                    return false;
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to encode EGFX {} frame: {}", codec_name, e);
-                return false;
-            }
-        }
-
-        true
+        Self::queue_rdpegfx_frame(handle, "send_avc420_frame", |server| {
+            server
+                .send_avc420_frame(surface_id, h264_data, regions, timestamp_ms)
+                .or_else(|| {
+                    tracing::trace!("send_avc420_frame: send_avc420_frame returned None");
+                    None
+                })
+        })
     }
 }
 

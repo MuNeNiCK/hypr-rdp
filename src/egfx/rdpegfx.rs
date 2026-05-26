@@ -1,9 +1,17 @@
 use std::sync::atomic::Ordering;
 
+use ironrdp_dvc::DvcMessage;
+use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
 use super::{EgfxFrameReadiness, EgfxShared};
+
+pub(in crate::egfx) struct QueuedRdpegfxFrame {
+    pub(in crate::egfx) frame_id: u32,
+    pub(in crate::egfx) dvc_messages: Vec<DvcMessage>,
+    pub(in crate::egfx) channel_id: u32,
+}
 
 impl EgfxShared {
     /// Prepare EGFX state for a resize (Deactivation-Reactivation).
@@ -199,5 +207,118 @@ impl EgfxShared {
             };
         }
         EgfxFrameReadiness::Ready
+    }
+
+    pub(in crate::egfx) fn rdpegfx_event_sender_closed(
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        trace_name: &'static str,
+    ) -> bool {
+        if sender.is_closed() {
+            tracing::trace!("{trace_name}: EGFX event channel already closed");
+            return true;
+        }
+        false
+    }
+
+    pub(in crate::egfx) fn send_tracked_rdpegfx_frame(
+        &self,
+        handle: &GfxServerHandle,
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        codec_name: &'static str,
+        trace_name: &'static str,
+        queue_frame: impl FnOnce(&mut GraphicsPipelineServer) -> Option<u32>,
+    ) -> bool {
+        if !self.can_send_frame(handle) {
+            return false;
+        }
+
+        let Some(queued) = Self::queue_rdpegfx_frame(handle, trace_name, queue_frame) else {
+            return false;
+        };
+
+        let frame_id = queued.frame_id;
+        if Self::send_rdpegfx_dvc_messages(sender, queued, codec_name, trace_name) {
+            self.record_frame_queued(frame_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(in crate::egfx) fn queue_rdpegfx_frame(
+        handle: &GfxServerHandle,
+        trace_name: &'static str,
+        queue_frame: impl FnOnce(&mut GraphicsPipelineServer) -> Option<u32>,
+    ) -> Option<QueuedRdpegfxFrame> {
+        let (frame_id, dvc_messages, channel_id) = {
+            let Ok(mut server) = handle.lock() else {
+                return None;
+            };
+
+            if !server.is_ready() {
+                tracing::trace!("{trace_name}: server not ready");
+                return None;
+            }
+            if server.should_backpressure() {
+                tracing::trace!(
+                    in_flight = server.frames_in_flight(),
+                    "{trace_name}: backpressure"
+                );
+                return None;
+            }
+
+            let channel_id = match server.channel_id() {
+                Some(id) => id,
+                None => {
+                    tracing::trace!("{trace_name}: no channel_id");
+                    return None;
+                }
+            };
+
+            let frame_id = queue_frame(&mut server)?;
+            let dvc_messages = server.drain_output();
+            (frame_id, dvc_messages, channel_id)
+        };
+
+        if dvc_messages.is_empty() {
+            return None;
+        }
+
+        Some(QueuedRdpegfxFrame {
+            frame_id,
+            dvc_messages,
+            channel_id,
+        })
+    }
+
+    pub(in crate::egfx) fn send_rdpegfx_dvc_messages(
+        sender: &mpsc::UnboundedSender<ServerEvent>,
+        queued: QueuedRdpegfxFrame,
+        codec_name: &'static str,
+        trace_name: &'static str,
+    ) -> bool {
+        match ironrdp_dvc::encode_dvc_messages(
+            queued.channel_id,
+            queued.dvc_messages,
+            ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
+        ) {
+            Ok(svc_messages) => {
+                if sender
+                    .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
+                        messages: svc_messages,
+                    }))
+                    .is_err()
+                {
+                    tracing::trace!("{trace_name}: EGFX event channel closed");
+                    return false;
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to encode EGFX {} frame: {}", codec_name, e);
+                return false;
+            }
+        }
+
+        true
     }
 }
