@@ -1911,7 +1911,7 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
-    fn avc444_v2_encoder_options_use_freerdp_libavcodec_backend_policy() {
+    fn avc444_v2_encoder_options_use_ffmpeg_libavcodec_backend_policy() {
         let options = avc444_h264_encoder_options();
 
         assert!(!options.ffmpeg_vaapi);
@@ -1919,7 +1919,7 @@ mod tests {
 
     #[cfg(feature = "vaapi")]
     #[test]
-    fn avc444_vaapi_options_use_freerdp_ffmpeg_h264_vaapi_policy() {
+    fn avc444_vaapi_options_use_ffmpeg_h264_vaapi_policy() {
         let options = avc444_h264_vaapi_encoder_options();
 
         assert!(options.ffmpeg_vaapi);

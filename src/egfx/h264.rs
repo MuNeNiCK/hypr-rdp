@@ -404,8 +404,8 @@ impl FfmpegH264Encoder {
 
         let mut hw_device_ctx = null_mut();
         if matches!(backend, FfmpegH264Backend::Vaapi) {
-            hw_device_ctx = create_freerdp_vaapi_device()?;
-            configure_freerdp_vaapi_frames(&mut encoder, hw_device_ctx, width, height)?;
+            hw_device_ctx = create_ffmpeg_vaapi_device()?;
+            configure_ffmpeg_vaapi_frames(&mut encoder, hw_device_ctx, width, height)?;
         }
 
         let encoder = encoder
@@ -432,7 +432,7 @@ impl FfmpegH264Encoder {
         prepend_cached_sps_pps: bool,
     ) -> Result<EncodedH264> {
         let mut frame = self.create_input_frame(yuv)?;
-        set_freerdp_ffmpeg_frame_metadata(&mut frame, self.frame_index);
+        set_ffmpeg_h264_frame_metadata(&mut frame, self.frame_index);
         let forced_keyframe = self.force_idr;
         if forced_keyframe {
             mark_ffmpeg_h264_keyframe(&mut frame);
@@ -521,7 +521,7 @@ impl FfmpegH264Encoder {
             self.width as u32,
             self.height as u32,
         );
-        set_freerdp_ffmpeg_frame_color(&mut software_frame);
+        set_ffmpeg_h264_frame_color(&mut software_frame);
         copy_yuv420p_to_nv12_frame(yuv, &mut software_frame, self.width, self.height);
 
         let mut hardware_frame = ffmpeg::frame::Video::empty();
@@ -561,7 +561,7 @@ fn ffmpeg_h264_encoder_options(
     qp: u8,
 ) -> ffmpeg::Dictionary<'static> {
     let mut options = ffmpeg::Dictionary::new();
-    options.set("preset", backend.freerdp_preset());
+    options.set("preset", backend.ffmpeg_preset());
     options.set("tune", "zerolatency");
     match backend {
         FfmpegH264Backend::Software => {
@@ -602,12 +602,12 @@ fn ensure_ffmpeg_vaapi_packet_progress(backend: FfmpegH264Backend, data: &[u8]) 
     Ok(())
 }
 
-fn set_freerdp_ffmpeg_frame_metadata(frame: &mut ffmpeg::frame::Video, pts: i64) {
+fn set_ffmpeg_h264_frame_metadata(frame: &mut ffmpeg::frame::Video, pts: i64) {
     frame.set_pts(Some(pts));
-    set_freerdp_ffmpeg_frame_color(frame);
+    set_ffmpeg_h264_frame_color(frame);
 }
 
-fn set_freerdp_ffmpeg_frame_color(frame: &mut ffmpeg::frame::Video) {
+fn set_ffmpeg_h264_frame_color(frame: &mut ffmpeg::frame::Video) {
     frame.set_color_space(ffmpeg::color::Space::BT709);
     frame.set_color_range(ffmpeg::color::Range::JPEG);
     unsafe {
@@ -735,7 +735,7 @@ impl FfmpegH264Backend {
         }
     }
 
-    fn freerdp_preset(self) -> &'static str {
+    fn ffmpeg_preset(self) -> &'static str {
         match self {
             Self::Software => "medium",
             Self::Vaapi => "veryslow",
@@ -743,8 +743,8 @@ impl FfmpegH264Backend {
     }
 }
 
-fn create_freerdp_vaapi_device() -> Result<*mut ffmpeg::ffi::AVBufferRef> {
-    let device = std::env::var("FREERDP_VAAPI_DEVICE")
+fn create_ffmpeg_vaapi_device() -> Result<*mut ffmpeg::ffi::AVBufferRef> {
+    let device = std::env::var("HYPR_RDP_VAAPI_DEVICE")
         .ok()
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "/dev/dri/renderD128".to_owned());
@@ -767,7 +767,7 @@ fn create_freerdp_vaapi_device() -> Result<*mut ffmpeg::ffi::AVBufferRef> {
     Ok(hw_device_ctx)
 }
 
-fn configure_freerdp_vaapi_frames(
+fn configure_ffmpeg_vaapi_frames(
     encoder: &mut ffmpeg::codec::encoder::video::Video,
     hw_device_ctx: *mut ffmpeg::ffi::AVBufferRef,
     width: i32,
@@ -787,7 +787,7 @@ fn configure_freerdp_vaapi_frames(
         (*frames).sw_format = ffmpeg::ffi::AVPixelFormat::AV_PIX_FMT_NV12;
         (*frames).width = width;
         (*frames).height = height;
-        (*frames).initial_pool_size = FREERDP_VAAPI_INITIAL_POOL_SIZE;
+        (*frames).initial_pool_size = FFMPEG_VAAPI_INITIAL_POOL_SIZE;
         ffmpeg::ffi::av_hwframe_ctx_init(hw_frames_ctx)
     };
 
@@ -816,7 +816,7 @@ fn configure_freerdp_vaapi_frames(
     Ok(())
 }
 
-const FREERDP_VAAPI_INITIAL_POOL_SIZE: c_int = 20;
+const FFMPEG_VAAPI_INITIAL_POOL_SIZE: c_int = 20;
 
 fn ffmpeg_status(status: c_int) -> String {
     let mut buffer = [0i8; 128];
@@ -1009,14 +1009,14 @@ mod tests {
     }
 
     #[test]
-    fn default_h264_encoder_options_use_freerdp_libavcodec_backend() {
+    fn default_h264_encoder_options_use_ffmpeg_libavcodec_backend() {
         let options = H264EncoderOptions::default();
 
         assert!(!options.ffmpeg_vaapi);
     }
 
     #[test]
-    fn ffmpeg_libavcodec_context_keeps_freerdp_loop_filter_and_delay_policy() {
+    fn ffmpeg_libavcodec_context_keeps_loop_filter_and_delay_policy() {
         let encoder = match FfmpegH264Encoder::new(
             64,
             64,
@@ -1043,9 +1043,9 @@ mod tests {
 
         assert!(
             flags.contains(ffmpeg::codec::flag::Flags::LOOP_FILTER),
-            "FreeRDP libavcodec sets AV_CODEC_FLAG_LOOP_FILTER"
+            "FFmpeg libavcodec H.264 uses AV_CODEC_FLAG_LOOP_FILTER"
         );
-        assert_eq!(delay, 0, "FreeRDP libavcodec sets delay=0");
+        assert_eq!(delay, 0, "FFmpeg libavcodec H.264 uses delay=0");
     }
 
     #[test]
@@ -1084,13 +1084,13 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_vaapi_backend_policy_matches_freerdp_hardware_frames_path() {
+    fn ffmpeg_vaapi_backend_policy_uses_hardware_frames_path() {
         assert_eq!(
             FfmpegH264Backend::Vaapi.pixel_format(),
             ffmpeg::format::Pixel::VAAPI
         );
-        assert_eq!(FfmpegH264Backend::Vaapi.freerdp_preset(), "veryslow");
-        assert_eq!(FREERDP_VAAPI_INITIAL_POOL_SIZE, 20);
+        assert_eq!(FfmpegH264Backend::Vaapi.ffmpeg_preset(), "veryslow");
+        assert_eq!(FFMPEG_VAAPI_INITIAL_POOL_SIZE, 20);
     }
 
     #[test]
@@ -1119,10 +1119,10 @@ mod tests {
     }
 
     #[test]
-    fn ffmpeg_frame_metadata_matches_freerdp_libavcodec_input() {
+    fn ffmpeg_frame_metadata_sets_expected_h264_input_fields() {
         let mut frame = ffmpeg::frame::Video::new(ffmpeg::format::Pixel::YUV420P, 64, 64);
 
-        set_freerdp_ffmpeg_frame_metadata(&mut frame, 1);
+        set_ffmpeg_h264_frame_metadata(&mut frame, 1);
 
         assert_eq!(frame.pts(), Some(1));
         assert_eq!(frame.color_space(), ffmpeg::color::Space::BT709);

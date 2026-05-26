@@ -213,9 +213,9 @@ impl EgfxShared {
             return target_fps;
         }
 
-        let freerdp_percent = 100 / in_flight.saturating_add(1);
+        let backpressure_percent = 100 / in_flight.saturating_add(1);
         target_fps
-            .saturating_mul(freerdp_percent)
+            .saturating_mul(backpressure_percent)
             .saturating_div(100)
             .max(1)
     }

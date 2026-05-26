@@ -1414,7 +1414,7 @@ mod tests {
     }
 
     #[test]
-    fn vaapi_vbr_policy_uses_freerdp_bitrate_without_qp_controls() {
+    fn vaapi_vbr_policy_uses_configured_bitrate_without_qp_controls() {
         let policy = vaapi_rate_control_policy(10_000_000, 23, H264RateControl::Vbr);
 
         assert_eq!(policy.config_mode, sys::VA_RC_VBR);
