@@ -36,7 +36,7 @@ fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
     let pdus = drain_gfx_pdus(&mut event_rx);
 
     assert_eq!(pdus.len(), 3);
-    match &pdus[0] {
+    match &pdus.as_slice()[0] {
         GfxPdu::ResetGraphics(reset) => {
             assert_eq!(reset.width, 1280);
             assert_eq!(reset.height, 720);
@@ -44,7 +44,7 @@ fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
         }
         other => panic!("expected ResetGraphics first, got {other:?}"),
     }
-    match &pdus[1] {
+    match &pdus.as_slice()[1] {
         GfxPdu::CreateSurface(create) => {
             assert_eq!(create.surface_id, surface_id);
             assert_eq!(create.width, 1280);
@@ -53,7 +53,7 @@ fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
         }
         other => panic!("expected CreateSurface second, got {other:?}"),
     }
-    match &pdus[2] {
+    match &pdus.as_slice()[2] {
         GfxPdu::MapSurfaceToOutput(map) => {
             assert_eq!(map.surface_id, surface_id);
             assert_eq!(map.output_origin_x, 0);
@@ -104,7 +104,7 @@ fn frame_session_owns_surface_and_encoded_send() {
     assert!(session.send_encoded_frame(&shared, &encoded, &[(0, 0, 64, 64)], 123, 64, 64, 21,));
 
     let frame_pdus = drain_gfx_pdus(&mut event_rx);
-    let wire = assert_wire_to_surface_frame(&frame_pdus, surface_id, Codec1Type::Avc420);
+    let wire = assert_wire_to_surface_frame(frame_pdus.as_slice(), surface_id, Codec1Type::Avc420);
     assert_eq!(wire.destination_rectangle.left, 0);
     assert_eq!(wire.destination_rectangle.top, 0);
     assert_eq!(wire.destination_rectangle.right, 64);
@@ -139,11 +139,11 @@ fn resize_deletes_old_surface_then_resets_without_monitor_layout() {
     let pdus = drain_gfx_pdus(&mut event_rx);
 
     assert_eq!(pdus.len(), 2);
-    match &pdus[0] {
+    match &pdus.as_slice()[0] {
         GfxPdu::DeleteSurface(delete) => assert_eq!(delete.surface_id, surface_id),
         other => panic!("expected DeleteSurface first, got {other:?}"),
     }
-    match &pdus[1] {
+    match &pdus.as_slice()[1] {
         GfxPdu::ResetGraphics(reset) => {
             assert_eq!(reset.width, 800);
             assert_eq!(reset.height, 600);
@@ -170,7 +170,7 @@ fn surface_reinit_after_resize_emits_create_map_without_second_reset() {
 
     assert_ne!(new_surface_id, old_surface_id);
     assert_eq!(pdus.len(), 2);
-    match &pdus[0] {
+    match &pdus.as_slice()[0] {
         GfxPdu::CreateSurface(create) => {
             assert_eq!(create.surface_id, new_surface_id);
             assert_eq!(create.width, 800);
@@ -178,7 +178,7 @@ fn surface_reinit_after_resize_emits_create_map_without_second_reset() {
         }
         other => panic!("expected CreateSurface first, got {other:?}"),
     }
-    match &pdus[1] {
+    match &pdus.as_slice()[1] {
         GfxPdu::MapSurfaceToOutput(map) => assert_eq!(map.surface_id, new_surface_id),
         other => panic!("expected MapSurfaceToOutput second, got {other:?}"),
     }
@@ -200,7 +200,7 @@ fn avc420_rdpegfx_queue_emits_logical_frame_wire_shape() {
     .expect("AVC420 frame queues");
 
     let pdus: Vec<_> = queued.dvc_messages.iter().map(decode_gfx_output).collect();
-    let wire = assert_wire_to_surface_frame(&pdus, surface_id, Codec1Type::Avc420);
+    let wire = assert_wire_to_surface_frame(pdus.as_slice(), surface_id, Codec1Type::Avc420);
     let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
     let bitmap = Avc420BitmapStream::decode(&mut bitmap_cursor).expect("AVC420 payload decodes");
 
@@ -249,7 +249,7 @@ fn tracked_frame_ack_releases_local_queue_depth() {
     assert!(!shared.can_send_frame(&handle));
 
     let pdus = drain_gfx_pdus(&mut event_rx);
-    let frame_id = match &pdus[0] {
+    let frame_id = match &pdus.as_slice()[0] {
         GfxPdu::StartFrame(start) => start.frame_id,
         other => panic!("expected StartFrame, got {other:?}"),
     };
@@ -381,7 +381,7 @@ fn tracked_queue_policy_backpressures_after_ack_stream_stalls() {
         123,
     ));
     let pdus = drain_gfx_pdus(&mut event_rx);
-    let first_frame_id = match &pdus[0] {
+    let first_frame_id = match &pdus.as_slice()[0] {
         GfxPdu::StartFrame(start) => start.frame_id,
         other => panic!("expected StartFrame, got {other:?}"),
     };
@@ -476,7 +476,7 @@ fn preferred_frame_rate_drops_as_ack_window_fills() {
     assert_eq!(shared.preferred_frame_rate(30), 7);
 
     let pdus = drain_gfx_pdus(&mut event_rx);
-    let first_frame_id = match &pdus[0] {
+    let first_frame_id = match &pdus.as_slice()[0] {
         GfxPdu::StartFrame(start) => start.frame_id,
         other => panic!("expected StartFrame, got {other:?}"),
     };
@@ -502,7 +502,7 @@ fn tracked_queue_policy_honors_client_ack_suspend() {
         123,
     ));
     let pdus = drain_gfx_pdus(&mut event_rx);
-    let frame_id = match &pdus[0] {
+    let frame_id = match &pdus.as_slice()[0] {
         GfxPdu::StartFrame(start) => start.frame_id,
         other => panic!("expected StartFrame, got {other:?}"),
     };
@@ -548,7 +548,7 @@ fn resize_generation_ignores_stale_frame_ack() {
         123,
     ));
     let first_pdus = drain_gfx_pdus(&mut event_rx);
-    let stale_frame_id = match &first_pdus[0] {
+    let stale_frame_id = match &first_pdus.as_slice()[0] {
         GfxPdu::StartFrame(start) => start.frame_id,
         other => panic!("expected StartFrame, got {other:?}"),
     };
@@ -570,7 +570,7 @@ fn resize_generation_ignores_stale_frame_ack() {
         124,
     ));
     let second_pdus = drain_gfx_pdus(&mut event_rx);
-    let current_frame_id = match &second_pdus[0] {
+    let current_frame_id = match &second_pdus.as_slice()[0] {
         GfxPdu::StartFrame(start) => start.frame_id,
         other => panic!("expected StartFrame, got {other:?}"),
     };
@@ -602,7 +602,7 @@ fn avc444v2_rdpegfx_queue_emits_logical_frame_wire_shape() {
     )
     .expect("LC=0 AVC444v2 frame queues");
     let pdus: Vec<_> = queued.dvc_messages.iter().map(decode_gfx_output).collect();
-    let wire = assert_wire_to_surface_frame(&pdus, surface_id, Codec1Type::Avc444v2);
+    let wire = assert_wire_to_surface_frame(pdus.as_slice(), surface_id, Codec1Type::Avc444v2);
     let mut bitmap_cursor = ReadCursor::new(&wire.bitmap_data);
     let bitmap = Avc444BitmapStream::decode(&mut bitmap_cursor).expect("AVC444 payload decodes");
 
@@ -1051,18 +1051,18 @@ fn new_gfx_server_requires_fresh_capabilities_and_surface_setup() {
 
     assert_eq!(pdus.len(), 3);
     assert!(matches!(
-        &pdus[0],
+        &pdus.as_slice()[0],
         GfxPdu::ResetGraphics(reset) if reset.width == 64 && reset.height == 64
     ));
     assert!(matches!(
-        &pdus[1],
+        &pdus.as_slice()[1],
         GfxPdu::CreateSurface(create)
             if create.surface_id == new_surface_id
                 && create.width == 64
                 && create.height == 64
     ));
     assert!(matches!(
-        &pdus[2],
+        &pdus.as_slice()[2],
         GfxPdu::MapSurfaceToOutput(map) if map.surface_id == new_surface_id
     ));
     assert_eq!(shared.current_surface_id(64, 64), Some(new_surface_id));

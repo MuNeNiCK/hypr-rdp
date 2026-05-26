@@ -8,7 +8,6 @@ use ironrdp_server::{EgfxServerMessage, GfxDvcBridge, GfxServerHandle, ServerEve
 use openh264::decoder::{Decoder, DecoderConfig};
 use openh264::formats::YUVSource;
 use openh264::OpenH264API;
-use std::ops::Deref;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use yuv::{
@@ -65,7 +64,7 @@ impl From<TestQueueDepth> for QueueDepth {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct WireSurfaceSummary {
+pub(crate) struct EncodedFrameSummary {
     pub(crate) surface_id: u16,
     pub(crate) frame_id: u32,
 }
@@ -76,8 +75,16 @@ pub(crate) struct GfxPduTrace {
 }
 
 impl GfxPduTrace {
-    pub(crate) fn as_slice(&self) -> &[GfxPdu] {
+    pub(in crate::egfx) fn as_slice(&self) -> &[GfxPdu] {
         &self.pdus
+    }
+
+    pub(in crate::egfx) fn len(&self) -> usize {
+        self.pdus.len()
+    }
+
+    pub(in crate::egfx) fn is_empty(&self) -> bool {
+        self.pdus.is_empty()
     }
 
     pub(crate) fn assert_empty(&self) {
@@ -88,12 +95,12 @@ impl GfxPduTrace {
         );
     }
 
-    pub(crate) fn assert_no_wire_to_surface(&self) {
+    pub(crate) fn assert_no_encoded_frame(&self) {
         assert!(
             self.pdus
                 .iter()
                 .all(|pdu| !matches!(pdu, GfxPdu::WireToSurface1(_))),
-            "expected no WireToSurface1 PDU: {:?}",
+            "expected no encoded frame PDU: {:?}",
             self.pdus
         );
     }
@@ -134,7 +141,7 @@ impl GfxPduTrace {
         &self,
         width: u16,
         height: u16,
-    ) -> WireSurfaceSummary {
+    ) -> EncodedFrameSummary {
         assert_eq!(self.pdus.len(), 6);
         let surface_id = match &self.pdus[1] {
             GfxPdu::CreateSurface(create) => create.surface_id,
@@ -168,16 +175,16 @@ impl GfxPduTrace {
         assert_eq!(wire.surface_id, surface_id);
         assert_eq!(end.frame_id, start.frame_id);
 
-        WireSurfaceSummary {
+        EncodedFrameSummary {
             surface_id,
             frame_id: start.frame_id,
         }
     }
 
-    pub(crate) fn assert_sendable_avc444_wire_to_surface(
+    pub(crate) fn assert_sendable_avc444_frame(
         &self,
         expected_encoding: ExpectedAvc444Encoding,
-    ) -> WireSurfaceSummary {
+    ) -> EncodedFrameSummary {
         let wire = self
             .pdus
             .iter()
@@ -203,18 +210,10 @@ impl GfxPduTrace {
             assert!(bitmap.stream2.is_none());
         }
 
-        WireSurfaceSummary {
+        EncodedFrameSummary {
             surface_id: wire.surface_id,
             frame_id: self.frame_id(),
         }
-    }
-}
-
-impl Deref for GfxPduTrace {
-    type Target = [GfxPdu];
-
-    fn deref(&self) -> &Self::Target {
-        self.as_slice()
     }
 }
 
@@ -670,14 +669,14 @@ fn yuv444_error_metrics(expected: &[u8], actual: &[u8]) -> Yuv444ErrorMetrics {
     }
 }
 
-pub(crate) fn decode_gfx_output(message: &ironrdp_dvc::DvcMessage) -> GfxPdu {
+pub(in crate::egfx) fn decode_gfx_output(message: &ironrdp_dvc::DvcMessage) -> GfxPdu {
     let wrapped = encode_vec(&**message).expect("DVC message encodes");
     assert_eq!(&wrapped[0..2], &[0xe0, 0x04]);
     let mut cursor = ReadCursor::new(&wrapped[2..]);
     GfxPdu::decode(&mut cursor).expect("GFX PDU decodes")
 }
 
-pub(crate) fn decode_avc444_wire_to_surface(
+pub(in crate::egfx) fn decode_avc444_wire_to_surface(
     message: &ironrdp_dvc::DvcMessage,
 ) -> WireToSurface1Pdu {
     match decode_gfx_output(message) {
@@ -686,7 +685,7 @@ pub(crate) fn decode_avc444_wire_to_surface(
     }
 }
 
-pub(crate) fn assert_wire_to_surface_frame(
+pub(in crate::egfx) fn assert_wire_to_surface_frame(
     pdus: &[GfxPdu],
     surface_id: u16,
     codec_id: Codec1Type,

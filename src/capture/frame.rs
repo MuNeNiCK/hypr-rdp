@@ -1461,7 +1461,7 @@ mod tests {
         assert!(processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
         let setup_pdus = drain_gfx_pdus(&mut event_rx);
-        setup_pdus.assert_no_wire_to_surface();
+        setup_pdus.assert_no_encoded_frame();
     }
 
     #[test]
@@ -1501,7 +1501,7 @@ mod tests {
         let setup_pdus = drain_gfx_pdus(&mut event_rx);
         let surface_id = setup_pdus.first_created_surface_id();
         assert!(setup_pdus.contains_map_surface_to_output(surface_id));
-        setup_pdus.assert_no_wire_to_surface();
+        setup_pdus.assert_no_encoded_frame();
 
         for expected_failures in 1..MAX_ENCODE_FAILURES {
             assert!(processor.process(&frame, &display_tx));
@@ -1569,7 +1569,7 @@ mod tests {
 
         let initial_pdus = drain_gfx_pdus(&mut event_rx);
         initial_pdus.assert_initial_surface_setup_precedes_logical_frame(64, 64);
-        initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        initial_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
 
         processor.queue_damage(&[(16, 16, 2, 2)]);
         assert!(processor.process(&second, &display_tx));
@@ -1578,7 +1578,7 @@ mod tests {
         assert!(display_rx.try_recv().is_err());
 
         let followup_pdus = drain_gfx_pdus(&mut event_rx);
-        followup_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        followup_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
     }
 
     #[test]
@@ -1609,7 +1609,7 @@ mod tests {
         assert!(!processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
         let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
-        initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        initial_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         let initial_frame_id = initial_pdus.frame_id();
         ack_frame(
             &mut session.bridge,
@@ -1624,7 +1624,7 @@ mod tests {
         assert!(display_rx.try_recv().is_err());
 
         let refresh_pdus = drain_gfx_pdus(&mut session.event_rx);
-        refresh_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        refresh_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         let (last_luma_regions, last_chroma_regions) = processor
             .h264_encoder
             .as_ref()
@@ -1703,7 +1703,7 @@ mod tests {
         assert!(display_rx.try_recv().is_err());
 
         let refresh_pdus = drain_gfx_pdus(&mut session.event_rx);
-        refresh_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        refresh_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         let full_frame = [(0, 0, width as i32, height as i32)];
         let (last_luma_regions, last_chroma_regions) = processor
             .h264_encoder
@@ -1865,7 +1865,7 @@ mod tests {
         assert!(processor.process(&third, &display_tx));
         assert!(!processor.has_pending_damage());
         let recovered_pdus = drain_gfx_pdus(&mut session.event_rx);
-        recovered_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::Luma);
+        recovered_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::Luma);
         let committed_after_recovery = processor
             .h264_encoder
             .as_ref()
@@ -1915,7 +1915,7 @@ mod tests {
             if index == 0 {
                 pdus.assert_initial_surface_setup_precedes_logical_frame(64, 64);
             }
-            pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+            pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
             let frame_id = pdus.frame_id();
 
             assert!(!shared.can_send_frame(&session.handle));
@@ -2034,7 +2034,7 @@ mod tests {
                     height as u16,
                 );
             }
-            pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+            pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
             oracle.assert_trace_reconstructs_visible_progress(&pdus, index);
 
             let frame_id = pdus.frame_id();
@@ -2095,7 +2095,7 @@ mod tests {
                     height as u16,
                 );
             }
-            pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+            pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
             oracle.assert_trace_matches_bgra_with_bounded_yuv444_error(
                 &pdus, index, &frame, stride, 16.0, 0.10,
             );
@@ -2148,7 +2148,7 @@ mod tests {
         let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
         initial_pdus
             .assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
-        initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        initial_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         oracle.assert_trace_matches_bgra_with_bounded_yuv444_error(
             &initial_pdus,
             0,
@@ -2168,7 +2168,7 @@ mod tests {
         assert!(!processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
         let followup_pdus = drain_gfx_pdus(&mut session.event_rx);
-        followup_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::Luma);
+        followup_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::Luma);
         oracle.assert_trace_matches_bgra_with_bounded_yuv444_error(
             &followup_pdus,
             1,
@@ -2214,7 +2214,7 @@ mod tests {
         let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
         initial_pdus
             .assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
-        initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        initial_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         oracle.assert_trace_reconstructs_visible_progress(&initial_pdus, 0);
         ack_frame(
             &mut session.bridge,
@@ -2232,7 +2232,7 @@ mod tests {
         assert!(processor.process(&frame, &display_tx));
         assert!(display_rx.try_recv().is_err());
         let luma_pdus = drain_gfx_pdus(&mut session.event_rx);
-        luma_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::Luma);
+        luma_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::Luma);
         oracle.assert_trace_reconstructs_visible_progress_with_min_delta(&luma_pdus, 1, 1);
 
         assert_eq!(processor.stats.sent_frames, 2);
@@ -2272,7 +2272,7 @@ mod tests {
         let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
         initial_pdus
             .assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
-        initial_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        initial_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         oracle.assert_trace_reconstructs_visible_progress(&initial_pdus, 0);
         ack_frame(
             &mut session.bridge,
@@ -2287,7 +2287,7 @@ mod tests {
         assert!(processor.process(&frame, &display_tx));
         assert!(display_rx.try_recv().is_err());
         let chroma_pdus = drain_gfx_pdus(&mut session.event_rx);
-        chroma_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::Chroma);
+        chroma_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::Chroma);
         oracle.assert_trace_reconstructs_visible_progress_with_min_delta(&chroma_pdus, 1, 1);
 
         assert_eq!(processor.stats.sent_frames, 2);
@@ -2335,12 +2335,12 @@ mod tests {
                     height as u16,
                 );
             }
-            let wire =
-                pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+            let frame_summary =
+                pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
             assert!(!shared.can_send_frame(&session.handle));
             ack_frame(
                 &mut session.bridge,
-                wire.frame_id,
+                frame_summary.frame_id,
                 TestQueueDepth::AvailableBytes(1),
             );
             assert!(shared.can_send_frame(&session.handle));
@@ -2382,9 +2382,9 @@ mod tests {
         assert!(processor.process(&frame, &display_tx));
         let first_pdus = drain_gfx_pdus(&mut session.event_rx);
         first_pdus.assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
-        let first_wire = first_pdus
-            .assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
-        let first_surface_id = first_wire.surface_id;
+        let first_frame_summary =
+            first_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
+        let first_surface_id = first_frame_summary.surface_id;
         let first_frame_id = first_pdus.frame_id();
         assert!(!processor.has_pending_damage());
         assert!(!shared.can_send_frame(&session.handle));
@@ -2400,7 +2400,7 @@ mod tests {
         processor.queue_damage(&[(8, 8, 16, 16)]);
         assert!(processor.process(&frame, &display_tx));
         let second_pdus = drain_gfx_pdus(&mut session.event_rx);
-        second_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        second_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         let second_frame_id = second_pdus.frame_id();
         assert!(!shared.can_send_frame(&session.handle));
 
@@ -2420,8 +2420,7 @@ mod tests {
         assert!(processor.process(&frame, &display_tx));
         assert!(!processor.has_pending_damage());
         let recovered_pdus = drain_gfx_pdus(&mut session.event_rx);
-        recovered_pdus
-            .assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        recovered_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         let recovered_frame_id = recovered_pdus.frame_id();
 
         ack_frame(
@@ -2432,7 +2431,7 @@ mod tests {
         shared.prepare_for_resize(width as u16, height as u16);
         let resize_pdus = drain_gfx_pdus(&mut session.event_rx);
         assert!(resize_pdus.contains_delete_surface(first_surface_id));
-        resize_pdus.assert_no_wire_to_surface();
+        resize_pdus.assert_no_encoded_frame();
 
         mutate_bgra_tile(&mut frame, width, height, stride, 4);
         processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
@@ -2442,9 +2441,9 @@ mod tests {
         let resized_surface_id = resized_pdus.first_created_surface_id();
         assert_ne!(resized_surface_id, first_surface_id);
         assert!(resized_pdus.contains_map_surface_to_output(resized_surface_id));
-        let resized_wire = resized_pdus
-            .assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
-        assert_eq!(resized_wire.surface_id, resized_surface_id);
+        let resized_frame_summary =
+            resized_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
+        assert_eq!(resized_frame_summary.surface_id, resized_surface_id);
         assert_eq!(processor.stats.sent_frames, 4);
         assert!(display_rx.try_recv().is_err());
     }
@@ -2487,7 +2486,7 @@ mod tests {
         assert_eq!(first_generation, shared.generation());
         let first_pdus = drain_gfx_pdus(&mut first_event_rx);
         first_pdus.assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
-        first_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        first_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         assert!(display_rx.try_recv().is_err());
 
         let (second_event_tx, mut second_event_rx) = mpsc::unbounded_channel();
@@ -2515,7 +2514,7 @@ mod tests {
         let second_pdus = drain_gfx_pdus(&mut second_event_rx);
         second_pdus
             .assert_initial_surface_setup_precedes_logical_frame(width as u16, height as u16);
-        second_pdus.assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
+        second_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         drain_gfx_pdus(&mut first_event_rx).assert_empty();
     }
 
@@ -2548,15 +2547,15 @@ mod tests {
         assert!(processor.sent_first_frame);
         assert!(processor.egfx_surface_id.is_some());
         let initial_pdus = drain_gfx_pdus(&mut event_rx);
-        let initial_wire = initial_pdus
-            .assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
-        let old_surface_id = initial_wire.surface_id;
+        let initial_frame_summary =
+            initial_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
+        let old_surface_id = initial_frame_summary.surface_id;
         let first_generation = processor.egfx_generation;
 
         shared.prepare_for_resize(width as u16, height as u16);
         let resize_pdus = drain_gfx_pdus(&mut event_rx);
         assert!(resize_pdus.contains_delete_surface(old_surface_id));
-        resize_pdus.assert_no_wire_to_surface();
+        resize_pdus.assert_no_encoded_frame();
         processor.queue_damage(&[(0, 0, 4, 2)]);
         assert!(processor.process(&second, &display_tx));
 
@@ -2569,9 +2568,9 @@ mod tests {
         let new_surface_id = resized_pdus.first_created_surface_id();
         assert_ne!(new_surface_id, old_surface_id);
         assert!(resized_pdus.contains_map_surface_to_output(new_surface_id));
-        let resized_wire = resized_pdus
-            .assert_sendable_avc444_wire_to_surface(ExpectedAvc444Encoding::LumaAndChroma);
-        assert_eq!(resized_wire.surface_id, new_surface_id);
+        let resized_frame_summary =
+            resized_pdus.assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
+        assert_eq!(resized_frame_summary.surface_id, new_surface_id);
         assert!(!processor.has_pending_damage());
         let (last_luma_regions, last_chroma_regions) = processor
             .h264_encoder
