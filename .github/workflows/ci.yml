@@ -18,7 +18,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev
+          sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -29,8 +29,11 @@ jobs:
       - name: Clippy
         run: cargo clippy -- -D warnings
 
-      - name: Test
+      - name: Test default features
         run: cargo test
+
+      - name: Test software-only features
+        run: cargo test --no-default-features
 
       - name: Build
         run: cargo build --release

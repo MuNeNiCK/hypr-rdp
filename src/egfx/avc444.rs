@@ -2488,7 +2488,7 @@ mod tests {
             Avc444FrameEncoding::LumaAndChroma,
             EncodedH264 {
                 data: vec![0x00, 0x00, 0x01, 0x65],
-                frame_type: H264FrameType::IDR,
+                frame_type: H264FrameType::Idr,
             },
             EncodedH264::empty(),
             vec![(0, 0, 16, 16)],
@@ -2509,7 +2509,7 @@ mod tests {
             Avc444FrameEncoding::LumaAndChroma,
             EncodedH264 {
                 data: vec![0x00, 0x00, 0x01, 0x65],
-                frame_type: H264FrameType::IDR,
+                frame_type: H264FrameType::Idr,
             },
             EncodedH264 {
                 data: vec![0x00, 0x00, 0x01, 0x41],

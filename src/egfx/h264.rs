@@ -297,17 +297,9 @@ fn validate_bgra_buffer(width: usize, height: usize, stride: usize, len: usize) 
     Ok(())
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub(super) struct H264EncoderOptions {
     pub(super) ffmpeg_vaapi: bool,
-}
-
-impl Default for H264EncoderOptions {
-    fn default() -> Self {
-        Self {
-            ffmpeg_vaapi: false,
-        }
-    }
 }
 
 impl H264EncoderOptions {
@@ -328,10 +320,7 @@ pub(super) fn avc444_h264_encoder_options() -> H264EncoderOptions {
 
 #[cfg(feature = "vaapi")]
 pub(super) fn avc444_h264_vaapi_encoder_options() -> H264EncoderOptions {
-    H264EncoderOptions {
-        ffmpeg_vaapi: true,
-        ..avc444_h264_encoder_options()
-    }
+    H264EncoderOptions { ffmpeg_vaapi: true }
 }
 
 enum H264EncoderImpl {
@@ -488,7 +477,7 @@ impl FfmpegH264Encoder {
         let frame_type = if data.is_empty() {
             H264FrameType::Skip
         } else if annex_b_nal_types(&data).contains(&5) {
-            H264FrameType::IDR
+            H264FrameType::Idr
         } else if packet_key {
             H264FrameType::I
         } else {
@@ -888,7 +877,7 @@ fn copy_yuv_plane(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usi
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum H264FrameType {
     Skip,
-    IDR,
+    Idr,
     I,
     P,
 }
@@ -908,7 +897,7 @@ impl EncodedH264 {
 }
 
 pub(super) fn is_h264_keyframe(frame_type: H264FrameType) -> bool {
-    frame_type == H264FrameType::IDR || frame_type == H264FrameType::I
+    frame_type == H264FrameType::Idr || frame_type == H264FrameType::I
 }
 
 #[cfg(any(feature = "vaapi", test))]
@@ -1299,7 +1288,7 @@ mod tests {
     fn initial_bootstrap_requires_parameter_sets_and_key_picture() {
         let idr_without_headers = EncodedH264 {
             data: vec![0x00, 0x00, 0x01, 0x65, 0x11],
-            frame_type: H264FrameType::IDR,
+            frame_type: H264FrameType::Idr,
         };
         let headers_with_delta = EncodedH264 {
             data: vec![
@@ -1313,7 +1302,7 @@ mod tests {
                 0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x01, 0x68, 0xbb, 0x00, 0x00, 0x01, 0x65,
                 0xcc,
             ],
-            frame_type: H264FrameType::IDR,
+            frame_type: H264FrameType::Idr,
         };
 
         assert!(!initial_h264_bootstrap_is_sendable(&idr_without_headers));
@@ -1505,7 +1494,7 @@ mod tests {
             0x00, 0x00, 0x01, 0x65, 0xee, 0xff, // IDR
         ];
 
-        apply_sps_pps_cache(H264FrameType::IDR, &mut idr, &mut cached, true);
+        apply_sps_pps_cache(H264FrameType::Idr, &mut idr, &mut cached, true);
 
         let expected_parameter_sets = vec![
             0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, 0x00, 0x00, 0x01, 0x68, 0xcc, 0xdd,
