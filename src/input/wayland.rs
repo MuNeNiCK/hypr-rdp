@@ -120,14 +120,8 @@ impl HyprInputHandler {
             output.release();
         }
 
-        let (keymap_data, keymap_source) = load_keymap(&mut event_queue, &mut wl_state, &seat, &qh)
-            .or_else(|err| {
-                tracing::warn!(
-                    "Failed to get compositor keymap, falling back to default: {:#}",
-                    err
-                );
-                generate_xkb_keymap().map(|data| (data, "fallback"))
-            })?;
+        let (keymap_data, keymap_source) =
+            load_keymap(&mut event_queue, &mut wl_state, &seat, &qh)?;
         let keyboard_state = KeyboardStateTracker::new(&keymap_data)?;
         let keymap_fd = create_keymap_fd(&keymap_data)?;
         vk.keymap(1, keymap_fd.as_fd(), keymap_data.len() as u32); // 1 = XKB_V1
@@ -178,9 +172,8 @@ fn load_keymap(
             .roundtrip(wl_state)
             .context("Wayland roundtrip for keyboard keymap failed")?;
 
-        if let Some(keymap_data) = wl_state.keymap.take() {
-            tracing::info!(len = keymap_data.len(), "Loaded compositor keyboard keymap");
-            return Ok((keymap_data, "compositor"));
+        if let Some(keymap) = take_loaded_keymap(wl_state)? {
+            return Ok(keymap);
         }
     } else {
         tracing::warn!("Wayland seat has no keyboard capability, using fallback keymap");
@@ -189,6 +182,19 @@ fn load_keymap(
     let fallback = generate_xkb_keymap()?;
     tracing::info!(len = fallback.len(), "Generated fallback keyboard keymap");
     Ok((fallback, "fallback"))
+}
+
+fn take_loaded_keymap(wl_state: &mut WlState) -> Result<Option<(Vec<u8>, &'static str)>> {
+    if !wl_state.seat_has_keyboard {
+        return Ok(None);
+    }
+
+    let keymap_data = wl_state
+        .keymap
+        .take()
+        .context("Wayland seat has keyboard capability but did not provide an XKB keymap")?;
+    tracing::info!(len = keymap_data.len(), "Loaded compositor keyboard keymap");
+    Ok(Some((keymap_data, "compositor")))
 }
 
 fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
@@ -337,5 +343,51 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for WlState
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keymap_selection_accepts_compositor_keymap_for_keyboard_seat() {
+        let mut state = WlState {
+            seat_has_keyboard: true,
+            keymap: Some(b"xkb-keymap".to_vec()),
+            ..Default::default()
+        };
+
+        let (keymap, source) = take_loaded_keymap(&mut state)
+            .expect("keyboard-capable seat with keymap succeeds")
+            .expect("keymap is selected");
+
+        assert_eq!(keymap, b"xkb-keymap");
+        assert_eq!(source, "compositor");
+        assert!(state.keymap.is_none());
+    }
+
+    #[test]
+    fn keymap_selection_rejects_keyboard_seat_without_keymap() {
+        let mut state = WlState {
+            seat_has_keyboard: true,
+            keymap: None,
+            ..Default::default()
+        };
+
+        assert!(take_loaded_keymap(&mut state).is_err());
+    }
+
+    #[test]
+    fn keymap_selection_allows_fallback_for_keyboardless_seat() {
+        let mut state = WlState {
+            seat_has_keyboard: false,
+            keymap: None,
+            ..Default::default()
+        };
+
+        assert!(take_loaded_keymap(&mut state)
+            .expect("keyboardless seat defers to fallback")
+            .is_none());
     }
 }
