@@ -70,7 +70,7 @@ struct Args {
     config: Option<String>,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Debug, Deserialize, Default)]
 struct ConfigFile {
     bind: Option<String>,
     cert: Option<String>,
@@ -89,34 +89,45 @@ struct ConfigFile {
 }
 
 impl ConfigFile {
-    fn load(path: Option<&str>) -> Self {
-        let config_path = match path {
-            Some(p) => PathBuf::from(p),
+    fn load(path: Option<&str>) -> anyhow::Result<Self> {
+        let (config_path, explicit) = match path {
+            Some(p) => (PathBuf::from(p), true),
             None => {
                 let home = match std::env::var("HOME") {
-                    Ok(h) => h,
-                    Err(_) => return Self::default(),
+                    Ok(home) => home,
+                    Err(_) => return Ok(Self::default()),
                 };
-                PathBuf::from(home)
-                    .join(".config")
-                    .join("hypr-rdp")
-                    .join("config.toml")
+                (
+                    PathBuf::from(home)
+                        .join(".config")
+                        .join("hypr-rdp")
+                        .join("config.toml"),
+                    false,
+                )
             }
         };
 
         let content = match std::fs::read_to_string(&config_path) {
             Ok(c) => c,
-            Err(_) => return Self::default(),
+            Err(error) if !explicit && error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Self::default());
+            }
+            Err(error) => {
+                anyhow::bail!("failed to read config {}: {}", config_path.display(), error);
+            }
         };
 
         match toml::from_str(&content) {
             Ok(config) => {
                 tracing::info!("Loaded config from {}", config_path.display());
-                config
+                Ok(config)
             }
-            Err(e) => {
-                tracing::warn!("Failed to parse {}: {}", config_path.display(), e);
-                Self::default()
+            Err(error) => {
+                anyhow::bail!(
+                    "failed to parse config {}: {}",
+                    config_path.display(),
+                    error
+                );
             }
         }
     }
@@ -143,7 +154,7 @@ pub struct RuntimeConfig {
 impl RuntimeConfig {
     pub fn load() -> anyhow::Result<Self> {
         let args = Args::parse();
-        let config = ConfigFile::load(args.config.as_deref());
+        let config = ConfigFile::load(args.config.as_deref())?;
 
         let bind = args
             .bind
@@ -292,6 +303,49 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+    use std::fs;
+
+    fn temp_config_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!("hypr-rdp-{name}-{}.toml", std::process::id()));
+        path
+    }
+
+    #[test]
+    fn explicit_missing_config_returns_error() {
+        let path = temp_config_path("missing");
+        let _ = fs::remove_file(&path);
+
+        let error = ConfigFile::load(Some(path.to_str().unwrap()))
+            .expect_err("explicit missing config must not fall back to defaults");
+
+        assert!(format!("{error:#}").contains("failed to read config"));
+    }
+
+    #[test]
+    fn explicit_invalid_config_returns_error() {
+        let path = temp_config_path("invalid");
+        fs::write(&path, "bind = [").expect("write invalid config");
+
+        let error = ConfigFile::load(Some(path.to_str().unwrap()))
+            .expect_err("explicit invalid config must not fall back to defaults");
+
+        assert!(format!("{error:#}").contains("failed to parse config"));
+        fs::remove_file(&path).expect("remove invalid config");
+    }
+
+    #[test]
+    fn explicit_valid_config_loads_values() {
+        let path = temp_config_path("valid");
+        fs::write(&path, "bind = '127.0.0.1:3390'\nusername = 'alice'\n")
+            .expect("write valid config");
+
+        let config = ConfigFile::load(Some(path.to_str().unwrap())).expect("config loads");
+
+        assert_eq!(config.bind.as_deref(), Some("127.0.0.1:3390"));
+        assert_eq!(config.username.as_deref(), Some("alice"));
+        fs::remove_file(&path).expect("remove valid config");
+    }
 
     #[test]
     fn parses_egfx_codec_policy_values() {
