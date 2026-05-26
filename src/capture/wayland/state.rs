@@ -201,17 +201,17 @@ impl Dispatch<ext_image_copy_capture_session_v1::ExtImageCopyCaptureSessionV1, (
                 state.stopped = true;
             }
             #[cfg(feature = "vaapi")]
-            ext_image_copy_capture_session_v1::Event::DmabufDevice { device } => {
+            ext_image_copy_capture_session_v1::Event::DmabufDevice { device }
+                if device.len() >= std::mem::size_of::<libc::dev_t>() =>
+            {
                 // device is a Vec<u8> containing a dev_t value
-                if device.len() >= std::mem::size_of::<libc::dev_t>() {
-                    let dev = libc::dev_t::from_ne_bytes(
-                        device[..std::mem::size_of::<libc::dev_t>()]
-                            .try_into()
-                            .unwrap(),
-                    );
-                    tracing::trace!(dev, "Session: DMA-BUF device advertised");
-                    state.dmabuf_device = Some(dev);
-                }
+                let dev = libc::dev_t::from_ne_bytes(
+                    device[..std::mem::size_of::<libc::dev_t>()]
+                        .try_into()
+                        .unwrap(),
+                );
+                tracing::trace!(dev, "Session: DMA-BUF device advertised");
+                state.dmabuf_device = Some(dev);
             }
             #[cfg(feature = "vaapi")]
             ext_image_copy_capture_session_v1::Event::DmabufFormat { format, modifiers } => {

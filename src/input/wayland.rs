@@ -231,10 +231,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for WlState {
         } = event
         {
             match interface.as_str() {
-                "wl_seat" => {
-                    if state.seat.is_none() {
-                        state.seat = Some(registry.bind(name, version.min(7), qh, ()));
-                    }
+                "wl_seat" if state.seat.is_none() => {
+                    state.seat = Some(registry.bind(name, version.min(7), qh, ()));
                 }
                 "zwp_virtual_keyboard_manager_v1" => {
                     state.vk_manager = Some(registry.bind(name, version.min(1), qh, ()));

@@ -216,10 +216,8 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClipState {
                 "zwlr_data_control_manager_v1" => {
                     state.manager = Some(registry.bind(name, version.min(2), qh, ()));
                 }
-                "wl_seat" => {
-                    if state.seat.is_none() {
-                        state.seat = Some(registry.bind(name, version.min(1), qh, ()));
-                    }
+                "wl_seat" if state.seat.is_none() => {
+                    state.seat = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 _ => {}
             }
