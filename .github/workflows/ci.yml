@@ -32,8 +32,14 @@ jobs:
       - name: Test default features
         run: cargo test
 
+      - name: Test generated inputs
+        run: PROPTEST_CASES=512 cargo test generated_
+
       - name: Test software-only features
         run: cargo test --no-default-features
+
+      - name: Test generated inputs software-only
+        run: PROPTEST_CASES=512 cargo test --no-default-features generated_
 
       - name: Build
         run: cargo build --release
