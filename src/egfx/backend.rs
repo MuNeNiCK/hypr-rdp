@@ -4,9 +4,6 @@ use super::encoder;
 #[cfg(feature = "vaapi")]
 use super::vaapi;
 
-#[cfg(feature = "vaapi")]
-const AVC444_VAAPI_OPT_IN_ENV: &str = "HYPR_RDP_AVC444_VAAPI";
-
 #[cfg(test)]
 pub(crate) type Avc444ReferenceRegions<'a> =
     (&'a [(i32, i32, i32, i32)], &'a [(i32, i32, i32, i32)]);
@@ -17,7 +14,7 @@ pub enum H264RateControl {
     Cqp,
 }
 
-/// Encoder backend: VAAPI hardware or OpenH264 software.
+/// Encoder backend: hardware VAAPI, common H.264 software, or AVC444 wrapper.
 pub enum FrameEncoder {
     #[cfg(feature = "vaapi")]
     Vaapi(Box<vaapi::VaapiEncoder>),
@@ -53,7 +50,7 @@ impl FrameEncoder {
         }
 
         let enc = encoder::H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using OpenH264 software encoder");
+        tracing::info!("Using FFmpeg/libavcodec software H.264 encoder");
         Ok(Self::Software(Box::new(enc)))
     }
 
@@ -149,7 +146,7 @@ impl FrameEncoder {
             Self::Vaapi(_) => "vaapi",
             #[cfg(test)]
             Self::FailingVaapiForTest { .. } => "vaapi-test-failing",
-            Self::Software(_) => "openh264",
+            Self::Software(_) => "ffmpeg-h264",
             Self::SoftwareAvc444(enc) => enc.backend_name(),
         }
     }
@@ -175,7 +172,7 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         let enc = encoder::H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
-        tracing::info!("Using OpenH264 software encoder (runtime fallback)");
+        tracing::info!("Using FFmpeg/libavcodec software H.264 encoder (runtime fallback)");
         Ok(Self::Software(Box::new(enc)))
     }
 
@@ -189,31 +186,24 @@ impl FrameEncoder {
     ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
         {
-            if std::env::var_os(AVC444_VAAPI_OPT_IN_ENV).is_some() {
-                match encoder::Avc444Encoder::new_with_vaapi(
-                    width,
-                    height,
-                    bitrate,
-                    fps,
-                    quality,
-                    rate_control,
-                ) {
-                    Ok(enc) => {
-                        tracing::info!("Using FFmpeg/VAAPI hardware AVC444 encoder");
-                        return Ok(Self::SoftwareAvc444(Box::new(enc)));
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "VA-API AVC444 init failed, falling back to software: {:#}",
-                            e
-                        );
-                    }
+            match encoder::Avc444Encoder::new_with_vaapi(
+                width,
+                height,
+                bitrate,
+                fps,
+                quality,
+                rate_control,
+            ) {
+                Ok(enc) => {
+                    tracing::info!("Using FFmpeg/VAAPI hardware AVC444 encoder");
+                    return Ok(Self::SoftwareAvc444(Box::new(enc)));
                 }
-            } else {
-                tracing::info!(
-                    env = AVC444_VAAPI_OPT_IN_ENV,
-                    "VA-API AVC444 is disabled unless explicitly opted in"
-                );
+                Err(e) => {
+                    tracing::warn!(
+                        "VA-API AVC444 init failed, falling back to software: {:#}",
+                        e
+                    );
+                }
             }
         }
 

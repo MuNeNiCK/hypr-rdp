@@ -1859,7 +1859,7 @@ mod tests {
                 .h264_encoder
                 .as_ref()
                 .map(crate::egfx::FrameEncoder::backend_name),
-            Some("openh264")
+            Some("ffmpeg-h264")
         );
         assert!(processor.sent_first_frame);
         assert!(!processor.has_pending_damage());

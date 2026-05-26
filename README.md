@@ -4,7 +4,7 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 
 ## Features
 
-- **H.264/EGFX** — OpenH264 software encoding by default, with optional VA-API hardware encoding
+- **H.264/EGFX** — AVC420 by default, experimental AVC444 support, and VA-API acceleration with automatic software fallback
 - **Screen capture** — `wlr-screencopy-v1` and `ext-image-copy-capture-v1` protocols
 - **Audio** — PipeWire audio forwarding via RDPSND
 - **Clipboard** — Bidirectional text and image clipboard sync
@@ -33,14 +33,16 @@ tar xzf hypr-rdp-v*.tar.gz
 sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-Runtime dependencies: `openh264`, `pipewire`, `libxkbcommon`
+Runtime dependencies: `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon`
+
+For VA-API hardware encoding, install a VA-API driver such as
+`intel-media-driver` for Intel GPUs or `libva-mesa-driver` for AMD GPUs.
 
 ### Build from source
 
 Requirements:
 - Rust 1.75+
-- `pipewire`, `libxkbcommon` (development headers)
-- `openh264` at runtime
+- `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon` (development headers)
 
 ```sh
 git clone https://github.com/MuNeNICK/hypr-rdp.git
@@ -49,15 +51,11 @@ cargo build --release
 sudo install -Dm755 target/release/hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-VA-API build (optional hardware encoding):
-
-```sh
-cargo build --release --features vaapi
-```
-
 ## Usage
 
-Requires **Hyprland 0.54+**. VA-API builds additionally need `libva` and a VA-API driver (`intel-media-driver` for Intel, `libva-mesa-driver` for AMD).
+Requires **Hyprland 0.54+**.
+VA-API is included in the standard build and falls back to software encoding
+automatically when unavailable.
 
 ```sh
 # Basic (auto-generates TLS cert, binds to 127.0.0.1:3389)
@@ -73,7 +71,7 @@ hypr-rdp -u user -p pass --resolution 2560x1440 --fps 60
 hypr-rdp -u user -p pass --output DP-1
 
 # Use ext-image-copy-capture protocol
-hypr-rdp -u user -p pass --capture_mode ext
+hypr-rdp -u user -p pass --capture-mode ext
 ```
 
 ### Config file
@@ -86,9 +84,10 @@ username = "user"
 password = "pass"
 resolution = "1920x1080"
 capture_mode = "wlr"
-bitrate = 5000000
+bitrate = 10000000
 quality = 23
 fps = 30
+egfx_codec = "avc420"
 # output = "DP-1"
 ```
 
@@ -104,10 +103,13 @@ CLI arguments override config file values.
 | `-u`, `--username` | RDP username | _(none)_ |
 | `-p`, `--password` | RDP password | _(none)_ |
 | `--resolution`, `-r` | Session resolution | `1920x1080` |
-| `--capture_mode` | `wlr` or `ext` | `wlr` |
-| `--bitrate` | H.264 bitrate (bps) | `5000000` |
+| `--capture-mode` | `wlr` or `ext` | `wlr` |
+| `--bitrate` | H.264 bitrate (bps) | `10000000` |
 | `--quality` | H.264 quality (0-51) | `23` |
+| `--rate-control` | H.264 rate control: `vbr` or `cqp` | `vbr` |
 | `--fps` | Max framerate | `30` |
+| `--max-frames-in-flight` | Max unacknowledged EGFX frames | `3` |
+| `--egfx-codec` | EGFX codec policy: `avc420`, experimental `avc444`, or `auto` | `avc420` |
 | `--output` | Specific output name | _(headless)_ |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
 

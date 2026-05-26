@@ -9,6 +9,8 @@ use ironrdp_server::{EgfxServerMessage, ServerEvent};
 use super::h264::avc444_h264_vaapi_encoder_options;
 #[cfg(feature = "vaapi")]
 use super::h264::initial_h264_bootstrap_is_sendable;
+#[cfg(test)]
+use super::h264::H264FrameType;
 use super::h264::{
     annex_b_nal_types, avc444_h264_encoder_options, is_h264_keyframe, EncodedH264, H264Encoder,
     H264EncoderOptions,
@@ -1906,26 +1908,12 @@ fn union_region(a: (i32, i32, i32, i32), b: (i32, i32, i32, i32)) -> (i32, i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openh264::encoder::{Complexity, UsageType};
     use proptest::prelude::*;
 
     #[test]
     fn avc444_v2_encoder_options_use_freerdp_libavcodec_backend_policy() {
         let options = avc444_h264_encoder_options();
 
-        assert!(matches!(
-            options.usage_type,
-            UsageType::ScreenContentRealTime
-        ));
-        assert!(matches!(options.complexity, Complexity::Medium));
-        assert!(options.scene_change_detect);
-        assert!(!options.adaptive_quantization);
-        assert!(!options.background_detection);
-        assert!(!options.long_term_reference);
-        assert!(options.frame_skip);
-        assert!(!options.vbr_qp_clamp);
-        assert!(!options.freerdp_openh264_params);
-        assert!(options.ffmpeg_libavcodec);
         assert!(!options.ffmpeg_vaapi);
     }
 
@@ -1934,10 +1922,7 @@ mod tests {
     fn avc444_vaapi_options_use_freerdp_ffmpeg_h264_vaapi_policy() {
         let options = avc444_h264_vaapi_encoder_options();
 
-        assert!(options.ffmpeg_libavcodec);
         assert!(options.ffmpeg_vaapi);
-        assert!(!options.freerdp_openh264_params);
-        assert!(!options.vbr_qp_clamp);
     }
 
     #[cfg(feature = "vaapi")]
@@ -2156,7 +2141,7 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2202,7 +2187,7 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2248,7 +2233,7 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2305,7 +2290,7 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2354,7 +2339,7 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2390,7 +2375,7 @@ mod tests {
 
         let mut encoder = match new_test_avc444_encoder(width, height) {
             Ok(encoder) => encoder,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
         };
 
@@ -2464,7 +2449,7 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2488,7 +2473,7 @@ mod tests {
         let mut encoder = match Avc444Encoder::new(16, 16, 1_000_000, 30, 23, H264RateControl::Cqp)
         {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2503,7 +2488,7 @@ mod tests {
             Avc444FrameEncoding::LumaAndChroma,
             EncodedH264 {
                 data: vec![0x00, 0x00, 0x01, 0x65],
-                frame_type: openh264::encoder::FrameType::IDR,
+                frame_type: H264FrameType::IDR,
             },
             EncodedH264::empty(),
             vec![(0, 0, 16, 16)],
@@ -2524,11 +2509,11 @@ mod tests {
             Avc444FrameEncoding::LumaAndChroma,
             EncodedH264 {
                 data: vec![0x00, 0x00, 0x01, 0x65],
-                frame_type: openh264::encoder::FrameType::IDR,
+                frame_type: H264FrameType::IDR,
             },
             EncodedH264 {
                 data: vec![0x00, 0x00, 0x01, 0x41],
-                frame_type: openh264::encoder::FrameType::P,
+                frame_type: H264FrameType::P,
             },
             vec![(0, 0, 16, 16)],
             vec![(0, 0, 16, 16)],
@@ -2542,7 +2527,6 @@ mod tests {
 
     #[derive(Debug)]
     struct Avc444WireProfile {
-        encoding: Avc444FrameEncoding,
         stream1_len: usize,
         stream2_len: usize,
         stream1_nals: Vec<u8>,
@@ -2554,7 +2538,6 @@ mod tests {
     impl From<Avc444EncodedFrame> for Avc444WireProfile {
         fn from(frame: Avc444EncodedFrame) -> Self {
             Self {
-                encoding: frame.encoding,
                 stream1_len: frame.stream1.len(),
                 stream2_len: frame.stream2.len(),
                 stream1_nals: annex_b_nal_types(&frame.stream1),
@@ -2563,14 +2546,6 @@ mod tests {
                 stream2_regions: frame.stream2_regions,
             }
         }
-    }
-
-    fn avc444_profiles_for_complexity(
-        complexity: Complexity,
-    ) -> std::result::Result<Vec<Avc444WireProfile>, String> {
-        let mut options = avc444_h264_encoder_options();
-        options.complexity = complexity;
-        avc444_profiles_with_options(options)
     }
 
     fn avc444_profiles_with_options(
@@ -2626,41 +2601,10 @@ mod tests {
     }
 
     #[test]
-    fn avc444_v2_complexity_variants_preserve_basic_wire_shape() {
-        let medium = match avc444_profiles_for_complexity(Complexity::Medium) {
-            Ok(profiles) => profiles,
-            Err(error) if error.contains("libopenh264") => return,
-            Err(error) => panic!("AVC444v2 medium encoder failed: {error}"),
-        };
-        let low = match avc444_profiles_for_complexity(Complexity::Low) {
-            Ok(profiles) => profiles,
-            Err(error) if error.contains("libopenh264") => return,
-            Err(error) => panic!("AVC444v2 low encoder failed: {error}"),
-        };
-
-        assert_eq!(medium.len(), low.len());
-        for (medium, low) in medium.iter().zip(low.iter()) {
-            assert_eq!(medium.encoding, low.encoding);
-            assert_eq!(medium.stream1_regions, low.stream1_regions);
-            assert_eq!(medium.stream2_regions, low.stream2_regions);
-            assert_eq!(medium.stream1_len > 32, low.stream1_len > 32);
-            assert_eq!(medium.stream2_len > 32, low.stream2_len > 32);
-            assert_eq!(
-                medium.stream1_nals.contains(&5),
-                low.stream1_nals.contains(&5)
-            );
-            assert_eq!(
-                medium.stream2_nals.contains(&5),
-                low.stream2_nals.contains(&5)
-            );
-        }
-    }
-
-    #[test]
     fn avc444_v2_configured_encoder_uses_delta_slices_after_initial_frame() {
         let profiles = match avc444_profiles_with_options(avc444_h264_encoder_options()) {
             Ok(profiles) => profiles,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder failed: {error}"),
         };
 
@@ -2681,7 +2625,7 @@ mod tests {
     fn avc444_v2_configured_encoder_keeps_initial_payload_sendable() {
         let profiles = match avc444_profiles_with_options(avc444_h264_encoder_options()) {
             Ok(profiles) => profiles,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder failed: {error}"),
         };
 
@@ -2741,6 +2685,11 @@ mod tests {
         .map_err(|error| format!("{error:#}"))
     }
 
+    fn h264_backend_unavailable(error: &str) -> bool {
+        error.contains("FFmpeg H.264 encoder not found")
+            || error.contains("failed to initialize FFmpeg H.264")
+    }
+
     #[test]
     fn avc444_force_idr_after_empty_output_recovers_with_full_lc0_and_stream1_idr() {
         let width = 16;
@@ -2749,7 +2698,7 @@ mod tests {
         let bgra = gradient_bgra_frame(width, height, stride);
         let mut encoder = match new_test_avc444_encoder(width, height) {
             Ok(encoder) => encoder,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
         };
 
@@ -2828,7 +2777,7 @@ mod tests {
 
         let mut encoder = match new_test_avc444_encoder(width, height) {
             Ok(encoder) => encoder,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error}"),
         };
 
@@ -2880,7 +2829,7 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -2930,7 +2879,7 @@ mod tests {
             H264RateControl::Vbr,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 
@@ -3014,7 +2963,7 @@ mod tests {
             H264RateControl::Cqp,
         ) {
             Ok(encoder) => encoder,
-            Err(error) if format!("{error:#}").contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&format!("{error:#}")) => return,
             Err(error) => panic!("AVC444v2 encoder initialization failed: {error:#}"),
         };
 

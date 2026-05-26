@@ -1,19 +1,8 @@
 use anyhow::{bail, Context, Result};
 use ffmpeg_next as ffmpeg;
-use openh264::encoder::{
-    BitRate, Complexity, Encoder, EncoderConfig, FrameRate, FrameType, QpRange, RateControlMode,
-    UsageType, VuiConfig,
-};
-use openh264::formats::YUVSource;
-use openh264::OpenH264API;
-use openh264_sys2::{
-    videoFormatI420, ISVCEncoder, ISVCEncoderVtbl, SEncParamExt, SFrameBSInfo, SSourcePicture,
-    API as _, RC_BITRATE_MODE, RC_OFF_MODE, SM_FIXEDSLCNUM_SLICE, UNSPECIFIED_BIT_RATE,
-    VIDEO_CODING_LAYER,
-};
 use std::ffi::CString;
 use std::os::raw::c_int;
-use std::ptr::{from_mut, null, null_mut};
+use std::ptr::{from_mut, null_mut};
 use yuv::{
     bgra_to_yuv420, BufferStoreMut, YuvConversionMode, YuvPlanarImageMut, YuvRange,
     YuvStandardMatrix,
@@ -74,7 +63,7 @@ pub fn extract_sps_pps(data: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
-/// H.264 encoder wrapping OpenH264 for screen capture encoding.
+/// H.264 encoder for screen capture encoding.
 ///
 /// Pre-allocates YUV planes and uses BT.709 full-range conversion. Caches
 /// SPS/PPS from IDR frames and prepends them to P-frames for Windows MFT
@@ -126,112 +115,27 @@ impl H264Encoder {
             bail!("dimensions must be non-zero and even: {}x{}", width, height);
         }
 
-        if options.ffmpeg_libavcodec {
-            tracing::info!(
-                bitrate,
-                fps,
-                quality = qp,
-                rate_control = ?rate_control,
-                vaapi = options.ffmpeg_vaapi,
-                "FFmpeg/libavcodec H.264 encoder settings"
-            );
-            return Self::from_encoder_impl(
-                H264EncoderImpl::Ffmpeg(FfmpegH264Encoder::new(
-                    width as i32,
-                    height as i32,
-                    bitrate,
-                    fps,
-                    qp,
-                    rate_control,
-                    options.ffmpeg_backend(),
-                )?),
-                width,
-                height,
-            );
-        }
-
-        let api = unsafe {
-            OpenH264API::from_blob_path_unchecked("libopenh264.so")
-                .context("failed to load libopenh264.so (install openh264 package)")?
-        };
-
-        let threads = if options.freerdp_openh264_params {
-            freerdp_openh264_thread_count()
-        } else {
-            openh264_thread_count()
-        };
-        let openh264_rate_control = h264_rate_control_mode(rate_control, options);
         tracing::info!(
             bitrate,
             fps,
             quality = qp,
             rate_control = ?rate_control,
-            openh264_rate_control = ?openh264_rate_control,
-            usage_type = ?options.usage_type,
-            complexity = ?options.complexity,
-            scene_change_detect = options.scene_change_detect,
-            adaptive_quantization = options.adaptive_quantization,
-            background_detection = options.background_detection,
-            long_term_reference = options.long_term_reference,
-            frame_skip = options.frame_skip,
-            vbr_qp_clamp = options.vbr_qp_clamp,
-            freerdp_openh264_params = options.freerdp_openh264_params,
-            threads,
-            "OpenH264 encoder settings"
+            vaapi = options.ffmpeg_vaapi,
+            "FFmpeg/libavcodec H.264 encoder settings"
         );
-        let mut config = EncoderConfig::new()
-            .bitrate(BitRate::from_bps(bitrate))
-            .max_frame_rate(FrameRate::from_hz(fps as f32))
-            .usage_type(options.usage_type)
-            .complexity(options.complexity)
-            .scene_change_detect(options.scene_change_detect)
-            .adaptive_quantization(options.adaptive_quantization)
-            .background_detection(options.background_detection)
-            .long_term_reference(options.long_term_reference)
-            .vui(VuiConfig::bt709_full());
-        if threads > 1 {
-            config = config.num_threads(threads);
-            if let Some(max_slice_len) = openh264_size_limited_slice_len() {
-                config = config.max_slice_len(max_slice_len);
-            }
-        }
-        config = match rate_control {
-            H264RateControl::Vbr => {
-                let config = config
-                    .rate_control_mode(openh264_rate_control)
-                    .skip_frames(options.frame_skip);
-                if options.vbr_qp_clamp {
-                    config.qp(QpRange::new(0, vbr_max_qp(qp)))
-                } else {
-                    config
-                }
-            }
-            H264RateControl::Cqp => config
-                .rate_control_mode(RateControlMode::Off)
-                .qp(QpRange::new(qp.min(51), qp.min(51)))
-                .skip_frames(false),
-        };
-
-        let encoder = if options.freerdp_openh264_params {
-            H264EncoderImpl::FreeRdp(FreeRdpOpenH264Encoder::new(
-                api,
+        Self::from_encoder_impl(
+            H264EncoderImpl::Ffmpeg(FfmpegH264Encoder::new(
                 width as i32,
                 height as i32,
                 bitrate,
                 fps,
                 qp,
                 rate_control,
-                options,
-                threads,
-            )?)
-        } else {
-            H264EncoderImpl::Rust(
-                Encoder::with_api_config(api, config)
-                    .context("failed to create OpenH264 encoder")?,
-            )
-        };
-
-        Self::from_encoder_impl(encoder, width, height)
+                options.ffmpeg_backend(),
+            )?),
+            width,
+            height,
+        )
     }
 
     fn from_encoder_impl(encoder: H264EncoderImpl, width: u32, height: u32) -> Result<Self> {
@@ -263,8 +167,6 @@ impl H264Encoder {
             y: &self.y_buf,
             u: &self.u_buf,
             v: &self.v_buf,
-            width: self.width,
-            height: self.height,
         };
 
         self.encoder
@@ -298,8 +200,6 @@ impl H264Encoder {
             y: &y[..y_len],
             u: &u[..uv_len],
             v: &v[..uv_len],
-            width: self.width,
-            height: self.height,
         };
 
         self.encoder
@@ -399,32 +299,12 @@ fn validate_bgra_buffer(width: usize, height: usize, stride: usize, len: usize) 
 
 #[derive(Clone, Copy)]
 pub(super) struct H264EncoderOptions {
-    pub(super) usage_type: UsageType,
-    pub(super) complexity: Complexity,
-    pub(super) scene_change_detect: bool,
-    pub(super) adaptive_quantization: bool,
-    pub(super) background_detection: bool,
-    pub(super) long_term_reference: bool,
-    pub(super) frame_skip: bool,
-    pub(super) vbr_qp_clamp: bool,
-    pub(super) freerdp_openh264_params: bool,
-    pub(super) ffmpeg_libavcodec: bool,
     pub(super) ffmpeg_vaapi: bool,
 }
 
 impl Default for H264EncoderOptions {
     fn default() -> Self {
         Self {
-            usage_type: UsageType::ScreenContentRealTime,
-            complexity: Complexity::Medium,
-            scene_change_detect: true,
-            adaptive_quantization: false,
-            background_detection: false,
-            long_term_reference: false,
-            frame_skip: true,
-            vbr_qp_clamp: true,
-            freerdp_openh264_params: false,
-            ffmpeg_libavcodec: false,
             ffmpeg_vaapi: false,
         }
     }
@@ -442,16 +322,6 @@ impl H264EncoderOptions {
 
 pub(super) fn avc444_h264_encoder_options() -> H264EncoderOptions {
     H264EncoderOptions {
-        usage_type: UsageType::ScreenContentRealTime,
-        complexity: Complexity::Medium,
-        scene_change_detect: true,
-        adaptive_quantization: false,
-        background_detection: false,
-        long_term_reference: false,
-        frame_skip: true,
-        vbr_qp_clamp: false,
-        freerdp_openh264_params: false,
-        ffmpeg_libavcodec: true,
         ffmpeg_vaapi: false,
     }
 }
@@ -464,94 +334,18 @@ pub(super) fn avc444_h264_vaapi_encoder_options() -> H264EncoderOptions {
     }
 }
 
-fn vbr_max_qp(qp: u8) -> u8 {
-    qp.clamp(1, 51)
-}
-
-fn vbr_rate_control_mode(options: H264EncoderOptions) -> RateControlMode {
-    if options.frame_skip {
-        RateControlMode::Bitrate
-    } else {
-        RateControlMode::Quality
-    }
-}
-
-fn h264_rate_control_mode(
-    rate_control: H264RateControl,
-    options: H264EncoderOptions,
-) -> RateControlMode {
-    match rate_control {
-        H264RateControl::Vbr => vbr_rate_control_mode(options),
-        H264RateControl::Cqp => RateControlMode::Off,
-    }
-}
-
-fn openh264_thread_count() -> u16 {
-    let env_value = std::env::var("HYPR_RDP_OPENH264_THREADS").ok();
-    let default_parallelism = std::thread::available_parallelism()
-        .map(|threads| threads.get().clamp(1, 4) as u16)
-        .unwrap_or(1);
-
-    openh264_thread_count_with(env_value.as_deref(), default_parallelism)
-}
-
-fn freerdp_openh264_thread_count() -> u16 {
-    let env_value = std::env::var("HYPR_RDP_OPENH264_THREADS").ok();
-    freerdp_openh264_thread_count_with(env_value.as_deref())
-}
-
-fn freerdp_openh264_thread_count_with(env_value: Option<&str>) -> u16 {
-    env_value
-        .and_then(|value| value.parse::<u16>().ok())
-        .map(|value| value.min(16))
-        .unwrap_or(0)
-}
-
-fn openh264_thread_count_with(env_value: Option<&str>, default_parallelism: u16) -> u16 {
-    if let Some(value) = env_value {
-        if let Ok(parsed) = value.parse::<u16>() {
-            return parsed.clamp(1, 16);
-        }
-    }
-
-    default_parallelism.clamp(1, 4)
-}
-
-fn openh264_size_limited_slice_len() -> Option<u32> {
-    let env_value = std::env::var("HYPR_RDP_OPENH264_MAX_SLICE_LEN").ok();
-    openh264_size_limited_slice_len_with(env_value.as_deref())
-}
-
-fn openh264_size_limited_slice_len_with(env_value: Option<&str>) -> Option<u32> {
-    if let Some(value) = env_value {
-        if let Ok(parsed) = value.parse::<u32>() {
-            return (parsed != 0).then(|| parsed.clamp(4096, 262_144));
-        }
-    }
-
-    None
-}
-
 enum H264EncoderImpl {
-    Rust(Encoder),
-    FreeRdp(FreeRdpOpenH264Encoder),
     Ffmpeg(FfmpegH264Encoder),
 }
 
 impl H264EncoderImpl {
     fn encode_yuv_source(
         &mut self,
-        yuv: &impl YUVSource,
+        yuv: &impl Yuv420Source,
         cached_sps_pps: &mut Option<Vec<u8>>,
         prepend_cached_sps_pps: bool,
     ) -> Result<EncodedH264> {
         match self {
-            Self::Rust(encoder) => {
-                encode_yuv_source_with_options(encoder, cached_sps_pps, yuv, prepend_cached_sps_pps)
-            }
-            Self::FreeRdp(encoder) => {
-                encoder.encode_yuv_source(yuv, cached_sps_pps, prepend_cached_sps_pps)
-            }
             Self::Ffmpeg(encoder) => {
                 encoder.encode_yuv_source(yuv, cached_sps_pps, prepend_cached_sps_pps)
             }
@@ -560,8 +354,6 @@ impl H264EncoderImpl {
 
     fn force_intra_frame(&mut self) {
         match self {
-            Self::Rust(encoder) => encoder.force_intra_frame(),
-            Self::FreeRdp(encoder) => encoder.force_intra_frame(),
             Self::Ffmpeg(encoder) => encoder.force_intra_frame(),
         }
     }
@@ -646,7 +438,7 @@ impl FfmpegH264Encoder {
 
     fn encode_yuv_source(
         &mut self,
-        yuv: &impl YUVSource,
+        yuv: &impl Yuv420Source,
         cached_sps_pps: &mut Option<Vec<u8>>,
         prepend_cached_sps_pps: bool,
     ) -> Result<EncodedH264> {
@@ -694,13 +486,13 @@ impl FfmpegH264Encoder {
         );
 
         let frame_type = if data.is_empty() {
-            FrameType::Skip
+            H264FrameType::Skip
         } else if annex_b_nal_types(&data).contains(&5) {
-            FrameType::IDR
+            H264FrameType::IDR
         } else if packet_key {
-            FrameType::I
+            H264FrameType::I
         } else {
-            FrameType::P
+            H264FrameType::P
         };
 
         apply_sps_pps_cache(
@@ -716,7 +508,7 @@ impl FfmpegH264Encoder {
         self.force_idr = true;
     }
 
-    fn create_input_frame(&mut self, yuv: &impl YUVSource) -> Result<ffmpeg::frame::Video> {
+    fn create_input_frame(&mut self, yuv: &impl Yuv420Source) -> Result<ffmpeg::frame::Video> {
         match self.backend {
             FfmpegH264Backend::Software => {
                 let mut frame = ffmpeg::frame::Video::new(
@@ -731,7 +523,10 @@ impl FfmpegH264Encoder {
         }
     }
 
-    fn create_vaapi_input_frame(&mut self, yuv: &impl YUVSource) -> Result<ffmpeg::frame::Video> {
+    fn create_vaapi_input_frame(
+        &mut self,
+        yuv: &impl Yuv420Source,
+    ) -> Result<ffmpeg::frame::Video> {
         let mut software_frame = ffmpeg::frame::Video::new(
             ffmpeg::format::Pixel::NV12,
             self.width as u32,
@@ -1047,7 +842,7 @@ fn ffmpeg_status(status: c_int) -> String {
 }
 
 fn copy_yuv420p_to_frame(
-    yuv: &impl YUVSource,
+    yuv: &impl Yuv420Source,
     frame: &mut ffmpeg::frame::Video,
     width: usize,
     height: usize,
@@ -1061,7 +856,7 @@ fn copy_yuv420p_to_frame(
 }
 
 fn copy_yuv420p_to_nv12_frame(
-    yuv: &impl YUVSource,
+    yuv: &impl Yuv420Source,
     frame: &mut ffmpeg::frame::Video,
     width: usize,
     height: usize,
@@ -1090,266 +885,30 @@ fn copy_yuv_plane(src: &[u8], src_stride: usize, dst: &mut [u8], dst_stride: usi
     }
 }
 
-struct FreeRdpOpenH264Encoder {
-    api: OpenH264API,
-    encoder_ptr: *mut ISVCEncoder,
-    encode_frame:
-        unsafe extern "C" fn(*mut ISVCEncoder, *const SSourcePicture, *mut SFrameBSInfo) -> c_int,
-    force_intra_frame: unsafe extern "C" fn(*mut ISVCEncoder, bool) -> c_int,
-    bitstream_info: SFrameBSInfo,
-}
-
-impl FreeRdpOpenH264Encoder {
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        api: OpenH264API,
-        width: i32,
-        height: i32,
-        bitrate: u32,
-        fps: u32,
-        qp: u8,
-        rate_control: H264RateControl,
-        options: H264EncoderOptions,
-        threads: u16,
-    ) -> Result<Self> {
-        let mut encoder_ptr = null::<ISVCEncoderVtbl>() as *mut ISVCEncoder;
-        unsafe {
-            api.WelsCreateSVCEncoder(from_mut(&mut encoder_ptr))
-                .try_openh264("WelsCreateSVCEncoder")?;
-        }
-
-        let vtable = unsafe { **encoder_ptr };
-        let get_default_params = vtable
-            .GetDefaultParams
-            .context("OpenH264 encoder vtable missing GetDefaultParams")?;
-        let initialize_ext = vtable
-            .InitializeExt
-            .context("OpenH264 encoder vtable missing InitializeExt")?;
-        let encode_frame = vtable
-            .EncodeFrame
-            .context("OpenH264 encoder vtable missing EncodeFrame")?;
-        let force_intra_frame = vtable
-            .ForceIntraFrame
-            .context("OpenH264 encoder vtable missing ForceIntraFrame")?;
-
-        let mut params = SEncParamExt::default();
-        unsafe {
-            get_default_params(encoder_ptr, &mut params).try_openh264("GetDefaultParams")?;
-        }
-
-        apply_freerdp_openh264_params(
-            &mut params,
-            width,
-            height,
-            bitrate,
-            fps,
-            qp,
-            rate_control,
-            options,
-            threads,
-        )?;
-
-        unsafe {
-            initialize_ext(encoder_ptr, &params).try_openh264("InitializeExt")?;
-        }
-
-        Ok(Self {
-            api,
-            encoder_ptr,
-            encode_frame,
-            force_intra_frame,
-            bitstream_info: SFrameBSInfo::default(),
-        })
-    }
-
-    fn encode_yuv_source(
-        &mut self,
-        yuv: &impl YUVSource,
-        cached_sps_pps: &mut Option<Vec<u8>>,
-        prepend_cached_sps_pps: bool,
-    ) -> Result<EncodedH264> {
-        let dimensions = yuv.dimensions_i32();
-        let strides = yuv.strides_i32();
-        let source = SSourcePicture {
-            iColorFormat: videoFormatI420,
-            iStride: [strides.0, strides.1, strides.2, 0],
-            pData: [
-                yuv.y().as_ptr().cast_mut(),
-                yuv.u().as_ptr().cast_mut(),
-                yuv.v().as_ptr().cast_mut(),
-                std::ptr::null_mut(),
-            ],
-            iPicWidth: dimensions.0,
-            iPicHeight: dimensions.1,
-            uiTimeStamp: 0,
-            bPsnrY: false,
-            bPsnrU: false,
-            bPsnrV: false,
-        };
-
-        unsafe {
-            (self.encode_frame)(self.encoder_ptr, &source, &mut self.bitstream_info)
-                .try_openh264("EncodeFrame")?;
-        }
-
-        let frame_type = frame_type_from_openh264(self.bitstream_info.eFrameType);
-        let mut data = frame_data_from_openh264(&self.bitstream_info)?;
-        if data.is_empty() {
-            return Ok(EncodedH264 { data, frame_type });
-        }
-
-        apply_sps_pps_cache(
-            frame_type,
-            &mut data,
-            cached_sps_pps,
-            prepend_cached_sps_pps,
-        );
-        Ok(EncodedH264 { data, frame_type })
-    }
-
-    fn force_intra_frame(&mut self) {
-        unsafe {
-            let _ = (self.force_intra_frame)(self.encoder_ptr, true);
-        }
-    }
-}
-
-impl Drop for FreeRdpOpenH264Encoder {
-    fn drop(&mut self) {
-        unsafe {
-            self.api.WelsDestroySVCEncoder(self.encoder_ptr);
-        }
-    }
-}
-
-unsafe impl Send for FreeRdpOpenH264Encoder {}
-unsafe impl Sync for FreeRdpOpenH264Encoder {}
-
-#[allow(clippy::too_many_arguments)]
-fn apply_freerdp_openh264_params(
-    params: &mut SEncParamExt,
-    width: i32,
-    height: i32,
-    bitrate: u32,
-    fps: u32,
-    qp: u8,
-    rate_control: H264RateControl,
-    options: H264EncoderOptions,
-    threads: u16,
-) -> Result<()> {
-    params.iUsageType = usage_type_to_openh264(options.usage_type);
-    params.iPicWidth = width;
-    params.iPicHeight = height;
-    params.fMaxFrameRate = fps as f32;
-    params.iMaxBitrate = UNSPECIFIED_BIT_RATE as c_int;
-    params.bEnableDenoise = false;
-    params.bEnableAdaptiveQuant = options.adaptive_quantization;
-    params.bEnableBackgroundDetection = options.background_detection;
-    params.bEnableLongTermReference = options.long_term_reference;
-    params.iSpatialLayerNum = 1;
-    params.iMultipleThreadIdc = threads;
-    params.sSpatialLayers[0].fFrameRate = fps as f32;
-    params.sSpatialLayers[0].iVideoWidth = width;
-    params.sSpatialLayers[0].iVideoHeight = height;
-    params.sSpatialLayers[0].iMaxSpatialBitrate = params.iMaxBitrate;
-
-    match rate_control {
-        H264RateControl::Vbr => {
-            params.iRCMode = RC_BITRATE_MODE;
-            params.iTargetBitrate = bitrate
-                .try_into()
-                .context("OpenH264 target bitrate does not fit c_int")?;
-            params.sSpatialLayers[0].iSpatialBitrate = params.iTargetBitrate;
-            params.bEnableFrameSkip = options.frame_skip;
-        }
-        H264RateControl::Cqp => {
-            params.iRCMode = RC_OFF_MODE;
-            params.sSpatialLayers[0].iDLayerQp = qp.min(51).into();
-            params.bEnableFrameSkip = false;
-        }
-    }
-
-    if threads > 1 {
-        params.sSpatialLayers[0].sSliceArgument.uiSliceMode = SM_FIXEDSLCNUM_SLICE;
-    }
-
-    Ok(())
-}
-
-fn usage_type_to_openh264(usage_type: UsageType) -> c_int {
-    match usage_type {
-        UsageType::CameraVideoRealTime => openh264_sys2::CAMERA_VIDEO_REAL_TIME,
-        UsageType::ScreenContentRealTime => openh264_sys2::SCREEN_CONTENT_REAL_TIME,
-        UsageType::CameraVideoNonRealTime => openh264_sys2::CAMERA_VIDEO_NON_REAL_TIME,
-        UsageType::ScreenContentNonRealTime => openh264_sys2::SCREEN_CONTENT_NON_REAL_TIME,
-        UsageType::InputContentTypeAll => openh264_sys2::INPUT_CONTENT_TYPE_ALL,
-    }
-}
-
-fn frame_type_from_openh264(frame_type: c_int) -> FrameType {
-    match frame_type {
-        openh264_sys2::videoFrameTypeIDR => FrameType::IDR,
-        openh264_sys2::videoFrameTypeI => FrameType::I,
-        openh264_sys2::videoFrameTypeP => FrameType::P,
-        openh264_sys2::videoFrameTypeSkip => FrameType::Skip,
-        openh264_sys2::videoFrameTypeIPMixed => FrameType::IPMixed,
-        _ => FrameType::Invalid,
-    }
-}
-
-fn frame_data_from_openh264(bitstream_info: &SFrameBSInfo) -> Result<Vec<u8>> {
-    let mut data = Vec::new();
-    for layer in bitstream_info
-        .sLayerInfo
-        .iter()
-        .take(bitstream_info.iLayerNum.max(0) as usize)
-    {
-        if layer.uiLayerType != VIDEO_CODING_LAYER as u8 {
-            continue;
-        }
-        for nal_index in 0..layer.iNalCount.max(0) as usize {
-            let size = unsafe { *layer.pNalLengthInByte.add(nal_index) };
-            if size <= 0 {
-                continue;
-            }
-            let offset: usize = (0..nal_index)
-                .map(|index| unsafe { *layer.pNalLengthInByte.add(index) }.max(0) as usize)
-                .sum();
-            let nal =
-                unsafe { std::slice::from_raw_parts(layer.pBsBuf.add(offset), size as usize) };
-            data.extend_from_slice(nal);
-        }
-    }
-    Ok(data)
-}
-
-trait OpenH264StatusExt {
-    fn try_openh264(self, operation: &str) -> Result<()>;
-}
-
-impl OpenH264StatusExt for c_int {
-    fn try_openh264(self, operation: &str) -> Result<()> {
-        anyhow::ensure!(self == 0, "{operation} failed with OpenH264 status {self}");
-        Ok(())
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum H264FrameType {
+    Skip,
+    IDR,
+    I,
+    P,
 }
 
 pub(super) struct EncodedH264 {
     pub(super) data: Vec<u8>,
-    pub(super) frame_type: FrameType,
+    pub(super) frame_type: H264FrameType,
 }
 
 impl EncodedH264 {
     pub(super) fn empty() -> Self {
         Self {
             data: Vec::new(),
-            frame_type: FrameType::Skip,
+            frame_type: H264FrameType::Skip,
         }
     }
 }
 
-pub(super) fn is_h264_keyframe(frame_type: FrameType) -> bool {
-    frame_type == FrameType::IDR || frame_type == FrameType::I
+pub(super) fn is_h264_keyframe(frame_type: H264FrameType) -> bool {
+    frame_type == H264FrameType::IDR || frame_type == H264FrameType::I
 }
 
 #[cfg(any(feature = "vaapi", test))]
@@ -1359,32 +918,8 @@ pub(super) fn initial_h264_bootstrap_is_sendable(encoded: &EncodedH264) -> bool 
         && extract_sps_pps(&encoded.data).is_some()
 }
 
-fn encode_yuv_source_with_options(
-    encoder: &mut Encoder,
-    cached_sps_pps: &mut Option<Vec<u8>>,
-    yuv: &impl YUVSource,
-    prepend_cached_sps_pps: bool,
-) -> Result<EncodedH264> {
-    let bitstream = encoder.encode(yuv).context("OpenH264 encode failed")?;
-
-    let mut data = bitstream.to_vec();
-    let frame_type = bitstream.frame_type();
-    if data.is_empty() {
-        return Ok(EncodedH264 { data, frame_type });
-    }
-
-    apply_sps_pps_cache(
-        frame_type,
-        &mut data,
-        cached_sps_pps,
-        prepend_cached_sps_pps,
-    );
-
-    Ok(EncodedH264 { data, frame_type })
-}
-
 fn apply_sps_pps_cache(
-    frame_type: FrameType,
+    frame_type: H264FrameType,
     data: &mut Vec<u8>,
     cached_sps_pps: &mut Option<Vec<u8>>,
     prepend_cached_sps_pps: bool,
@@ -1433,24 +968,20 @@ pub(super) fn annex_b_nal_types(data: &[u8]) -> Vec<u8> {
     types
 }
 
-/// Reference to pre-allocated YUV planes implementing OpenH264's YUVSource.
+trait Yuv420Source {
+    fn y(&self) -> &[u8];
+    fn u(&self) -> &[u8];
+    fn v(&self) -> &[u8];
+}
+
+/// Reference to pre-allocated YUV planes.
 struct YuvRef<'a> {
     y: &'a [u8],
     u: &'a [u8],
     v: &'a [u8],
-    width: usize,
-    height: usize,
 }
 
-impl YUVSource for YuvRef<'_> {
-    fn dimensions(&self) -> (usize, usize) {
-        (self.width, self.height)
-    }
-
-    fn strides(&self) -> (usize, usize, usize) {
-        (self.width, self.width / 2, self.width / 2)
-    }
-
+impl Yuv420Source for YuvRef<'_> {
     fn y(&self) -> &[u8] {
         self.y
     }
@@ -1489,64 +1020,10 @@ mod tests {
     }
 
     #[test]
-    fn vbr_quality_caps_max_qp() {
-        assert_eq!(vbr_max_qp(0), 1);
-        assert_eq!(vbr_max_qp(23), 23);
-        assert_eq!(vbr_max_qp(51), 51);
-        assert_eq!(vbr_max_qp(99), 51);
-    }
-
-    #[test]
-    fn default_h264_encoder_options_use_screen_content_vbr_without_ltr() {
+    fn default_h264_encoder_options_use_freerdp_libavcodec_backend() {
         let options = H264EncoderOptions::default();
 
-        assert!(matches!(
-            options.usage_type,
-            UsageType::ScreenContentRealTime
-        ));
-        assert!(matches!(options.complexity, Complexity::Medium));
-        assert!(options.scene_change_detect);
-        assert!(!options.adaptive_quantization);
-        assert!(!options.background_detection);
-        assert!(!options.long_term_reference);
-        assert!(options.frame_skip);
-        assert!(options.vbr_qp_clamp);
-        assert!(!options.freerdp_openh264_params);
-        assert!(!options.ffmpeg_libavcodec);
         assert!(!options.ffmpeg_vaapi);
-    }
-
-    #[test]
-    fn vbr_uses_bitrate_mode_when_frame_skip_is_enabled() {
-        let default_options = H264EncoderOptions::default();
-        assert!(matches!(
-            vbr_rate_control_mode(default_options),
-            RateControlMode::Bitrate
-        ));
-
-        let avc444_options = avc444_h264_encoder_options();
-        assert!(matches!(
-            vbr_rate_control_mode(avc444_options),
-            RateControlMode::Bitrate
-        ));
-    }
-
-    #[test]
-    fn cqp_uses_rc_off_independent_of_frame_skip_option() {
-        let mut options = H264EncoderOptions {
-            frame_skip: true,
-            ..H264EncoderOptions::default()
-        };
-        assert!(matches!(
-            h264_rate_control_mode(H264RateControl::Cqp, options),
-            RateControlMode::Off
-        ));
-
-        options.frame_skip = false;
-        assert!(matches!(
-            h264_rate_control_mode(H264RateControl::Cqp, options),
-            RateControlMode::Off
-        ));
     }
 
     #[test]
@@ -1674,44 +1151,6 @@ mod tests {
         assert!(format!("{error:#}").contains("produced no packet"));
         assert!(ensure_ffmpeg_vaapi_packet_progress(FfmpegH264Backend::Software, &[]).is_ok());
         assert!(ensure_ffmpeg_vaapi_packet_progress(FfmpegH264Backend::Vaapi, &[1]).is_ok());
-    }
-
-    #[test]
-    fn openh264_thread_count_env_is_bounded_and_falls_back_to_available_parallelism() {
-        assert_eq!(openh264_thread_count_with(Some("0"), 4), 1);
-        assert_eq!(openh264_thread_count_with(Some("2"), 1), 2);
-        assert_eq!(openh264_thread_count_with(Some("32"), 1), 16);
-        assert_eq!(openh264_thread_count_with(Some("invalid"), 3), 3);
-        assert_eq!(openh264_thread_count_with(None, 0), 1);
-        assert_eq!(openh264_thread_count_with(None, 8), 4);
-    }
-
-    #[test]
-    fn freerdp_openh264_thread_count_defaults_to_auto_and_bounds_env() {
-        assert_eq!(freerdp_openh264_thread_count_with(None), 0);
-        assert_eq!(freerdp_openh264_thread_count_with(Some("0")), 0);
-        assert_eq!(freerdp_openh264_thread_count_with(Some("2")), 2);
-        assert_eq!(freerdp_openh264_thread_count_with(Some("32")), 16);
-        assert_eq!(freerdp_openh264_thread_count_with(Some("invalid")), 0);
-    }
-
-    #[test]
-    fn openh264_size_limited_slice_len_env_is_optional_and_bounded() {
-        assert_eq!(openh264_size_limited_slice_len_with(None), None);
-        assert_eq!(openh264_size_limited_slice_len_with(Some("invalid")), None);
-        assert_eq!(openh264_size_limited_slice_len_with(Some("0")), None);
-        assert_eq!(
-            openh264_size_limited_slice_len_with(Some("1024")),
-            Some(4096)
-        );
-        assert_eq!(
-            openh264_size_limited_slice_len_with(Some("65536")),
-            Some(65_536)
-        );
-        assert_eq!(
-            openh264_size_limited_slice_len_with(Some("999999")),
-            Some(262_144)
-        );
     }
 
     fn solid_bgra(width: usize, height: usize, stride: usize, r: u8, g: u8, b: u8) -> Vec<u8> {
@@ -1844,7 +1283,7 @@ mod tests {
 
         assert!(!initial_h264_bootstrap_is_sendable(&EncodedH264 {
             data: data.clone(),
-            frame_type: FrameType::P,
+            frame_type: H264FrameType::P,
         }));
 
         prepend_codec_headers_for_bootstrap(&mut data, Some(&headers), true);
@@ -1852,7 +1291,7 @@ mod tests {
         assert_eq!(annex_b_nal_types(&data), vec![7, 8, 1]);
         assert!(initial_h264_bootstrap_is_sendable(&EncodedH264 {
             data,
-            frame_type: FrameType::I,
+            frame_type: H264FrameType::I,
         }));
     }
 
@@ -1860,21 +1299,21 @@ mod tests {
     fn initial_bootstrap_requires_parameter_sets_and_key_picture() {
         let idr_without_headers = EncodedH264 {
             data: vec![0x00, 0x00, 0x01, 0x65, 0x11],
-            frame_type: FrameType::IDR,
+            frame_type: H264FrameType::IDR,
         };
         let headers_with_delta = EncodedH264 {
             data: vec![
                 0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x01, 0x68, 0xbb, 0x00, 0x00, 0x01, 0x61,
                 0xcc,
             ],
-            frame_type: FrameType::P,
+            frame_type: H264FrameType::P,
         };
         let complete = EncodedH264 {
             data: vec![
                 0x00, 0x00, 0x01, 0x67, 0xaa, 0x00, 0x00, 0x01, 0x68, 0xbb, 0x00, 0x00, 0x01, 0x65,
                 0xcc,
             ],
-            frame_type: FrameType::IDR,
+            frame_type: H264FrameType::IDR,
         };
 
         assert!(!initial_h264_bootstrap_is_sendable(&idr_without_headers));
@@ -2058,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn sps_pps_cache_is_updated_from_idr_and_prepended_to_delta_without_openh264() {
+    fn sps_pps_cache_is_updated_from_idr_and_prepended_to_delta() {
         let mut cached = None;
         let mut idr = vec![
             0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, // SPS
@@ -2066,7 +1505,7 @@ mod tests {
             0x00, 0x00, 0x01, 0x65, 0xee, 0xff, // IDR
         ];
 
-        apply_sps_pps_cache(FrameType::IDR, &mut idr, &mut cached, true);
+        apply_sps_pps_cache(H264FrameType::IDR, &mut idr, &mut cached, true);
 
         let expected_parameter_sets = vec![
             0x00, 0x00, 0x01, 0x67, 0xaa, 0xbb, 0x00, 0x00, 0x01, 0x68, 0xcc, 0xdd,
@@ -2074,7 +1513,7 @@ mod tests {
         assert_eq!(cached, Some(expected_parameter_sets.clone()));
 
         let mut delta = vec![0x00, 0x00, 0x01, 0x41, 0x11, 0x22];
-        apply_sps_pps_cache(FrameType::P, &mut delta, &mut cached, true);
+        apply_sps_pps_cache(H264FrameType::P, &mut delta, &mut cached, true);
 
         assert!(delta.starts_with(&expected_parameter_sets));
         assert_eq!(annex_b_nal_types(&delta), vec![7, 8, 1]);
@@ -2086,16 +1525,16 @@ mod tests {
         let original = vec![0x00, 0x00, 0x01, 0x41, 0x11, 0x22];
         let mut delta = original.clone();
 
-        apply_sps_pps_cache(FrameType::P, &mut delta, &mut cached, false);
+        apply_sps_pps_cache(H264FrameType::P, &mut delta, &mut cached, false);
         assert_eq!(delta, original);
 
         let mut missing_cache = None;
-        apply_sps_pps_cache(FrameType::P, &mut delta, &mut missing_cache, true);
+        apply_sps_pps_cache(H264FrameType::P, &mut delta, &mut missing_cache, true);
         assert_eq!(delta, original);
     }
 
     #[test]
-    fn h264_encoder_rejects_zero_and_odd_dimensions_before_loading_openh264() {
+    fn h264_encoder_rejects_zero_and_odd_dimensions_before_backend_init() {
         for (width, height) in [(0, 64), (64, 0), (63, 64), (64, 63)] {
             let err = match H264Encoder::new(width, height, 1_000_000, 30, 23, H264RateControl::Cqp)
             {
@@ -2129,7 +1568,7 @@ mod tests {
         let stride = width * 4 + 12;
         let mut encoder = match test_h264_encoder(width as u32, height as u32) {
             Ok(encoder) => encoder,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("H.264 encoder initialization failed: {error}"),
         };
         let valid = gradient_bgra(width, height, stride, 0);
@@ -2155,7 +1594,7 @@ mod tests {
         let stride = width * 4;
         let mut encoder = match test_h264_encoder(width as u32, height as u32) {
             Ok(encoder) => encoder,
-            Err(error) if error.contains("libopenh264") => return,
+            Err(error) if h264_backend_unavailable(&error) => return,
             Err(error) => panic!("H.264 encoder initialization failed: {error}"),
         };
 
@@ -2188,6 +1627,11 @@ mod tests {
             }
         }
 
-        panic!("OpenH264 did not produce a delta frame within the test sequence");
+        panic!("FFmpeg H.264 encoder did not produce a delta frame within the test sequence");
+    }
+
+    fn h264_backend_unavailable(error: &str) -> bool {
+        error.contains("FFmpeg H.264 encoder not found")
+            || error.contains("failed to initialize FFmpeg H.264")
     }
 }

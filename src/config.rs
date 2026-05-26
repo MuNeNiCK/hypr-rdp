@@ -57,7 +57,7 @@ struct Args {
     #[arg(long)]
     max_frames_in_flight: Option<u32>,
 
-    /// EGFX codec policy: "auto" (default), "avc420", or "avc444"
+    /// EGFX codec policy: "avc420" (default), "avc444" (experimental), or "auto"
     #[arg(long)]
     egfx_codec: Option<String>,
 
@@ -184,11 +184,7 @@ impl RuntimeConfig {
             .max_frames_in_flight
             .or(config.max_frames_in_flight)
             .unwrap_or(DEFAULT_MAX_FRAMES_IN_FLIGHT);
-        let egfx_codec_str = args
-            .egfx_codec
-            .or(config.egfx_codec)
-            .unwrap_or_else(|| "auto".into());
-        let egfx_codec = parse_egfx_codec_policy(&egfx_codec_str)?;
+        let egfx_codec = resolve_egfx_codec_policy(args.egfx_codec, config.egfx_codec)?;
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
@@ -252,6 +248,20 @@ fn parse_egfx_codec_policy(s: &str) -> anyhow::Result<EgfxCodecPolicy> {
     }
 }
 
+fn default_egfx_codec_policy_name() -> String {
+    "avc420".into()
+}
+
+fn resolve_egfx_codec_policy(
+    cli_value: Option<String>,
+    config_value: Option<String>,
+) -> anyhow::Result<EgfxCodecPolicy> {
+    let value = cli_value
+        .or(config_value)
+        .unwrap_or_else(default_egfx_codec_policy_name);
+    parse_egfx_codec_policy(&value)
+}
+
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
     let parts: Vec<&str> = s.split('x').collect();
     if parts.len() != 2 {
@@ -298,6 +308,25 @@ mod tests {
             EgfxCodecPolicy::Avc444
         );
         assert!(parse_egfx_codec_policy("h264").is_err());
+    }
+
+    #[test]
+    fn default_egfx_codec_policy_is_avc420() {
+        let policy = resolve_egfx_codec_policy(None, None).unwrap();
+
+        assert_eq!(policy, EgfxCodecPolicy::Avc420);
+    }
+
+    #[test]
+    fn explicit_egfx_codec_policy_overrides_default_and_config() {
+        assert_eq!(
+            resolve_egfx_codec_policy(None, Some("avc444".into())).unwrap(),
+            EgfxCodecPolicy::Avc444
+        );
+        assert_eq!(
+            resolve_egfx_codec_policy(Some("avc420".into()), Some("avc444".into())).unwrap(),
+            EgfxCodecPolicy::Avc420
+        );
     }
 
     #[test]

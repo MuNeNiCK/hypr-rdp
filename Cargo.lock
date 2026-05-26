@@ -1437,7 +1437,6 @@ dependencies = [
  "libc",
  "libva-sys",
  "openh264",
- "openh264-sys2",
  "pipewire",
  "png",
  "proptest",

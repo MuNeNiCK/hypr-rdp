@@ -19,8 +19,8 @@ use crate::input::SharedOutputLayout;
 
 pub(crate) use wayland::HeadlessOutputGuard;
 
-const OPENH264_MAX_LONG_DIMENSION: u32 = 3840;
-const OPENH264_MAX_SHORT_DIMENSION: u32 = 2160;
+const H264_SOFTWARE_MAX_LONG_DIMENSION: u32 = 3840;
+const H264_SOFTWARE_MAX_SHORT_DIMENSION: u32 = 2160;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMode {
@@ -96,7 +96,7 @@ fn resize_headless_output(output_name: &str, width: u32, height: u32) -> Result<
     Ok(())
 }
 
-fn clamp_to_openh264_limits(width: u32, height: u32) -> (u32, u32) {
+fn clamp_to_h264_software_limits(width: u32, height: u32) -> (u32, u32) {
     let width = width & !1;
     let height = height & !1;
     if width == 0 || height == 0 {
@@ -105,12 +105,12 @@ fn clamp_to_openh264_limits(width: u32, height: u32) -> (u32, u32) {
 
     let long = width.max(height);
     let short = width.min(height);
-    if long <= OPENH264_MAX_LONG_DIMENSION && short <= OPENH264_MAX_SHORT_DIMENSION {
+    if long <= H264_SOFTWARE_MAX_LONG_DIMENSION && short <= H264_SOFTWARE_MAX_SHORT_DIMENSION {
         return (width, height);
     }
 
-    let scale_by_long = OPENH264_MAX_LONG_DIMENSION as f64 / long as f64;
-    let scale_by_short = OPENH264_MAX_SHORT_DIMENSION as f64 / short as f64;
+    let scale_by_long = H264_SOFTWARE_MAX_LONG_DIMENSION as f64 / long as f64;
+    let scale_by_short = H264_SOFTWARE_MAX_SHORT_DIMENSION as f64 / short as f64;
     let scale = scale_by_long.min(scale_by_short).min(1.0);
 
     let scaled_width = ((width as f64 * scale).floor() as u32).max(2) & !1;
@@ -139,14 +139,14 @@ impl HyprDisplay {
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
         let requested_resolution = resolution;
-        let resolution = clamp_to_openh264_limits(resolution.0, resolution.1);
+        let resolution = clamp_to_h264_software_limits(resolution.0, resolution.1);
         if resolution != requested_resolution {
             tracing::warn!(
                 requested_w = requested_resolution.0,
                 requested_h = requested_resolution.1,
                 applied_w = resolution.0,
                 applied_h = resolution.1,
-                "Configured resolution exceeds OpenH264 software encoder limit; clamping"
+                "Configured resolution exceeds H.264 software encoder policy limit; clamping"
             );
         }
 
@@ -248,14 +248,14 @@ impl RdpServerDisplay for HyprDisplay {
         let requested_h = client_size.height as u32;
 
         // H.264 requires even dimensions
-        let (cw, ch) = clamp_to_openh264_limits(requested_w, requested_h);
+        let (cw, ch) = clamp_to_h264_software_limits(requested_w, requested_h);
         if cw != (requested_w & !1) || ch != (requested_h & !1) {
             tracing::warn!(
                 requested_w,
                 requested_h,
                 applied_w = cw,
                 applied_h = ch,
-                "Client requested size exceeds OpenH264 software encoder limit; clamping"
+                "Client requested size exceeds H.264 software encoder policy limit; clamping"
             );
         }
 
@@ -351,14 +351,14 @@ impl RdpServerDisplay for HyprDisplay {
             return;
         }
 
-        let (w, h) = clamp_to_openh264_limits(requested_w, requested_h);
+        let (w, h) = clamp_to_h264_software_limits(requested_w, requested_h);
         if w != (requested_w & !1) || h != (requested_h & !1) {
             tracing::warn!(
                 requested_w,
                 requested_h,
                 applied_w = w,
                 applied_h = h,
-                "DisplayControl size exceeds OpenH264 software encoder limit; clamping"
+                "DisplayControl size exceeds H.264 software encoder policy limit; clamping"
             );
         }
 
@@ -462,23 +462,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn openh264_limit_keeps_supported_landscape_size() {
-        assert_eq!(clamp_to_openh264_limits(1920, 1200), (1920, 1200));
-        assert_eq!(clamp_to_openh264_limits(3840, 2160), (3840, 2160));
+    fn h264_software_limit_keeps_supported_landscape_size() {
+        assert_eq!(clamp_to_h264_software_limits(1920, 1200), (1920, 1200));
+        assert_eq!(clamp_to_h264_software_limits(3840, 2160), (3840, 2160));
     }
 
     #[test]
-    fn openh264_limit_scales_ultrawide_client_size() {
-        assert_eq!(clamp_to_openh264_limits(5120, 1440), (3840, 1080));
+    fn h264_software_limit_scales_ultrawide_client_size() {
+        assert_eq!(clamp_to_h264_software_limits(5120, 1440), (3840, 1080));
     }
 
     #[test]
-    fn openh264_limit_scales_portrait_size() {
-        assert_eq!(clamp_to_openh264_limits(1440, 5120), (1080, 3840));
+    fn h264_software_limit_scales_portrait_size() {
+        assert_eq!(clamp_to_h264_software_limits(1440, 5120), (1080, 3840));
     }
 
     #[test]
-    fn openh264_limit_rounds_to_even_dimensions() {
-        assert_eq!(clamp_to_openh264_limits(5121, 1441), (3840, 1080));
+    fn h264_software_limit_rounds_to_even_dimensions() {
+        assert_eq!(clamp_to_h264_software_limits(5121, 1441), (3840, 1080));
     }
 }

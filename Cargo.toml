@@ -6,9 +6,9 @@ description = "Native RDP server for Hyprland"
 license = "MIT"
 
 [features]
-# Keep the default build software-only so Arch/libva updates do not break
-# installation. VA-API can be enabled explicitly with `--features vaapi`.
-default = []
+# Standard builds include VA-API. Use `--no-default-features` for a
+# software-only build.
+default = ["vaapi"]
 vaapi = ["dep:libva-sys"]
 
 [dependencies]
@@ -26,10 +26,8 @@ ironrdp-core = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "5469bd1
 ironrdp-displaycontrol = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "5469bd1411ca5cea34832c9555cca185ff7e0111" }
 ironrdp-graphics = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "5469bd1411ca5cea34832c9555cca185ff7e0111" }
 
-# H.264 encoding (OpenH264 software encoder)
+# H.264 encoding (FFmpeg/libavcodec software encoder)
 ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format"] }
-openh264 = { version = "0.9", features = ["libloading"] }
-openh264-sys2 = { version = "0.9.6", features = ["libloading"] }
 yuv = "0.8.14"
 
 # Async runtime
@@ -70,5 +68,6 @@ serde_json = "1"
 rustls = { version = "0.23", default-features = false }
 
 [dev-dependencies]
+openh264 = { version = "0.9", features = ["libloading"] }
 png = "0.18.1"
 proptest = "1"
