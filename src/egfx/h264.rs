@@ -1079,10 +1079,8 @@ mod tests {
         mark_ffmpeg_h264_keyframe(&mut frame);
 
         assert_eq!(frame.kind(), ffmpeg::picture::Type::I);
-        assert!(
-            frame.is_key(),
-            "FFmpeg 8 key frames are marked with AV_FRAME_FLAG_KEY"
-        );
+        let frame_flags = unsafe { (*frame.as_ptr()).flags };
+        assert_ne!(frame_flags & ffmpeg::ffi::AV_FRAME_FLAG_KEY, 0);
     }
 
     #[test]
