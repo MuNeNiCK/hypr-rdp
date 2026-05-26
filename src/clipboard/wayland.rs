@@ -463,8 +463,8 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
 
                 if should_send {
                     if let Some(data) = state.source_data.lock().ok().and_then(|g| g.clone()) {
-                        let mut file = std::fs::File::from(fd);
-                        let _ = file.write_all(&data);
+                        let file = std::fs::File::from(fd);
+                        write_source_data(file, &data);
                     }
                 }
             }
@@ -486,3 +486,45 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
 
 delegate_noop!(ClipState: ignore wl_seat::WlSeat);
 delegate_noop!(ClipState: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);
+
+fn write_source_data<W: Write>(mut writer: W, data: &[u8]) -> bool {
+    match writer.write_all(data) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!("Clipboard: failed to write source data: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+
+    use super::*;
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::other("write failed"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn source_data_writer_reports_successful_write() {
+        let mut out = Vec::new();
+
+        assert!(write_source_data(&mut out, b"clipboard"));
+        assert_eq!(out, b"clipboard");
+    }
+
+    #[test]
+    fn source_data_writer_reports_failed_write() {
+        assert!(!write_source_data(FailingWriter, b"clipboard"));
+    }
+}

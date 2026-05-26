@@ -317,7 +317,7 @@ impl HyprCliprdrBackend {
         let pending_write = Arc::clone(&self.pending_write);
         let running = Arc::clone(&self.running);
 
-        let handle = thread::Builder::new()
+        match thread::Builder::new()
             .name("clipboard-watcher".into())
             .spawn(move || {
                 if let Err(e) = clipboard_thread(
@@ -330,12 +330,14 @@ impl HyprCliprdrBackend {
                 ) {
                     tracing::error!("Clipboard thread error: {:#}", e);
                 }
-            })
-            .ok();
-
-        if let Some(h) = handle {
-            self.watcher_thread = Some(h);
-            tracing::info!("Clipboard: watching via wlr-data-control-v1");
+            }) {
+            Ok(handle) => {
+                self.watcher_thread = Some(handle);
+                tracing::info!("Clipboard: watching via wlr-data-control-v1");
+            }
+            Err(e) => {
+                tracing::error!("Clipboard: failed to spawn watcher thread: {}", e);
+            }
         }
     }
 }
