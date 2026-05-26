@@ -1,7 +1,10 @@
 use std::fmt;
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use ironrdp_rdpsnd::pdu::AudioFormat;
 use ironrdp_rdpsnd::server::RdpsndServerHandler;
@@ -10,6 +13,44 @@ use tokio::sync::mpsc;
 
 use super::format::{advertised_format, BITS_PER_SAMPLE, CHANNELS, SAMPLE_RATE};
 use super::pipewire::run_capture;
+
+const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+type AudioStartupStatus = Result<(), String>;
+
+trait AudioCaptureRunner: Send + Sync {
+    fn spawn(
+        &self,
+        sender: mpsc::UnboundedSender<ServerEvent>,
+        stop_signal: Arc<AtomicBool>,
+        startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+    ) -> io::Result<thread::JoinHandle<()>>;
+}
+
+struct PipeWireCaptureRunner;
+
+impl AudioCaptureRunner for PipeWireCaptureRunner {
+    fn spawn(
+        &self,
+        sender: mpsc::UnboundedSender<ServerEvent>,
+        stop_signal: Arc<AtomicBool>,
+        startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+    ) -> io::Result<thread::JoinHandle<()>> {
+        thread::Builder::new()
+            .name("pipewire-audio".into())
+            .spawn(move || {
+                pipewire::init();
+
+                if let Err(e) = run_capture(sender, Arc::clone(&stop_signal), Some(startup_tx)) {
+                    tracing::error!("Audio: PipeWire capture error: {:#}", e);
+                }
+
+                // SAFETY: Called once per init(), after all PipeWire resources are dropped
+                unsafe {
+                    pipewire::deinit();
+                }
+            })
+    }
+}
 
 pub struct HyprSoundFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
@@ -33,6 +74,7 @@ impl SoundServerFactory for HyprSoundFactory {
             event_sender: self.event_sender.clone(),
             stop_signal: None,
             capture_thread: None,
+            capture_runner: Arc::new(PipeWireCaptureRunner),
             formats: vec![advertised_format()],
         })
     }
@@ -42,6 +84,7 @@ struct HyprSoundHandler {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     stop_signal: Option<Arc<AtomicBool>>,
     capture_thread: Option<thread::JoinHandle<()>>,
+    capture_runner: Arc<dyn AudioCaptureRunner>,
     formats: Vec<AudioFormat>,
 }
 
@@ -81,30 +124,43 @@ impl RdpsndServerHandler for HyprSoundHandler {
         };
 
         let stop_signal = Arc::new(AtomicBool::new(false));
-        self.stop_signal = Some(Arc::clone(&stop_signal));
+        let (startup_tx, startup_rx) = std_mpsc::channel();
 
-        let sender = sender.clone();
-
-        match thread::Builder::new()
-            .name("pipewire-audio".into())
-            .spawn(move || {
-                pipewire::init();
-
-                if let Err(e) = run_capture(sender, Arc::clone(&stop_signal)) {
-                    tracing::error!("Audio: PipeWire capture error: {:#}", e);
+        let handle =
+            match self
+                .capture_runner
+                .spawn(sender.clone(), Arc::clone(&stop_signal), startup_tx)
+            {
+                Ok(handle) => handle,
+                Err(e) => {
+                    tracing::error!("Audio: failed to spawn capture thread: {}", e);
+                    return None;
                 }
+            };
 
-                // SAFETY: Called once per init(), after all PipeWire resources are dropped
-                unsafe {
-                    pipewire::deinit();
-                }
-            }) {
-            Ok(handle) => {
+        match startup_rx.recv_timeout(AUDIO_STARTUP_TIMEOUT) {
+            Ok(Ok(())) => {
+                self.stop_signal = Some(stop_signal);
                 self.capture_thread = Some(handle);
             }
-            Err(e) => {
-                tracing::error!("Audio: failed to spawn capture thread: {}", e);
-                self.stop_signal = None;
+            Ok(Err(e)) => {
+                tracing::error!("Audio: PipeWire startup failed: {}", e);
+                let _ = handle.join();
+                return None;
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                tracing::error!(
+                    timeout_ms = AUDIO_STARTUP_TIMEOUT.as_millis(),
+                    "Audio: timed out waiting for PipeWire startup"
+                );
+                stop_signal.store(true, Ordering::SeqCst);
+                self.stop_signal = Some(stop_signal);
+                self.capture_thread = Some(handle);
+                return None;
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!("Audio: capture thread exited before reporting startup");
+                let _ = handle.join();
                 return None;
             }
         }
@@ -153,6 +209,78 @@ mod tests {
 
     use super::*;
     use crate::audio::format::BLOCK_ALIGN;
+
+    struct PanicRunner;
+
+    impl AudioCaptureRunner for PanicRunner {
+        fn spawn(
+            &self,
+            _sender: mpsc::UnboundedSender<ServerEvent>,
+            _stop_signal: Arc<AtomicBool>,
+            _startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            panic!("capture runner should not be called")
+        }
+    }
+
+    struct ReadyRunner;
+
+    impl AudioCaptureRunner for ReadyRunner {
+        fn spawn(
+            &self,
+            _sender: mpsc::UnboundedSender<ServerEvent>,
+            stop_signal: Arc<AtomicBool>,
+            startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            Ok(thread::spawn(move || {
+                let _ = startup_tx.send(Ok(()));
+                while !stop_signal.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }))
+        }
+    }
+
+    struct FailingStartupRunner;
+
+    impl AudioCaptureRunner for FailingStartupRunner {
+        fn spawn(
+            &self,
+            _sender: mpsc::UnboundedSender<ServerEvent>,
+            _stop_signal: Arc<AtomicBool>,
+            startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            Ok(thread::spawn(move || {
+                let _ = startup_tx.send(Err("PipeWire unavailable".to_string()));
+            }))
+        }
+    }
+
+    struct SpawnErrorRunner;
+
+    impl AudioCaptureRunner for SpawnErrorRunner {
+        fn spawn(
+            &self,
+            _sender: mpsc::UnboundedSender<ServerEvent>,
+            _stop_signal: Arc<AtomicBool>,
+            _startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            Err(io::Error::other("spawn failed"))
+        }
+    }
+
+    fn handler_with_runner(
+        event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+        capture_runner: Arc<dyn AudioCaptureRunner>,
+    ) -> HyprSoundHandler {
+        HyprSoundHandler {
+            event_sender,
+            stop_signal: None,
+            capture_thread: None,
+            capture_runner,
+            formats: vec![advertised_format()],
+        }
+    }
 
     fn client_formats(formats: Vec<AudioFormat>) -> ClientAudioFormatPdu {
         ClientAudioFormatPdu {
@@ -212,12 +340,7 @@ mod tests {
 
     #[test]
     fn start_rejects_matching_format_when_event_sender_is_missing() {
-        let mut handler = HyprSoundHandler {
-            event_sender: None,
-            stop_signal: None,
-            capture_thread: None,
-            formats: vec![advertised_format()],
-        };
+        let mut handler = handler_with_runner(None, Arc::new(PanicRunner));
         let client_format = client_formats(vec![advertised_format()]);
 
         assert_eq!(handler.start(&client_format), None);
@@ -228,13 +351,45 @@ mod tests {
     #[test]
     fn start_rejects_unsupported_client_format_before_capture_spawn() {
         let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
-        let mut handler = HyprSoundHandler {
-            event_sender: Some(sender),
-            stop_signal: None,
-            capture_thread: None,
-            formats: vec![advertised_format()],
-        };
+        let mut handler = handler_with_runner(Some(sender), Arc::new(PanicRunner));
         let client_format = client_formats(vec![pcm_format(48000, CHANNELS, BITS_PER_SAMPLE)]);
+
+        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.stop_signal.is_none());
+        assert!(handler.capture_thread.is_none());
+    }
+
+    #[test]
+    fn start_accepts_matching_format_after_capture_runner_reports_ready() {
+        let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
+        let mut handler = handler_with_runner(Some(sender), Arc::new(ReadyRunner));
+        let client_format = client_formats(vec![advertised_format()]);
+
+        assert_eq!(handler.start(&client_format), Some(0));
+        assert!(handler.stop_signal.is_some());
+        assert!(handler.capture_thread.is_some());
+
+        handler.stop();
+        assert!(handler.stop_signal.is_none());
+        assert!(handler.capture_thread.is_none());
+    }
+
+    #[test]
+    fn start_rejects_matching_format_when_capture_startup_fails() {
+        let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
+        let mut handler = handler_with_runner(Some(sender), Arc::new(FailingStartupRunner));
+        let client_format = client_formats(vec![advertised_format()]);
+
+        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.stop_signal.is_none());
+        assert!(handler.capture_thread.is_none());
+    }
+
+    #[test]
+    fn start_rejects_matching_format_when_capture_spawn_fails() {
+        let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
+        let mut handler = handler_with_runner(Some(sender), Arc::new(SpawnErrorRunner));
+        let client_format = client_formats(vec![advertised_format()]);
 
         assert_eq!(handler.start(&client_format), None);
         assert!(handler.stop_signal.is_none());

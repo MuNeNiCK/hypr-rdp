@@ -1,4 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 
 use ironrdp_rdpsnd::server::RdpsndServerMessage;
@@ -21,6 +22,29 @@ struct CaptureData {
 pub(super) fn run_capture(
     sender: mpsc::UnboundedSender<ServerEvent>,
     stop_signal: Arc<AtomicBool>,
+    startup_tx: Option<std_mpsc::Sender<Result<(), String>>>,
+) -> anyhow::Result<()> {
+    let mut startup_tx = startup_tx;
+    let result = run_capture_inner(sender, stop_signal, &mut startup_tx);
+    if let Err(e) = &result {
+        report_startup_status(&mut startup_tx, Err(format!("{e:#}")));
+    }
+    result
+}
+
+fn report_startup_status(
+    startup_tx: &mut Option<std_mpsc::Sender<Result<(), String>>>,
+    status: Result<(), String>,
+) {
+    if let Some(tx) = startup_tx.take() {
+        let _ = tx.send(status);
+    }
+}
+
+fn run_capture_inner(
+    sender: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
+    stop_signal: Arc<AtomicBool>,
+    startup_tx: &mut Option<std_mpsc::Sender<Result<(), String>>>,
 ) -> anyhow::Result<()> {
     use pipewire as pw;
     use pw::spa;
@@ -171,6 +195,7 @@ pub(super) fn run_capture(
         .connect(spa::utils::Direction::Input, None, flags, &mut [pod])
         .map_err(|_| anyhow::anyhow!("Failed to connect PipeWire stream"))?;
 
+    report_startup_status(startup_tx, Ok(()));
     tracing::trace!("Audio: PipeWire stream connected, entering main loop");
 
     let loop_ref = mainloop.loop_();
