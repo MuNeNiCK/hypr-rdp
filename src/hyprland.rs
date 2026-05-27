@@ -51,6 +51,24 @@ pub fn monitors() -> Result<serde_json::Value> {
     serde_json::from_str(&response).context("failed to parse Hyprland monitors JSON")
 }
 
+/// Query a Hyprland option string value.
+pub fn option_string(option: &str) -> Result<Option<String>> {
+    let response = send_command(&format!("j/getoption {}", option))?;
+    option_string_from_response(&response)
+        .with_context(|| format!("failed to parse Hyprland option {}", option))
+}
+
+fn option_string_from_response(response: &str) -> Result<Option<String>> {
+    let value: serde_json::Value =
+        serde_json::from_str(response).context("failed to parse Hyprland option JSON")?;
+    Ok(value
+        .get("str")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned))
+}
+
 /// Create a headless output with a custom name prefix.
 /// Hyprland will name it `{name}-1`, `{name}-2`, etc.
 pub fn output_create_headless(name: &str) -> Result<()> {
@@ -137,5 +155,29 @@ impl EventStream {
                 Err(e) => return Err(e).context("failed to read Hyprland event"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::option_string_from_response;
+
+    #[test]
+    fn option_string_parser_returns_non_empty_string_values() {
+        let value = option_string_from_response(
+            r#"{"option":"input:kb_layout","str":" de , us ","set":true}"#,
+        )
+        .expect("option parses");
+
+        assert_eq!(value.as_deref(), Some("de , us"));
+    }
+
+    #[test]
+    fn option_string_parser_treats_empty_strings_as_unset() {
+        let value =
+            option_string_from_response(r#"{"option":"input:kb_variant","str":"","set":true}"#)
+                .expect("option parses");
+
+        assert_eq!(value, None);
     }
 }

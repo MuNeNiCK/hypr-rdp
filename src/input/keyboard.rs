@@ -13,6 +13,56 @@ const KEY_NUMLOCK: u32 = 69;
 const KEY_SCROLLLOCK: u32 = 70;
 const KEY_KATAKANAHIRAGANA: u32 = 93;
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct XkbKeymapNames {
+    pub(super) layout: Option<String>,
+    pub(super) variant: Option<String>,
+    pub(super) options: Option<String>,
+}
+
+impl XkbKeymapNames {
+    pub(super) fn is_empty(&self) -> bool {
+        self.layout.is_none() && self.variant.is_none() && self.options.is_none()
+    }
+}
+
+pub(super) fn xkb_names_for_rdp_keyboard_layout(keyboard_layout: u32) -> Option<XkbKeymapNames> {
+    let layout_id = keyboard_layout & 0xffff;
+    let layout = match layout_id {
+        0x0401 => "ara",
+        0x0404 | 0x0804 | 0x0c04 | 0x1004 | 0x1404 => "cn",
+        0x0405 => "cz",
+        0x0406 => "dk",
+        0x0407 => "de",
+        0x0408 => "gr",
+        0x0409 => "us",
+        0x040a | 0x0c0a => "es",
+        0x040b => "fi",
+        0x040c => "fr",
+        0x040d => "il",
+        0x040e => "hu",
+        0x0410 => "it",
+        0x0411 => "jp",
+        0x0412 => "kr",
+        0x0413 => "nl",
+        0x0414 => "no",
+        0x0415 => "pl",
+        0x0416 => "br",
+        0x0419 => "ru",
+        0x041d => "se",
+        0x041f => "tr",
+        0x0807 => "ch",
+        0x0809 => "gb",
+        0x0816 => "pt",
+        _ => return None,
+    };
+
+    Some(XkbKeymapNames {
+        layout: Some(layout.to_owned()),
+        ..Default::default()
+    })
+}
+
 /// Evdev keycode + required modifier (e.g. Shift) for a Unicode character.
 #[derive(Clone, Copy)]
 pub(super) struct UnicodeKeyMapping {
@@ -179,17 +229,21 @@ fn locked_mask_for_key(keymap: &xkb::Keymap, evdev_key: u32) -> u32 {
 
 /// Generate XKB keymap using xkbcommon (matching compositor's format)
 pub(super) fn generate_xkb_keymap() -> Result<Vec<u8>> {
+    generate_xkb_keymap_from_names(&XkbKeymapNames::default())
+}
+
+pub(super) fn generate_xkb_keymap_from_names(names: &XkbKeymapNames) -> Result<Vec<u8>> {
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
     let keymap = xkb::Keymap::new_from_names(
         &context,
-        "",   // rules: system default
-        "",   // model: system default
-        "",   // layout: system default
-        "",   // variant: system default
-        None, // options
+        "", // rules: system default
+        "", // model: system default
+        names.layout.as_deref().unwrap_or(""),
+        names.variant.as_deref().unwrap_or(""),
+        names.options.clone(),
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
-    .context("Failed to compile XKB keymap from system defaults")?;
+    .context("Failed to compile XKB keymap")?;
     let mut keymap_data = keymap
         .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
         .into_bytes();
@@ -223,4 +277,50 @@ pub(super) fn create_keymap_fd(keymap: &[u8]) -> Result<OwnedFd> {
         bail!("lseek failed on keymap memfd");
     }
     Ok(fd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout, KeyboardStateTracker,
+        XkbKeymapNames,
+    };
+
+    #[test]
+    fn generated_keymap_honors_non_us_layout_names() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("de".into()),
+            ..Default::default()
+        })
+        .expect("German keymap compiles");
+        let tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 21);
+        assert_eq!(tracker.unicode_to_evdev('y' as u16).unwrap().evdev_key, 44);
+    }
+
+    #[test]
+    fn rdp_keyboard_layout_maps_supported_hkl_to_xkb_names() {
+        let names =
+            xkb_names_for_rdp_keyboard_layout(0xe0010411).expect("Japanese HKL is supported");
+
+        assert_eq!(names.layout.as_deref(), Some("jp"));
+        assert_eq!(names.variant, None);
+        assert_eq!(names.options, None);
+    }
+
+    #[test]
+    fn rdp_keyboard_layout_returns_none_for_unknown_hkl() {
+        assert_eq!(xkb_names_for_rdp_keyboard_layout(0x0000ffff), None);
+    }
+
+    #[test]
+    fn rdp_keyboard_layout_generated_keymap_affects_unicode_lookup() {
+        let names = xkb_names_for_rdp_keyboard_layout(0x00000407).expect("German HKL is supported");
+        let keymap = generate_xkb_keymap_from_names(&names).expect("German keymap compiles");
+        let tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 21);
+        assert_eq!(tracker.unicode_to_evdev('y' as u16).unwrap().evdev_key, 44);
+    }
 }

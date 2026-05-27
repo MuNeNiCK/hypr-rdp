@@ -1,10 +1,30 @@
-use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{ClientKeyboardData, KeyboardEvent, MouseEvent, RdpServerInputHandler};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 
-use super::keymap;
+use super::keyboard::{generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout};
 use super::wayland::HyprInputHandler;
+use super::{keymap, wayland::InputState};
 
 impl RdpServerInputHandler for HyprInputHandler {
+    fn client_keyboard_data(&mut self, keyboard_data: ClientKeyboardData) {
+        let Some(keymap_data) = client_keymap_from_keyboard_layout(keyboard_data.keyboard_layout)
+        else {
+            tracing::info!(
+                keyboard_layout = %format_args!("{:#010x}", keyboard_data.keyboard_layout),
+                keyboard_type = ?keyboard_data.keyboard_type,
+                keyboard_subtype = keyboard_data.keyboard_subtype,
+                "Client keyboard layout is not mapped to an XKB layout; keeping existing keymap"
+            );
+            return;
+        };
+
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+
+        apply_client_keymap(&mut state, keymap_data, keyboard_data);
+    }
+
     fn keyboard(&mut self, event: KeyboardEvent) {
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -171,5 +191,68 @@ impl RdpServerInputHandler for HyprInputHandler {
                 state.flush();
             }
         }
+    }
+}
+
+fn client_keymap_from_keyboard_layout(keyboard_layout: u32) -> Option<Vec<u8>> {
+    let names = xkb_names_for_rdp_keyboard_layout(keyboard_layout)?;
+    match generate_xkb_keymap_from_names(&names) {
+        Ok(keymap) => Some(keymap),
+        Err(err) => {
+            tracing::warn!(
+                keyboard_layout = %format_args!("{keyboard_layout:#010x}"),
+                layout = ?names.layout,
+                variant = ?names.variant,
+                options = ?names.options,
+                "Failed to generate XKB keymap from client keyboard layout: {:#}",
+                err
+            );
+            None
+        }
+    }
+}
+
+fn apply_client_keymap(
+    state: &mut InputState,
+    keymap_data: Vec<u8>,
+    keyboard_data: ClientKeyboardData,
+) {
+    if let Err(err) = state.apply_keymap(keymap_data, "rdp-client") {
+        tracing::warn!(
+            keyboard_layout = %format_args!("{:#010x}", keyboard_data.keyboard_layout),
+            keyboard_type = ?keyboard_data.keyboard_type,
+            keyboard_subtype = keyboard_data.keyboard_subtype,
+            "Failed to apply client keyboard keymap: {:#}",
+            err
+        );
+    } else {
+        tracing::info!(
+            keyboard_layout = %format_args!("{:#010x}", keyboard_data.keyboard_layout),
+            keyboard_type = ?keyboard_data.keyboard_type,
+            keyboard_subtype = keyboard_data.keyboard_subtype,
+            keyboard_functional_keys_count = keyboard_data.keyboard_functional_keys_count,
+            "Applied client keyboard layout"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::client_keymap_from_keyboard_layout;
+    use crate::input::keyboard::KeyboardStateTracker;
+
+    #[test]
+    fn client_keyboard_layout_generates_non_us_keymap() {
+        let keymap =
+            client_keymap_from_keyboard_layout(0x00000407).expect("German HKL is supported");
+        let tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 21);
+        assert_eq!(tracker.unicode_to_evdev('y' as u16).unwrap().evdev_key, 44);
+    }
+
+    #[test]
+    fn client_keyboard_layout_keeps_existing_keymap_when_unknown() {
+        assert!(client_keymap_from_keyboard_layout(0x0000ffff).is_none());
     }
 }

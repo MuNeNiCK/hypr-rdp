@@ -1589,7 +1589,7 @@ checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 [[package]]
 name = "ironrdp-acceptor"
 version = "0.8.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-async",
  "ironrdp-connector",
@@ -1602,7 +1602,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-ainput"
 version = "0.5.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1614,7 +1614,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-async"
 version = "0.8.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bytes",
  "ironrdp-connector",
@@ -1626,7 +1626,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr"
 version = "0.5.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1638,7 +1638,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-cliprdr-format"
 version = "0.1.4"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-core",
  "png",
@@ -1647,7 +1647,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-connector"
 version = "0.8.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-core",
  "ironrdp-error",
@@ -1665,7 +1665,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-core"
 version = "0.1.5"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-error",
 ]
@@ -1673,7 +1673,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-displaycontrol"
 version = "0.5.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -1685,7 +1685,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-dvc"
 version = "0.5.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-core",
  "ironrdp-pdu",
@@ -1697,7 +1697,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-echo"
 version = "0.1.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-core",
  "ironrdp-dvc",
@@ -1708,7 +1708,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-egfx"
 version = "0.1.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1722,12 +1722,12 @@ dependencies = [
 [[package]]
 name = "ironrdp-error"
 version = "0.1.3"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 
 [[package]]
 name = "ironrdp-graphics"
 version = "0.7.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1743,7 +1743,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-pdu"
 version = "0.7.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bit_field",
  "bitflags 2.11.1",
@@ -1766,7 +1766,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-rdpsnd"
 version = "0.7.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1778,7 +1778,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-server"
 version = "0.10.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1810,7 +1810,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-svc"
 version = "0.6.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "bitflags 2.11.1",
  "ironrdp-core",
@@ -1820,7 +1820,7 @@ dependencies = [
 [[package]]
 name = "ironrdp-tokio"
 version = "0.8.0"
-source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=5469bd1411ca5cea34832c9555cca185ff7e0111#5469bd1411ca5cea34832c9555cca185ff7e0111"
+source = "git+https://github.com/MuNeNICK/IronRDP.git?rev=541362ccffd2bc9f40e77f53e678f39ada84a4bf#541362ccffd2bc9f40e77f53e678f39ada84a4bf"
 dependencies = [
  "ironrdp-async",
  "ironrdp-connector",

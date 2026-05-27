@@ -13,7 +13,12 @@ use wayland_protocols_wlr::virtual_pointer::v1::client::{
     zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1,
 };
 
-use super::keyboard::{create_keymap_fd, generate_xkb_keymap, KeyboardStateTracker};
+use crate::hyprland;
+
+use super::keyboard::{
+    create_keymap_fd, generate_xkb_keymap, generate_xkb_keymap_from_names, KeyboardStateTracker,
+    XkbKeymapNames,
+};
 use super::layout::SharedOutputLayout;
 use super::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1};
 
@@ -51,6 +56,28 @@ impl InputState {
         if let Err(e) = self.conn.flush() {
             tracing::warn!("Wayland flush failed: {}", e);
         }
+    }
+
+    pub(super) fn apply_keymap(
+        &mut self,
+        keymap_data: Vec<u8>,
+        keymap_source: &'static str,
+    ) -> Result<()> {
+        let keyboard_state = KeyboardStateTracker::new(&keymap_data)?;
+        let keymap_fd = create_keymap_fd(&keymap_data)?;
+        self.vk
+            .keymap(1, keymap_fd.as_fd(), keymap_data.len() as u32);
+        keyboard_state.send_modifiers(&self.vk);
+        self.keyboard_state = keyboard_state;
+        self.flush();
+
+        tracing::info!(
+            len = keymap_data.len(),
+            keymap_source,
+            "Applied keyboard keymap"
+        );
+
+        Ok(())
     }
 }
 
@@ -122,13 +149,26 @@ impl HyprInputHandler {
 
         let (keymap_data, keymap_source) =
             load_keymap(&mut event_queue, &mut wl_state, &seat, &qh)?;
-        let keyboard_state = KeyboardStateTracker::new(&keymap_data)?;
+        let input_state = InputState {
+            conn,
+            event_queue,
+            wl_state,
+            vk,
+            vp,
+            keyboard_state: KeyboardStateTracker::new(&keymap_data)?,
+            output_layout,
+            epoch: Instant::now(),
+        };
         let keymap_fd = create_keymap_fd(&keymap_data)?;
-        vk.keymap(1, keymap_fd.as_fd(), keymap_data.len() as u32); // 1 = XKB_V1
-        keyboard_state.send_modifiers(&vk);
+        input_state
+            .vk
+            .keymap(1, keymap_fd.as_fd(), keymap_data.len() as u32); // 1 = XKB_V1
+        input_state.keyboard_state.send_modifiers(&input_state.vk);
 
         // Flush to send all pending requests
-        conn.flush()
+        input_state
+            .conn
+            .flush()
             .context("Wayland flush after input setup failed")?;
 
         tracing::info!(
@@ -142,16 +182,7 @@ impl HyprInputHandler {
             "Input handler initialized (virtual keyboard + pointer)"
         );
 
-        let state = Arc::new(Mutex::new(InputState {
-            conn,
-            event_queue,
-            wl_state,
-            vk,
-            vp,
-            keyboard_state,
-            output_layout,
-            epoch: Instant::now(),
-        }));
+        let state = Arc::new(Mutex::new(input_state));
 
         Ok(Self { state })
     }
@@ -179,9 +210,59 @@ fn load_keymap(
         tracing::warn!("Wayland seat has no keyboard capability, using fallback keymap");
     }
 
+    generate_fallback_keymap()
+}
+
+fn generate_fallback_keymap() -> Result<(Vec<u8>, &'static str)> {
+    generate_fallback_keymap_from_names(hyprland_xkb_keymap_names())
+}
+
+fn generate_fallback_keymap_from_names(
+    hyprland_names: Result<XkbKeymapNames>,
+) -> Result<(Vec<u8>, &'static str)> {
+    let names = match hyprland_names {
+        Ok(names) => names,
+        Err(err) => {
+            tracing::warn!("Failed to query Hyprland keyboard options: {:#}", err);
+            XkbKeymapNames::default()
+        }
+    };
+
+    if !names.is_empty() {
+        match generate_xkb_keymap_from_names(&names) {
+            Ok(keymap) => {
+                tracing::info!(
+                    len = keymap.len(),
+                    layout = ?names.layout,
+                    variant = ?names.variant,
+                    options = ?names.options,
+                    "Generated Hyprland fallback keyboard keymap"
+                );
+                return Ok((keymap, "hyprland"));
+            }
+            Err(err) => {
+                tracing::warn!(
+                    layout = ?names.layout,
+                    variant = ?names.variant,
+                    options = ?names.options,
+                    "Failed to generate Hyprland fallback keymap, using xkb defaults: {:#}",
+                    err
+                );
+            }
+        }
+    }
+
     let fallback = generate_xkb_keymap()?;
     tracing::info!(len = fallback.len(), "Generated fallback keyboard keymap");
     Ok((fallback, "fallback"))
+}
+
+fn hyprland_xkb_keymap_names() -> Result<XkbKeymapNames> {
+    Ok(XkbKeymapNames {
+        layout: hyprland::option_string("input:kb_layout")?,
+        variant: hyprland::option_string("input:kb_variant")?,
+        options: hyprland::option_string("input:kb_options")?,
+    })
 }
 
 fn take_loaded_keymap(wl_state: &mut WlState) -> Result<Option<(Vec<u8>, &'static str)>> {
@@ -349,6 +430,19 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for WlState
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallback_keymap_uses_hyprland_layout_names_when_present() {
+        let (keymap, source) = generate_fallback_keymap_from_names(Ok(XkbKeymapNames {
+            layout: Some("de".into()),
+            ..Default::default()
+        }))
+        .expect("Hyprland fallback keymap compiles");
+
+        let tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+        assert_eq!(source, "hyprland");
+        assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 21);
+    }
 
     #[test]
     fn keymap_selection_accepts_compositor_keymap_for_keyboard_seat() {
