@@ -17,11 +17,24 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 ### AUR (Arch Linux)
 
 ```sh
-# Latest git (recommended)
-yay -S hypr-rdp-git
-
 # Stable release
 yay -S hypr-rdp
+
+# Latest git build
+yay -S hypr-rdp-git
+```
+
+### Nix
+
+```sh
+# Run from GitHub
+nix run github:MuNeNICK/hypr-rdp#hypr-rdp -- --help
+
+# Build from GitHub
+nix build github:MuNeNICK/hypr-rdp#hypr-rdp
+
+# Development shell
+nix develop
 ```
 
 ### Prebuilt binary
