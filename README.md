@@ -34,7 +34,7 @@ nix run github:MuNeNICK/hypr-rdp#hypr-rdp -- --help
 nix build github:MuNeNICK/hypr-rdp#hypr-rdp
 
 # Development shell
-nix develop
+nix develop github:MuNeNICK/hypr-rdp#hypr-rdp
 ```
 
 ### Prebuilt binary
