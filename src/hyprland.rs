@@ -76,8 +76,30 @@ pub fn output_create_headless(name: &str) -> Result<()> {
 }
 
 /// Set a monitor keyword rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").
+///
+/// Hyprland's new (Lua) config parser rejects `keyword` with
+/// "keyword can't work with non-legacy parsers. Use eval."
+/// In that case, retry as `eval hl.monitor({...})`.
 pub fn keyword_monitor(rule: &str) -> Result<()> {
-    send_action(&format!("keyword monitor {}", rule))
+    match send_action(&format!("keyword monitor {}", rule)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.to_string().contains("non-legacy parsers") => {
+            let lua = monitor_rule_to_lua(rule)?;
+            send_action(&format!("eval {}", lua))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn monitor_rule_to_lua(rule: &str) -> Result<String> {
+    let parts: Vec<&str> = rule.splitn(4, ',').collect();
+    let [output, mode, position, scale] = parts.as_slice() else {
+        bail!("cannot translate monitor rule to Lua (expected 4 fields): {}", rule);
+    };
+    Ok(format!(
+        r#"hl.monitor({{ output = "{}", mode = "{}", position = "{}", scale = "{}" }})"#,
+        output, mode, position, scale
+    ))
 }
 
 /// Remove a named output.
