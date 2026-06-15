@@ -101,6 +101,7 @@ bitrate = 10000000
 quality = 23
 fps = 30
 egfx_codec = "avc420"
+# keyboard_layout_policy = "client"
 # output = "DP-1"
 ```
 
@@ -123,6 +124,7 @@ CLI arguments override config file values.
 | `--fps` | Max framerate | `30` |
 | `--max-frames-in-flight` | Max unacknowledged EGFX frames | `3` |
 | `--egfx-codec` | EGFX codec policy: `avc420`, experimental `avc444`, or `auto` | `avc420` |
+| `--keyboard-layout-policy` | Keyboard layout policy: `client` applies the RDP client layout; `compositor` keeps the compositor/Hyprland keymap | `client` |
 | `--output` | Specific output name | _(headless)_ |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
 

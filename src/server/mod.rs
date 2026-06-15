@@ -34,6 +34,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         fps,
         max_frames_in_flight,
         egfx_codec,
+        keyboard_layout_policy,
         resolution_fixed,
         output,
     } = config;
@@ -61,8 +62,9 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     .await
     .context("failed to initialize display capture")?;
     egfx_shared.set_surface_size(rdp_width, rdp_height);
-    let input_handler = HyprInputHandler::new(rdp_width, rdp_height, output_layout)
-        .context("failed to initialize input handler")?;
+    let input_handler =
+        HyprInputHandler::new(rdp_width, rdp_height, output_layout, keyboard_layout_policy)
+            .context("failed to initialize input handler")?;
 
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();

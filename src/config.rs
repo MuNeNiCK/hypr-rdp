@@ -5,6 +5,7 @@ use serde::Deserialize;
 
 use crate::capture::CaptureMode;
 use crate::egfx::{EgfxCodecPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+use crate::input::KeyboardLayoutPolicy;
 
 #[derive(Parser, Debug)]
 #[command(name = "hypr-rdp", version, about = "Native RDP server for Hyprland")]
@@ -61,6 +62,10 @@ struct Args {
     #[arg(long)]
     egfx_codec: Option<String>,
 
+    /// Keyboard layout policy: "client" (default) or "compositor"
+    #[arg(long)]
+    keyboard_layout_policy: Option<String>,
+
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
     output: Option<String>,
@@ -85,6 +90,7 @@ struct ConfigFile {
     fps: Option<u32>,
     max_frames_in_flight: Option<u32>,
     egfx_codec: Option<String>,
+    keyboard_layout_policy: Option<String>,
     output: Option<String>,
 }
 
@@ -147,6 +153,7 @@ pub struct RuntimeConfig {
     pub fps: u32,
     pub max_frames_in_flight: u32,
     pub egfx_codec: EgfxCodecPolicy,
+    pub keyboard_layout_policy: KeyboardLayoutPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
 }
@@ -196,6 +203,10 @@ impl RuntimeConfig {
             .or(config.max_frames_in_flight)
             .unwrap_or(DEFAULT_MAX_FRAMES_IN_FLIGHT);
         let egfx_codec = resolve_egfx_codec_policy(args.egfx_codec, config.egfx_codec)?;
+        let keyboard_layout_policy = resolve_keyboard_layout_policy(
+            args.keyboard_layout_policy,
+            config.keyboard_layout_policy,
+        )?;
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
@@ -225,6 +236,7 @@ impl RuntimeConfig {
             fps,
             max_frames_in_flight,
             egfx_codec,
+            keyboard_layout_policy,
             resolution_fixed,
             output,
         })
@@ -259,6 +271,17 @@ fn parse_egfx_codec_policy(s: &str) -> anyhow::Result<EgfxCodecPolicy> {
     }
 }
 
+fn parse_keyboard_layout_policy(s: &str) -> anyhow::Result<KeyboardLayoutPolicy> {
+    match s {
+        "client" => Ok(KeyboardLayoutPolicy::Client),
+        "compositor" => Ok(KeyboardLayoutPolicy::Compositor),
+        other => anyhow::bail!(
+            "unknown keyboard layout policy '{}', expected 'client' or 'compositor'",
+            other
+        ),
+    }
+}
+
 fn default_egfx_codec_policy_name() -> String {
     "avc420".into()
 }
@@ -271,6 +294,20 @@ fn resolve_egfx_codec_policy(
         .or(config_value)
         .unwrap_or_else(default_egfx_codec_policy_name);
     parse_egfx_codec_policy(&value)
+}
+
+fn default_keyboard_layout_policy_name() -> String {
+    "client".into()
+}
+
+fn resolve_keyboard_layout_policy(
+    cli_value: Option<String>,
+    config_value: Option<String>,
+) -> anyhow::Result<KeyboardLayoutPolicy> {
+    let value = cli_value
+        .or(config_value)
+        .unwrap_or_else(default_keyboard_layout_policy_name);
+    parse_keyboard_layout_policy(&value)
 }
 
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
@@ -365,10 +402,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_keyboard_layout_policy_values() {
+        assert_eq!(
+            parse_keyboard_layout_policy("client").unwrap(),
+            KeyboardLayoutPolicy::Client
+        );
+        assert_eq!(
+            parse_keyboard_layout_policy("compositor").unwrap(),
+            KeyboardLayoutPolicy::Compositor
+        );
+        assert!(parse_keyboard_layout_policy("hyprland").is_err());
+    }
+
+    #[test]
     fn default_egfx_codec_policy_is_avc420() {
         let policy = resolve_egfx_codec_policy(None, None).unwrap();
 
         assert_eq!(policy, EgfxCodecPolicy::Avc420);
+    }
+
+    #[test]
+    fn default_keyboard_layout_policy_uses_client_layout() {
+        let policy = resolve_keyboard_layout_policy(None, None).unwrap();
+
+        assert_eq!(policy, KeyboardLayoutPolicy::Client);
     }
 
     #[test]
@@ -380,6 +437,19 @@ mod tests {
         assert_eq!(
             resolve_egfx_codec_policy(Some("avc420".into()), Some("avc444".into())).unwrap(),
             EgfxCodecPolicy::Avc420
+        );
+    }
+
+    #[test]
+    fn explicit_keyboard_layout_policy_overrides_default_and_config() {
+        assert_eq!(
+            resolve_keyboard_layout_policy(None, Some("compositor".into())).unwrap(),
+            KeyboardLayoutPolicy::Compositor
+        );
+        assert_eq!(
+            resolve_keyboard_layout_policy(Some("client".into()), Some("compositor".into()))
+                .unwrap(),
+            KeyboardLayoutPolicy::Client
         );
     }
 
@@ -397,6 +467,17 @@ mod tests {
 
         let ext = Args::try_parse_from(["hypr-rdp", "--capture-mode", "ext"]).unwrap();
         assert_eq!(ext.capture_mode.as_deref(), Some("ext"));
+    }
+
+    #[test]
+    fn cli_accepts_keyboard_layout_policy_values() {
+        let compositor =
+            Args::try_parse_from(["hypr-rdp", "--keyboard-layout-policy", "compositor"]).unwrap();
+
+        assert_eq!(
+            compositor.keyboard_layout_policy.as_deref(),
+            Some("compositor")
+        );
     }
 
     proptest! {
@@ -457,6 +538,15 @@ mod tests {
                 }
                 _ => {
                     prop_assert!(parse_rate_control(&token).is_err());
+                }
+            }
+
+            match token.as_str() {
+                "client" | "compositor" => {
+                    prop_assert!(parse_keyboard_layout_policy(&token).is_ok());
+                }
+                _ => {
+                    prop_assert!(parse_keyboard_layout_policy(&token).is_err());
                 }
             }
         }

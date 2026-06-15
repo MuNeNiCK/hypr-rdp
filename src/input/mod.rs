@@ -5,5 +5,11 @@ mod rdp;
 mod virtual_keyboard;
 mod wayland;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyboardLayoutPolicy {
+    Client,
+    Compositor,
+}
+
 pub use layout::SharedOutputLayout;
 pub use wayland::HyprInputHandler;

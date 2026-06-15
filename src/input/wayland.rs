@@ -21,6 +21,7 @@ use super::keyboard::{
 };
 use super::layout::SharedOutputLayout;
 use super::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1};
+use super::KeyboardLayoutPolicy;
 
 /// Shared state for sending input commands to the Wayland thread
 pub(super) struct InputState {
@@ -83,6 +84,7 @@ impl InputState {
 
 pub struct HyprInputHandler {
     pub(super) state: Arc<Mutex<InputState>>,
+    pub(super) keyboard_layout_policy: KeyboardLayoutPolicy,
 }
 
 impl HyprInputHandler {
@@ -90,6 +92,7 @@ impl HyprInputHandler {
         rdp_width: u16,
         rdp_height: u16,
         output_layout: Arc<SharedOutputLayout>,
+        keyboard_layout_policy: KeyboardLayoutPolicy,
     ) -> Result<Self> {
         let layout = output_layout
             .snapshot()
@@ -184,7 +187,10 @@ impl HyprInputHandler {
 
         let state = Arc::new(Mutex::new(input_state));
 
-        Ok(Self { state })
+        Ok(Self {
+            state,
+            keyboard_layout_policy,
+        })
     }
 }
 
