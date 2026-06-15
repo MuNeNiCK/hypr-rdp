@@ -75,7 +75,7 @@ pub fn output_create_headless(name: &str) -> Result<()> {
     send_action(&format!("output create headless {}", name))
 }
 
-/// Set a monitor keyword rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").
+/// Set a monitor rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").
 ///
 /// Hyprland's new (Lua) config parser rejects `keyword` with
 /// "keyword can't work with non-legacy parsers. Use eval."
@@ -83,23 +83,69 @@ pub fn output_create_headless(name: &str) -> Result<()> {
 pub fn keyword_monitor(rule: &str) -> Result<()> {
     match send_action(&format!("keyword monitor {}", rule)) {
         Ok(()) => Ok(()),
-        Err(e) if e.to_string().contains("non-legacy parsers") => {
-            let lua = monitor_rule_to_lua(rule)?;
-            send_action(&format!("eval {}", lua))
+        Err(e) if is_non_legacy_parser_error(&e) => {
+            send_action(&format!("eval {}", monitor_rule_to_lua(rule)?))
         }
         Err(e) => Err(e),
     }
 }
 
+fn is_non_legacy_parser_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("non-legacy parsers"))
+}
+
 fn monitor_rule_to_lua(rule: &str) -> Result<String> {
-    let parts: Vec<&str> = rule.splitn(4, ',').collect();
+    let parts: Vec<&str> = rule.splitn(4, ',').map(str::trim).collect();
     let [output, mode, position, scale] = parts.as_slice() else {
-        bail!("cannot translate monitor rule to Lua (expected 4 fields): {}", rule);
+        bail!(
+            "cannot translate monitor rule to Lua (expected 4 fields): {}",
+            rule
+        );
     };
+
     Ok(format!(
-        r#"hl.monitor({{ output = "{}", mode = "{}", position = "{}", scale = "{}" }})"#,
-        output, mode, position, scale
+        "hl.monitor({{ output = {}, mode = {}, position = {}, scale = {} }})",
+        lua_string(output)?,
+        lua_string(mode)?,
+        lua_string(position)?,
+        monitor_scale_to_lua(scale)?
     ))
+}
+
+fn monitor_scale_to_lua(scale: &str) -> Result<String> {
+    if scale.is_empty() {
+        bail!("cannot translate monitor rule to Lua with empty scale");
+    }
+
+    if let Ok(value) = scale.parse::<f64>() {
+        if value.is_finite() {
+            return Ok(scale.to_string());
+        }
+    }
+
+    lua_string(scale)
+}
+
+fn lua_string(value: &str) -> Result<String> {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('"');
+
+    for ch in value.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => bail!("cannot encode control character in Lua string"),
+            ch => escaped.push(ch),
+        }
+    }
+
+    escaped.push('"');
+    Ok(escaped)
 }
 
 /// Remove a named output.
@@ -182,7 +228,9 @@ impl EventStream {
 
 #[cfg(test)]
 mod tests {
-    use super::option_string_from_response;
+    use anyhow::anyhow;
+
+    use super::{is_non_legacy_parser_error, monitor_rule_to_lua, option_string_from_response};
 
     #[test]
     fn option_string_parser_returns_non_empty_string_values() {
@@ -201,5 +249,60 @@ mod tests {
                 .expect("option parses");
 
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn monitor_rule_to_lua_translates_generated_headless_rule() {
+        let lua = monitor_rule_to_lua("hypr-rdp-1,1920x1080@60,-9999x0,1")
+            .expect("monitor rule translates");
+
+        assert_eq!(
+            lua,
+            r#"hl.monitor({ output = "hypr-rdp-1", mode = "1920x1080@60", position = "-9999x0", scale = 1 })"#
+        );
+    }
+
+    #[test]
+    fn monitor_rule_to_lua_quotes_non_numeric_scale() {
+        let lua = monitor_rule_to_lua("DP-1,preferred,auto,auto").expect("monitor rule translates");
+
+        assert_eq!(
+            lua,
+            r#"hl.monitor({ output = "DP-1", mode = "preferred", position = "auto", scale = "auto" })"#
+        );
+    }
+
+    #[test]
+    fn monitor_rule_to_lua_escapes_lua_strings() {
+        let lua =
+            monitor_rule_to_lua(r#"DP-"1,modeline 1\2,0x0,1"#).expect("monitor rule translates");
+
+        assert_eq!(
+            lua,
+            r#"hl.monitor({ output = "DP-\"1", mode = "modeline 1\\2", position = "0x0", scale = 1 })"#
+        );
+    }
+
+    #[test]
+    fn monitor_rule_to_lua_rejects_malformed_rules() {
+        let err = monitor_rule_to_lua("hypr-rdp-1,1920x1080@60,-9999x0")
+            .expect_err("malformed rule is rejected");
+
+        assert!(err.to_string().contains("expected 4 fields"));
+    }
+
+    #[test]
+    fn non_legacy_parser_error_detection_matches_hyprland_message() {
+        let err =
+            anyhow!("Hyprland IPC error: keyword can't work with non-legacy parsers. Use eval.");
+
+        assert!(is_non_legacy_parser_error(&err));
+    }
+
+    #[test]
+    fn non_legacy_parser_error_detection_ignores_other_errors() {
+        let err = anyhow!("Hyprland IPC error: monitor rule failed");
+
+        assert!(!is_non_legacy_parser_error(&err));
     }
 }
