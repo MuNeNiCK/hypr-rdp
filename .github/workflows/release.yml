@@ -32,7 +32,7 @@ jobs:
         run: |
           mkdir -p dist
           cp target/release/hypr-rdp dist/
-          cp LICENSE README.md dist/
+          cp LICENSE README.md CHANGELOG.md dist/
           cd dist && tar czf ../hypr-rdp-${GITHUB_REF_NAME}-x86_64-linux.tar.gz *
 
       - name: Create GitHub Release
