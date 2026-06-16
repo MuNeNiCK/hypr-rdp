@@ -137,6 +137,31 @@ impl SharedOutputLayout {
     pub(crate) fn snapshot(&self) -> Option<OutputLayoutSnapshot> {
         self.inner.lock().ok()?.clone()
     }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_snapshot_for_test(
+        &self,
+        output_name: &str,
+        output_w: u32,
+        output_h: u32,
+        layout_extent_w: u32,
+        layout_extent_h: u32,
+        output_offset_x: u32,
+        output_offset_y: u32,
+        presentation: (u32, u32),
+    ) -> Result<()> {
+        self.update_snapshot(
+            output_name,
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+            presentation,
+        )
+    }
 }
 
 /// Query Hyprland monitor layout to compute coordinate mapping.
@@ -255,5 +280,30 @@ mod tests {
 
         assert!(layout_from_monitors(&zero_width, "hypr-rdp-1").is_err());
         assert!(layout_from_monitors(&negative_height, "hypr-rdp-1").is_err());
+    }
+
+    #[test]
+    fn output_layout_generation_advances_on_presentation_or_source_geometry_change() {
+        let layout = SharedOutputLayout::new();
+
+        layout
+            .update_snapshot_for_test("DP-1", 3840, 2160, 3840, 2160, 0, 0, (3840, 2160))
+            .expect("initial snapshot");
+        assert_eq!(layout.snapshot().unwrap().geometry_generation, 0);
+
+        layout
+            .update_snapshot_for_test("DP-1", 3840, 2160, 3840, 2160, 0, 0, (3840, 2160))
+            .expect("same snapshot");
+        assert_eq!(layout.snapshot().unwrap().geometry_generation, 0);
+
+        layout
+            .update_snapshot_for_test("DP-1", 3840, 2160, 3840, 2160, 0, 0, (1920, 1080))
+            .expect("presentation resize");
+        assert_eq!(layout.snapshot().unwrap().geometry_generation, 1);
+
+        layout
+            .update_snapshot_for_test("DP-1", 2560, 1440, 2560, 1440, 0, 0, (1920, 1080))
+            .expect("source resize");
+        assert_eq!(layout.snapshot().unwrap().geometry_generation, 2);
     }
 }

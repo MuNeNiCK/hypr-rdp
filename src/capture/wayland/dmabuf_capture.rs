@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::time::Instant;
+use std::{fmt, sync::Arc};
 
 use anyhow::{bail, Context, Result};
 use ironrdp_server::{DesktopSize, DisplayUpdate};
@@ -13,9 +13,11 @@ use wayland_protocols::wp::linux_dmabuf::zv1::client::{
 use super::state::AppState;
 use super::{poll_dispatch, POLL_TIMEOUT_MS};
 use crate::capture::frame::FramePacer;
+use crate::capture::scale::dmabuf_zero_copy_allowed;
 use crate::egfx::{
     EgfxFrameSession, EgfxShared, EncodedEgfxFrame, EncodedFrameState, H264RateControl,
 };
+use crate::input::{OutputLayoutSnapshot, SharedOutputLayout};
 
 const MAX_ENCODE_FAILURES: u32 = 5;
 
@@ -23,6 +25,37 @@ const MAX_ENCODE_FAILURES: u32 = 5;
 enum DmaBufEncodeFailureAction {
     Retry,
     FallBackToShm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmaBufCaptureDecision {
+    Continue,
+    FallBackToShm,
+    RestartCaptureSession,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DmaBufFrameWaitDecision {
+    ContinueWaiting,
+    FrameCompleted,
+    Shutdown,
+    Exit(DmaBufCaptureDecision),
+}
+
+#[derive(Debug)]
+pub(super) struct DmaBufCaptureSessionGeometryChanged;
+
+impl fmt::Display for DmaBufCaptureSessionGeometryChanged {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("EXT DMA-BUF capture source geometry changed")
+    }
+}
+
+impl std::error::Error for DmaBufCaptureSessionGeometryChanged {}
+
+pub(super) fn is_capture_session_geometry_changed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<DmaBufCaptureSessionGeometryChanged>()
+        .is_some()
 }
 
 #[derive(Debug)]
@@ -54,6 +87,58 @@ impl DmaBufEncodeFailureTracker {
         } else {
             DmaBufEncodeFailureAction::Retry
         }
+    }
+}
+
+fn dmabuf_capture_decision(
+    snapshot: Option<&OutputLayoutSnapshot>,
+    loop_size: (u32, u32),
+) -> DmaBufCaptureDecision {
+    let Some(snapshot) = snapshot else {
+        return DmaBufCaptureDecision::FallBackToShm;
+    };
+
+    let source = snapshot.presentation_geometry.source();
+    if (source.width, source.height) != loop_size {
+        return DmaBufCaptureDecision::RestartCaptureSession;
+    }
+
+    if dmabuf_zero_copy_allowed(snapshot) {
+        DmaBufCaptureDecision::Continue
+    } else {
+        DmaBufCaptureDecision::FallBackToShm
+    }
+}
+
+fn dmabuf_capture_decision_result(decision: DmaBufCaptureDecision) -> Result<()> {
+    match decision {
+        DmaBufCaptureDecision::Continue => Ok(()),
+        DmaBufCaptureDecision::FallBackToShm => {
+            bail!("presentation geometry changed while using DMA-BUF; falling back to SHM")
+        }
+        DmaBufCaptureDecision::RestartCaptureSession => {
+            Err(DmaBufCaptureSessionGeometryChanged.into())
+        }
+    }
+}
+
+fn dmabuf_frame_wait_decision(
+    frame_ready: bool,
+    frame_failed: bool,
+    should_stop: bool,
+    snapshot: Option<&OutputLayoutSnapshot>,
+    loop_size: (u32, u32),
+) -> DmaBufFrameWaitDecision {
+    if should_stop {
+        return DmaBufFrameWaitDecision::Shutdown;
+    }
+
+    match dmabuf_capture_decision(snapshot, loop_size) {
+        DmaBufCaptureDecision::Continue if frame_ready || frame_failed => {
+            DmaBufFrameWaitDecision::FrameCompleted
+        }
+        DmaBufCaptureDecision::Continue => DmaBufFrameWaitDecision::ContinueWaiting,
+        decision => DmaBufFrameWaitDecision::Exit(decision),
     }
 }
 
@@ -267,6 +352,7 @@ pub(super) fn capture_loop_ext_dmabuf(
     rate_control: H264RateControl,
     fps: u32,
     pending_initial_resize: Option<DesktopSize>,
+    output_layout: Arc<SharedOutputLayout>,
 ) -> Result<()> {
     tracing::info!(
         width,
@@ -308,8 +394,21 @@ pub(super) fn capture_loop_ext_dmabuf(
         // Wait for current frame to complete (poll-based for responsive shutdown)
         while !state.frame_ready && !state.frame_failed {
             poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
-            if state.should_stop() {
-                break;
+            match dmabuf_frame_wait_decision(
+                state.frame_ready,
+                state.frame_failed,
+                state.should_stop(),
+                output_layout.snapshot().as_ref(),
+                (width, height),
+            ) {
+                DmaBufFrameWaitDecision::ContinueWaiting => {}
+                DmaBufFrameWaitDecision::FrameCompleted | DmaBufFrameWaitDecision::Shutdown => {
+                    break;
+                }
+                DmaBufFrameWaitDecision::Exit(decision) => {
+                    frame.destroy();
+                    return dmabuf_capture_decision_result(decision);
+                }
             }
         }
         frame.destroy();
@@ -318,6 +417,11 @@ pub(super) fn capture_loop_ext_dmabuf(
         if !state.frame_ready && !state.frame_failed {
             break;
         }
+
+        dmabuf_capture_decision_result(dmabuf_capture_decision(
+            output_layout.snapshot().as_ref(),
+            (width, height),
+        ))?;
 
         let completed_failed = state.frame_failed;
         let completed_idx = cap_idx;
@@ -515,6 +619,171 @@ pub(super) fn capture_loop_ext_dmabuf(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::display::geometry::{PresentationGeometry, Size};
+
+    fn snapshot(source: (u32, u32), presentation: (u32, u32)) -> OutputLayoutSnapshot {
+        let source_size = Size::new(source.0, source.1).unwrap();
+        let presentation_size = Size::new(presentation.0, presentation.1).unwrap();
+        OutputLayoutSnapshot {
+            output_name: "DP-1".into(),
+            output_w: source.0,
+            output_h: source.1,
+            layout_extent_w: source.0,
+            layout_extent_h: source.1,
+            output_offset_x: 0,
+            output_offset_y: 0,
+            presentation_geometry: PresentationGeometry::new(source_size, presentation_size),
+            geometry_generation: 0,
+        }
+    }
+
+    #[test]
+    fn dmabuf_capture_decision_classifies_geometry_changes() {
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1920, 1080), (1920, 1080))), (1920, 1080)),
+            DmaBufCaptureDecision::Continue
+        );
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1920, 1080), (1280, 720))), (1920, 1080)),
+            DmaBufCaptureDecision::FallBackToShm
+        );
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1600, 900), (1600, 900))), (1920, 1080)),
+            DmaBufCaptureDecision::RestartCaptureSession
+        );
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1600, 900), (1280, 720))), (1920, 1080)),
+            DmaBufCaptureDecision::RestartCaptureSession
+        );
+        assert_eq!(
+            dmabuf_capture_decision(None, (1920, 1080)),
+            DmaBufCaptureDecision::FallBackToShm
+        );
+    }
+
+    #[test]
+    fn dmabuf_live_identity_resize_restarts_ext_capture_session() {
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1920, 1080), (1920, 1080))), (1920, 1080)),
+            DmaBufCaptureDecision::Continue
+        );
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1600, 900), (1600, 900))), (1920, 1080)),
+            DmaBufCaptureDecision::RestartCaptureSession
+        );
+    }
+
+    #[test]
+    fn dmabuf_same_source_scaled_geometry_requests_shm_fallback() {
+        assert_eq!(
+            dmabuf_capture_decision(Some(&snapshot((1920, 1080), (1280, 720))), (1920, 1080)),
+            DmaBufCaptureDecision::FallBackToShm
+        );
+    }
+
+    #[test]
+    fn dmabuf_guard_exits_during_wait_when_layout_changes() {
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                false,
+                false,
+                false,
+                Some(&snapshot((1920, 1080), (1920, 1080))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::ContinueWaiting
+        );
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                false,
+                false,
+                false,
+                Some(&snapshot((1920, 1080), (1280, 720))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::Exit(DmaBufCaptureDecision::FallBackToShm)
+        );
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                false,
+                false,
+                false,
+                Some(&snapshot((1600, 900), (1600, 900))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::Exit(DmaBufCaptureDecision::RestartCaptureSession)
+        );
+    }
+
+    #[test]
+    fn dmabuf_wait_decision_checks_layout_before_frame_completion() {
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                true,
+                false,
+                false,
+                Some(&snapshot((1920, 1080), (1920, 1080))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::FrameCompleted
+        );
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                true,
+                false,
+                false,
+                Some(&snapshot((1600, 900), (1600, 900))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::Exit(DmaBufCaptureDecision::RestartCaptureSession)
+        );
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                false,
+                true,
+                false,
+                Some(&snapshot((1920, 1080), (1280, 720))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::Exit(DmaBufCaptureDecision::FallBackToShm)
+        );
+    }
+
+    #[test]
+    fn dmabuf_wait_decision_respects_shutdown() {
+        assert_eq!(
+            dmabuf_frame_wait_decision(
+                false,
+                false,
+                true,
+                Some(&snapshot((1600, 900), (1600, 900))),
+                (1920, 1080)
+            ),
+            DmaBufFrameWaitDecision::Shutdown
+        );
+    }
+
+    #[test]
+    fn dmabuf_source_resize_error_is_restart_marker() {
+        let err = dmabuf_capture_decision_result(DmaBufCaptureDecision::RestartCaptureSession)
+            .expect_err("source resize should request capture restart");
+
+        assert!(is_capture_session_geometry_changed(&err));
+    }
+
+    #[test]
+    fn dmabuf_presentation_resize_error_is_shm_fallback() {
+        let err = dmabuf_capture_decision_result(DmaBufCaptureDecision::FallBackToShm)
+            .expect_err("presentation resize should request SHM fallback");
+
+        assert!(!is_capture_session_geometry_changed(&err));
+    }
+
+    #[test]
+    fn dmabuf_current_geometry_decision_is_ok() {
+        dmabuf_capture_decision_result(DmaBufCaptureDecision::Continue)
+            .expect("current geometry continues");
+    }
 
     #[test]
     fn dmabuf_encode_failure_tracker_retries_until_fallback_threshold() {

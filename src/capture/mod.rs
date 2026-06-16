@@ -238,7 +238,20 @@ fn physical_display_control_size(layout: &DisplayControlMonitorLayout) -> Option
     Some((width, height))
 }
 
-fn apply_presentation_state(inner: &mut HyprDisplayInner, width: u32, height: u32) -> DesktopSize {
+fn apply_presentation_state_with(
+    inner: &mut HyprDisplayInner,
+    width: u32,
+    height: u32,
+    refresh_layout: impl FnOnce(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
+) -> Option<DesktopSize> {
+    if let Err(e) = refresh_layout(&inner.output_layout, &inner.output_name, (width, height)) {
+        tracing::warn!(
+            "Failed to refresh input layout after presentation resize: {}",
+            e
+        );
+        return None;
+    }
+
     inner.resolution = (width, height);
     inner.width = width as u16;
     inner.height = height as u16;
@@ -251,17 +264,37 @@ fn apply_presentation_state(inner: &mut HyprDisplayInner, width: u32, height: u3
         shared.set_surface_size(inner.width, inner.height);
         shared.prepare_for_resize(inner.width, inner.height);
     }
-    if let Err(e) = inner
-        .output_layout
-        .update_from_output_with_presentation(&inner.output_name, (width, height))
-    {
-        tracing::warn!(
-            "Failed to refresh input layout after presentation resize: {}",
-            e
-        );
-    }
 
-    desktop_size
+    Some(desktop_size)
+}
+
+fn apply_resize_decision_with(
+    inner: &mut HyprDisplayInner,
+    decision: ResizeDecision,
+    mut resize_headless: impl FnMut(&str, u32, u32) -> Result<()>,
+    mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
+) -> Option<DesktopSize> {
+    match decision.target {
+        ResizeTarget::ManagedHeadlessOutput => {
+            if let Err(e) = resize_headless(&inner.output_name, decision.width, decision.height) {
+                tracing::warn!("Failed to resize headless output: {}", e);
+                None
+            } else {
+                apply_presentation_state_with(
+                    inner,
+                    decision.width,
+                    decision.height,
+                    |layout, name, presentation| refresh_layout(layout, name, presentation),
+                )
+            }
+        }
+        ResizeTarget::PhysicalPresentation => apply_presentation_state_with(
+            inner,
+            decision.width,
+            decision.height,
+            |layout, name, presentation| refresh_layout(layout, name, presentation),
+        ),
+    }
 }
 
 /// RdpServerDisplay implementation that delegates to HyprDisplayInner.
@@ -391,19 +424,13 @@ impl HyprDisplay {
         };
         Ok((Self { inner }, handle, dims))
     }
-}
 
-#[async_trait]
-impl RdpServerDisplay for HyprDisplay {
-    async fn size(&mut self) -> DesktopSize {
-        let inner = self.inner.lock().await;
-        DesktopSize {
-            width: inner.width,
-            height: inner.height,
-        }
-    }
-
-    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+    async fn request_initial_size_with(
+        &mut self,
+        client_size: DesktopSize,
+        mut resize_headless: impl FnMut(&str, u32, u32) -> Result<()>,
+        mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
+    ) -> DesktopSize {
         let requested_w = client_size.width as u32;
         let requested_h = client_size.height as u32;
 
@@ -438,13 +465,12 @@ impl RdpServerDisplay for HyprDisplay {
                         "Client requested initial size; resizing headless output"
                     );
 
-                    if let Err(e) =
-                        resize_headless_output(&inner.output_name, decision.width, decision.height)
-                    {
-                        tracing::warn!("Failed to apply client initial size: {}", e);
-                    } else {
-                        let desktop_size =
-                            apply_presentation_state(&mut inner, decision.width, decision.height);
+                    if let Some(desktop_size) = apply_resize_decision_with(
+                        &mut inner,
+                        decision,
+                        &mut resize_headless,
+                        &mut refresh_layout,
+                    ) {
                         inner.pending_initial_resize = Some(desktop_size);
                     }
                 }
@@ -458,9 +484,14 @@ impl RdpServerDisplay for HyprDisplay {
                         server_h = inner.height,
                         "Client requested initial size; updating physical-output presentation"
                     );
-                    let desktop_size =
-                        apply_presentation_state(&mut inner, decision.width, decision.height);
-                    inner.pending_initial_resize = Some(desktop_size);
+                    if let Some(desktop_size) = apply_resize_decision_with(
+                        &mut inner,
+                        decision,
+                        &mut resize_headless,
+                        &mut refresh_layout,
+                    ) {
+                        inner.pending_initial_resize = Some(desktop_size);
+                    }
                 }
             }
         } else if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
@@ -482,7 +513,12 @@ impl RdpServerDisplay for HyprDisplay {
         }
     }
 
-    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+    fn request_layout_with(
+        &mut self,
+        layout: DisplayControlMonitorLayout,
+        mut resize_headless: impl FnMut(&str, u32, u32) -> Result<()>,
+        mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
+    ) {
         let monitor = match layout.monitors().iter().find(|m| m.is_primary()) {
             Some(m) => m,
             None => match layout.monitors().first() {
@@ -539,17 +575,16 @@ impl RdpServerDisplay for HyprDisplay {
                     "Client requested resize via DisplayControl"
                 );
 
-                if let Err(e) =
-                    resize_headless_output(&inner.output_name, decision.width, decision.height)
-                {
-                    tracing::warn!("Failed to resize headless output: {}", e);
-                    return;
+                if let Some(desktop_size) = apply_resize_decision_with(
+                    &mut inner,
+                    decision,
+                    &mut resize_headless,
+                    &mut refresh_layout,
+                ) {
+                    let _ = inner
+                        .update_tx
+                        .try_send(DisplayUpdate::Resize(desktop_size));
                 }
-                let desktop_size =
-                    apply_presentation_state(&mut inner, decision.width, decision.height);
-                let _ = inner
-                    .update_tx
-                    .try_send(DisplayUpdate::Resize(desktop_size));
             }
             ResizeTarget::PhysicalPresentation => {
                 tracing::info!(
@@ -557,13 +592,46 @@ impl RdpServerDisplay for HyprDisplay {
                     h = decision.height,
                     "Client requested physical-output presentation resize via DisplayControl"
                 );
-                let desktop_size =
-                    apply_presentation_state(&mut inner, decision.width, decision.height);
-                let _ = inner
-                    .update_tx
-                    .try_send(DisplayUpdate::Resize(desktop_size));
+                if let Some(desktop_size) = apply_resize_decision_with(
+                    &mut inner,
+                    decision,
+                    &mut resize_headless,
+                    &mut refresh_layout,
+                ) {
+                    let _ = inner
+                        .update_tx
+                        .try_send(DisplayUpdate::Resize(desktop_size));
+                }
             }
         }
+    }
+}
+
+#[async_trait]
+impl RdpServerDisplay for HyprDisplay {
+    async fn size(&mut self) -> DesktopSize {
+        let inner = self.inner.lock().await;
+        DesktopSize {
+            width: inner.width,
+            height: inner.height,
+        }
+    }
+
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        self.request_initial_size_with(
+            client_size,
+            resize_headless_output,
+            SharedOutputLayout::update_from_output_with_presentation,
+        )
+        .await
+    }
+
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        self.request_layout_with(
+            layout,
+            resize_headless_output,
+            SharedOutputLayout::update_from_output_with_presentation,
+        );
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -658,6 +726,7 @@ mod tests {
 #[cfg(test)]
 mod output_downscaling {
     use super::*;
+    use crate::egfx::{EgfxCodecPolicy, DEFAULT_MAX_FRAMES_IN_FLIGHT};
     use ironrdp_displaycontrol::pdu::{
         DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry, MonitorOrientation,
     };
@@ -665,6 +734,83 @@ mod output_downscaling {
     fn single_primary(width: u32, height: u32) -> DisplayControlMonitorLayout {
         DisplayControlMonitorLayout::new(&[MonitorLayoutEntry::new_primary(width, height).unwrap()])
             .unwrap()
+    }
+
+    fn physical_display_for_callback_test(
+        resolution: (u32, u32),
+    ) -> (
+        HyprDisplay,
+        mpsc::Receiver<DisplayUpdate>,
+        Arc<EgfxShared>,
+        Arc<SharedOutputLayout>,
+    ) {
+        let (tx, rx) = mpsc::channel(4);
+        let shared = Arc::new(EgfxShared::with_codec_policy(
+            DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            EgfxCodecPolicy::Auto,
+        ));
+        shared.set_surface_size(resolution.0 as u16, resolution.1 as u16);
+        let output_layout = Arc::new(SharedOutputLayout::new());
+        output_layout
+            .update_snapshot_for_test(
+                "DP-1",
+                resolution.0,
+                resolution.1,
+                resolution.0,
+                resolution.1,
+                0,
+                0,
+                resolution,
+            )
+            .expect("initial physical layout");
+        let inner = HyprDisplayInner {
+            width: resolution.0 as u16,
+            height: resolution.1 as u16,
+            resolution,
+            capture_mode: CaptureMode::Ext,
+            output_name: "DP-1".into(),
+            egfx_shared: Some(Arc::clone(&shared)),
+            output_layout: Arc::clone(&output_layout),
+            update_tx: tx,
+            update_rx: None,
+            bitrate: 1_000_000,
+            quality: 23,
+            rate_control: H264RateControl::Vbr,
+            fps: 30,
+            output: Some("DP-1".into()),
+            resolution_fixed: false,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            capture_handle: None,
+            headless_guard: None,
+            pending_initial_resize: None,
+        };
+
+        (
+            HyprDisplay {
+                inner: Arc::new(Mutex::new(inner)),
+            },
+            rx,
+            shared,
+            output_layout,
+        )
+    }
+
+    fn refresh_physical_layout_for_test(
+        layout: &SharedOutputLayout,
+        output_name: &str,
+        presentation: (u32, u32),
+    ) -> Result<()> {
+        let snapshot = layout.snapshot().expect("existing physical layout");
+        layout.update_snapshot_for_test(
+            output_name,
+            snapshot.output_w,
+            snapshot.output_h,
+            snapshot.layout_extent_w,
+            snapshot.layout_extent_h,
+            snapshot.output_offset_x,
+            snapshot.output_offset_y,
+            presentation,
+        )
     }
 
     #[test]
@@ -700,6 +846,70 @@ mod output_downscaling {
         assert_eq!((decision.width, decision.height), (1600, 900));
     }
 
+    #[tokio::test]
+    async fn physical_output_initial_size_callback_updates_presentation_state() {
+        let (mut display, _rx, shared, _layout) = physical_display_for_callback_test((3840, 2160));
+
+        let size = display
+            .request_initial_size_with(
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                |_name, _width, _height| panic!("physical output must not resize headless output"),
+                refresh_physical_layout_for_test,
+            )
+            .await;
+
+        assert_eq!(
+            size,
+            DesktopSize {
+                width: 1600,
+                height: 900
+            }
+        );
+        assert_eq!(shared.get_surface_size(), (1600, 900));
+
+        let inner = display.inner.lock().await;
+        assert_eq!(inner.resolution, (1600, 900));
+        assert_eq!(
+            inner.pending_initial_resize,
+            Some(DesktopSize {
+                width: 1600,
+                height: 900
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn physical_output_initial_size_callback_layout_failure_preserves_state() {
+        let (mut display, _rx, shared, _layout) = physical_display_for_callback_test((3840, 2160));
+
+        let size = display
+            .request_initial_size_with(
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                |_name, _width, _height| panic!("physical output must not resize headless output"),
+                |_layout, _name, _presentation| anyhow::bail!("layout refresh failed"),
+            )
+            .await;
+
+        assert_eq!(
+            size,
+            DesktopSize {
+                width: 3840,
+                height: 2160
+            }
+        );
+        assert_eq!(shared.get_surface_size(), (3840, 2160));
+
+        let inner = display.inner.lock().await;
+        assert_eq!(inner.resolution, (3840, 2160));
+        assert_eq!(inner.pending_initial_resize, None);
+    }
+
     #[test]
     fn physical_output_initial_size_uses_desktop_size_policy_not_displaycontrol_layout_policy() {
         let decision = initial_size_resize_decision(true, false, (3840, 2160), (100, 100)).unwrap();
@@ -732,6 +942,53 @@ mod output_downscaling {
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
         assert_eq!((decision.width, decision.height), (1280, 720));
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_callback_emits_presentation_resize() {
+        let (mut display, mut rx, shared, _layout) =
+            physical_display_for_callback_test((1920, 1080));
+
+        display.request_layout_with(
+            single_primary(1280, 720),
+            |_name, _width, _height| panic!("physical output must not resize headless output"),
+            refresh_physical_layout_for_test,
+        );
+
+        match rx.try_recv().expect("resize update") {
+            DisplayUpdate::Resize(size) => {
+                assert_eq!(
+                    size,
+                    DesktopSize {
+                        width: 1280,
+                        height: 720
+                    }
+                );
+            }
+            other => panic!("expected resize update, got {other:?}"),
+        }
+        assert_eq!(shared.get_surface_size(), (1280, 720));
+
+        let inner = display.inner.blocking_lock();
+        assert_eq!(inner.resolution, (1280, 720));
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_callback_layout_failure_emits_no_resize() {
+        let (mut display, mut rx, shared, _layout) =
+            physical_display_for_callback_test((1920, 1080));
+
+        display.request_layout_with(
+            single_primary(1280, 720),
+            |_name, _width, _height| panic!("physical output must not resize headless output"),
+            |_layout, _name, _presentation| anyhow::bail!("layout refresh failed"),
+        );
+
+        assert!(rx.try_recv().is_err());
+        assert_eq!(shared.get_surface_size(), (1920, 1080));
+
+        let inner = display.inner.blocking_lock();
+        assert_eq!(inner.resolution, (1920, 1080));
     }
 
     #[test]
@@ -819,6 +1076,82 @@ mod managed_headless_resize {
             .unwrap()
     }
 
+    fn headless_inner_for_resize_test_with_tx(
+        resolution: (u32, u32),
+        tx: mpsc::Sender<DisplayUpdate>,
+    ) -> HyprDisplayInner {
+        let output_layout = Arc::new(SharedOutputLayout::new());
+        output_layout
+            .update_snapshot_for_test(
+                "HEADLESS-1",
+                resolution.0,
+                resolution.1,
+                resolution.0,
+                resolution.1,
+                0,
+                0,
+                resolution,
+            )
+            .expect("initial headless layout");
+        HyprDisplayInner {
+            width: resolution.0 as u16,
+            height: resolution.1 as u16,
+            resolution,
+            capture_mode: CaptureMode::Ext,
+            output_name: "HEADLESS-1".into(),
+            egfx_shared: None,
+            output_layout,
+            update_tx: tx,
+            update_rx: None,
+            bitrate: 1_000_000,
+            quality: 23,
+            rate_control: H264RateControl::Vbr,
+            fps: 30,
+            output: None,
+            resolution_fixed: false,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            capture_handle: None,
+            headless_guard: None,
+            pending_initial_resize: None,
+        }
+    }
+
+    fn headless_inner_for_resize_test(resolution: (u32, u32)) -> HyprDisplayInner {
+        let (tx, _rx) = mpsc::channel(4);
+        headless_inner_for_resize_test_with_tx(resolution, tx)
+    }
+
+    fn headless_display_for_callback_test(
+        resolution: (u32, u32),
+    ) -> (HyprDisplay, mpsc::Receiver<DisplayUpdate>) {
+        let (tx, rx) = mpsc::channel(4);
+        (
+            HyprDisplay {
+                inner: Arc::new(Mutex::new(headless_inner_for_resize_test_with_tx(
+                    resolution, tx,
+                ))),
+            },
+            rx,
+        )
+    }
+
+    fn refresh_headless_layout_for_test(
+        layout: &SharedOutputLayout,
+        output_name: &str,
+        presentation: (u32, u32),
+    ) -> Result<()> {
+        layout.update_snapshot_for_test(
+            output_name,
+            presentation.0,
+            presentation.1,
+            presentation.0,
+            presentation.1,
+            0,
+            0,
+            presentation,
+        )
+    }
+
     #[test]
     fn managed_headless_initial_size_still_targets_headless_output_resize() {
         let decision =
@@ -826,6 +1159,45 @@ mod managed_headless_resize {
 
         assert_eq!(decision.target, ResizeTarget::ManagedHeadlessOutput);
         assert_eq!((decision.width, decision.height), (1600, 900));
+    }
+
+    #[tokio::test]
+    async fn managed_headless_initial_size_callback_resizes_headless_and_updates_pending_resize() {
+        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let mut called = None;
+
+        let size = display
+            .request_initial_size_with(
+                DesktopSize {
+                    width: 1600,
+                    height: 900,
+                },
+                |name, width, height| {
+                    called = Some((name.to_string(), width, height));
+                    Ok(())
+                },
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900)));
+        assert_eq!(
+            size,
+            DesktopSize {
+                width: 1600,
+                height: 900
+            }
+        );
+
+        let inner = display.inner.lock().await;
+        assert_eq!(inner.resolution, (1600, 900));
+        assert_eq!(
+            inner.pending_initial_resize,
+            Some(DesktopSize {
+                width: 1600,
+                height: 900
+            })
+        );
     }
 
     #[test]
@@ -836,6 +1208,133 @@ mod managed_headless_resize {
 
         assert_eq!(decision.target, ResizeTarget::ManagedHeadlessOutput);
         assert_eq!((decision.width, decision.height), (1600, 900));
+    }
+
+    #[test]
+    fn managed_headless_displaycontrol_callback_resizes_headless_and_emits_resize() {
+        let (mut display, mut rx) = headless_display_for_callback_test((1920, 1080));
+        let mut called = None;
+
+        display.request_layout_with(
+            single_primary(1600, 900),
+            |name, width, height| {
+                called = Some((name.to_string(), width, height));
+                Ok(())
+            },
+            refresh_headless_layout_for_test,
+        );
+
+        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900)));
+        match rx.try_recv().expect("resize update") {
+            DisplayUpdate::Resize(size) => {
+                assert_eq!(
+                    size,
+                    DesktopSize {
+                        width: 1600,
+                        height: 900
+                    }
+                );
+            }
+            other => panic!("expected resize update, got {other:?}"),
+        }
+
+        let inner = display.inner.blocking_lock();
+        assert_eq!(inner.resolution, (1600, 900));
+    }
+
+    #[test]
+    fn managed_headless_displaycontrol_callback_failure_preserves_state_and_emits_no_resize() {
+        let (mut display, mut rx) = headless_display_for_callback_test((1920, 1080));
+
+        display.request_layout_with(
+            single_primary(1600, 900),
+            |_name, _width, _height| anyhow::bail!("resize failed"),
+            |_layout, _output_name, _presentation| {
+                panic!("layout refresh must not run after headless resize failure")
+            },
+        );
+
+        assert!(rx.try_recv().is_err());
+        let inner = display.inner.blocking_lock();
+        assert_eq!(inner.resolution, (1920, 1080));
+        assert_eq!((inner.width, inner.height), (1920, 1080));
+    }
+
+    #[test]
+    fn managed_headless_displaycontrol_callback_layout_failure_preserves_rdp_state() {
+        let (mut display, mut rx) = headless_display_for_callback_test((1920, 1080));
+        let mut called = None;
+
+        display.request_layout_with(
+            single_primary(1600, 900),
+            |name, width, height| {
+                called = Some((name.to_string(), width, height));
+                Ok(())
+            },
+            |_layout, _output_name, _presentation| anyhow::bail!("layout refresh failed"),
+        );
+
+        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900)));
+        assert!(rx.try_recv().is_err());
+        let inner = display.inner.blocking_lock();
+        assert_eq!(inner.resolution, (1920, 1080));
+        assert_eq!((inner.width, inner.height), (1920, 1080));
+    }
+
+    #[test]
+    fn managed_headless_resize_side_effects_run_only_after_headless_resize_succeeds() {
+        let mut inner = headless_inner_for_resize_test((1920, 1080));
+        let mut called = None;
+        let decision = ResizeDecision {
+            target: ResizeTarget::ManagedHeadlessOutput,
+            width: 1600,
+            height: 900,
+        };
+
+        let desktop_size = apply_resize_decision_with(
+            &mut inner,
+            decision,
+            |name, width, height| {
+                called = Some((name.to_string(), width, height));
+                Ok(())
+            },
+            refresh_headless_layout_for_test,
+        )
+        .expect("resize applies");
+
+        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900)));
+        assert_eq!(
+            desktop_size,
+            DesktopSize {
+                width: 1600,
+                height: 900
+            }
+        );
+        assert_eq!(inner.resolution, (1600, 900));
+        assert_eq!((inner.width, inner.height), (1600, 900));
+    }
+
+    #[test]
+    fn managed_headless_resize_failure_preserves_existing_presentation_state() {
+        let mut inner = headless_inner_for_resize_test((1920, 1080));
+        let decision = ResizeDecision {
+            target: ResizeTarget::ManagedHeadlessOutput,
+            width: 1600,
+            height: 900,
+        };
+
+        assert!(apply_resize_decision_with(
+            &mut inner,
+            decision,
+            |_name, _width, _height| { anyhow::bail!("resize failed") },
+            |_layout, _output_name, _presentation| {
+                panic!("layout refresh must not run after headless resize failure")
+            }
+        )
+        .is_none());
+
+        assert_eq!(inner.resolution, (1920, 1080));
+        assert_eq!((inner.width, inner.height), (1920, 1080));
     }
 
     #[test]

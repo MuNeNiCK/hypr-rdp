@@ -10,7 +10,7 @@ use tokio::sync::mpsc;
 
 use super::CaptureMode;
 use crate::egfx::{EgfxShared, H264RateControl};
-use crate::input::SharedOutputLayout;
+use crate::input::{OutputLayoutSnapshot, SharedOutputLayout};
 pub(crate) use output::{
     create_headless_output, list_stale_headless_outputs, output_info, wait_for_output_size,
     HeadlessOutputGuard,
@@ -26,7 +26,7 @@ mod wlr;
 
 use state::AppState;
 
-const WLR_BUFFER_PARAMETER_RESTART_LIMIT: u32 = 5;
+const CAPTURE_SESSION_RESTART_LIMIT: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureRestartDecision {
@@ -81,6 +81,29 @@ pub struct CaptureInfo {
 /// Verify that a named output exists in Hyprland monitors.
 fn verify_output_exists(output_name: &str) -> Result<()> {
     output_info(output_name).map(|_| ())
+}
+
+fn existing_presentation_for_capture_refresh(
+    snapshot: Option<&OutputLayoutSnapshot>,
+) -> Option<(u32, u32)> {
+    snapshot.map(|snapshot| {
+        let presentation = snapshot.presentation_geometry.presentation();
+        (presentation.width, presentation.height)
+    })
+}
+
+fn refresh_output_layout_for_capture(
+    output_layout: &SharedOutputLayout,
+    output_name: &str,
+    update_with_presentation: impl FnOnce(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
+    update_identity: impl FnOnce(&SharedOutputLayout, &str) -> Result<()>,
+) -> Result<()> {
+    let snapshot = output_layout.snapshot();
+    if let Some(presentation) = existing_presentation_for_capture_refresh(snapshot.as_ref()) {
+        update_with_presentation(output_layout, output_name, presentation)
+    } else {
+        update_identity(output_layout, output_name)
+    }
 }
 
 /// Start screen capture on a background thread.
@@ -163,7 +186,7 @@ fn capture_thread(
 
         match result {
             Ok(()) => return Ok(()),
-            Err(err) => match wlr_buffer_restart_decision(
+            Err(err) => match capture_session_restart_decision(
                 &err,
                 stop_flag.load(std::sync::atomic::Ordering::Acquire),
                 restarts,
@@ -174,7 +197,7 @@ fn capture_thread(
                     restarts = next_restarts;
                     tracing::warn!(
                         restarts,
-                        "WLR capture buffer parameters changed; restarting capture thread"
+                        "Capture session parameters changed; restarting capture thread"
                     );
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
@@ -184,7 +207,7 @@ fn capture_thread(
                     restarts = next_restarts;
                     tracing::warn!(
                         restarts,
-                        "WLR capture buffer parameters changed; restart limit reached"
+                        "Capture session parameters changed; restart limit reached"
                     );
                     send_capture_start_error(&mut info_tx, &err);
                     return Err(err);
@@ -198,17 +221,32 @@ fn capture_thread(
     }
 }
 
-fn wlr_buffer_restart_decision(
+fn capture_session_geometry_changed(err: &anyhow::Error) -> bool {
+    if wlr::is_buffer_parameters_changed(err) {
+        return true;
+    }
+
+    #[cfg(feature = "vaapi")]
+    {
+        if dmabuf_capture::is_capture_session_geometry_changed(err) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn capture_session_restart_decision(
     err: &anyhow::Error,
     stop_flag_set: bool,
     restarts: u32,
 ) -> CaptureRestartDecision {
-    if !wlr::is_buffer_parameters_changed(err) || stop_flag_set {
+    if stop_flag_set || !capture_session_geometry_changed(err) {
         return CaptureRestartDecision::Propagate;
     }
 
     let restarts = restarts.saturating_add(1);
-    if restarts >= WLR_BUFFER_PARAMETER_RESTART_LIMIT {
+    if restarts >= CAPTURE_SESSION_RESTART_LIMIT {
         CaptureRestartDecision::GiveUp { restarts }
     } else {
         CaptureRestartDecision::Restart { restarts }
@@ -254,19 +292,13 @@ fn capture_thread_inner(
 ) -> Result<()> {
     verify_output_exists(&output_name)?;
 
-    if let Some(snapshot) = output_layout.snapshot() {
-        let presentation = snapshot.presentation_geometry.presentation();
-        output_layout
-            .update_from_output_with_presentation(
-                &output_name,
-                (presentation.width, presentation.height),
-            )
-            .context("failed to refresh input layout for output")?;
-    } else {
-        output_layout
-            .update_from_output(&output_name)
-            .context("failed to refresh input layout for output")?;
-    }
+    refresh_output_layout_for_capture(
+        &output_layout,
+        &output_name,
+        SharedOutputLayout::update_from_output_with_presentation,
+        SharedOutputLayout::update_from_output,
+    )
+    .context("failed to refresh input layout for output")?;
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let mut event_queue = conn.new_event_queue::<AppState>();
@@ -404,7 +436,11 @@ fn is_wayland_would_block(err: &wayland_client::backend::WaylandError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{wlr, wlr_buffer_restart_decision, CaptureRestartDecision};
+    use super::{
+        capture_session_restart_decision, refresh_output_layout_for_capture, wlr,
+        CaptureRestartDecision,
+    };
+    use crate::input::SharedOutputLayout;
 
     fn buffer_parameters_changed_error() -> anyhow::Error {
         anyhow::Error::new(wlr::BufferParametersChanged)
@@ -415,15 +451,15 @@ mod tests {
         let err = buffer_parameters_changed_error();
 
         assert_eq!(
-            wlr_buffer_restart_decision(&err, false, 0),
+            capture_session_restart_decision(&err, false, 0),
             CaptureRestartDecision::Restart { restarts: 1 }
         );
         assert_eq!(
-            wlr_buffer_restart_decision(&err, false, 3),
+            capture_session_restart_decision(&err, false, 3),
             CaptureRestartDecision::Restart { restarts: 4 }
         );
         assert_eq!(
-            wlr_buffer_restart_decision(&err, false, 4),
+            capture_session_restart_decision(&err, false, 4),
             CaptureRestartDecision::GiveUp { restarts: 5 }
         );
     }
@@ -433,7 +469,7 @@ mod tests {
         let err = buffer_parameters_changed_error();
 
         assert_eq!(
-            wlr_buffer_restart_decision(&err, true, 0),
+            capture_session_restart_decision(&err, true, 0),
             CaptureRestartDecision::Propagate
         );
     }
@@ -443,8 +479,92 @@ mod tests {
         let err = anyhow::anyhow!("Wayland read failed");
 
         assert_eq!(
-            wlr_buffer_restart_decision(&err, false, 0),
+            capture_session_restart_decision(&err, false, 0),
             CaptureRestartDecision::Propagate
         );
+    }
+
+    #[cfg(feature = "vaapi")]
+    #[test]
+    fn dmabuf_source_geometry_change_restarts_capture_until_limit() {
+        let err = anyhow::Error::new(super::dmabuf_capture::DmaBufCaptureSessionGeometryChanged);
+
+        assert_eq!(
+            capture_session_restart_decision(&err, false, 0),
+            CaptureRestartDecision::Restart { restarts: 1 }
+        );
+        assert_eq!(
+            capture_session_restart_decision(&err, false, 4),
+            CaptureRestartDecision::GiveUp { restarts: 5 }
+        );
+    }
+
+    #[test]
+    fn capture_refresh_reuses_existing_presentation_geometry() {
+        let layout = SharedOutputLayout::new();
+        layout
+            .update_snapshot_for_test("DP-1", 3840, 2160, 3840, 2160, 0, 0, (1920, 1080))
+            .expect("initial scaled layout");
+
+        refresh_output_layout_for_capture(
+            &layout,
+            "DP-1",
+            |layout, output_name, presentation| {
+                layout.update_snapshot_for_test(
+                    output_name,
+                    2560,
+                    1440,
+                    2560,
+                    1440,
+                    0,
+                    0,
+                    presentation,
+                )
+            },
+            |_layout, _output_name| panic!("scaled refresh must preserve presentation geometry"),
+        )
+        .expect("refresh preserves presentation");
+
+        let snapshot = layout.snapshot().expect("refreshed snapshot");
+        let presentation = snapshot.presentation_geometry.presentation();
+        let source = snapshot.presentation_geometry.source();
+
+        assert_eq!((source.width, source.height), (2560, 1440));
+        assert_eq!((presentation.width, presentation.height), (1920, 1080));
+        assert_eq!(snapshot.geometry_generation, 1);
+    }
+
+    #[test]
+    fn capture_refresh_without_existing_snapshot_uses_identity_geometry() {
+        let layout = SharedOutputLayout::new();
+
+        refresh_output_layout_for_capture(
+            &layout,
+            "DP-1",
+            |_layout, _output_name, _presentation| {
+                panic!("initial refresh must not preserve missing presentation")
+            },
+            |layout, output_name| {
+                layout.update_snapshot_for_test(
+                    output_name,
+                    1920,
+                    1080,
+                    1920,
+                    1080,
+                    0,
+                    0,
+                    (1920, 1080),
+                )
+            },
+        )
+        .expect("initial refresh uses identity geometry");
+
+        let snapshot = layout.snapshot().expect("initial snapshot");
+        let presentation = snapshot.presentation_geometry.presentation();
+        let source = snapshot.presentation_geometry.source();
+
+        assert_eq!((source.width, source.height), (1920, 1080));
+        assert_eq!((presentation.width, presentation.height), (1920, 1080));
+        assert_eq!(snapshot.geometry_generation, 0);
     }
 }
