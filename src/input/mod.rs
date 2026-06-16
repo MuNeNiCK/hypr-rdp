@@ -11,5 +11,6 @@ pub enum KeyboardLayoutPolicy {
     Compositor,
 }
 
+pub(crate) use layout::OutputLayoutSnapshot;
 pub use layout::SharedOutputLayout;
 pub use wayland::HyprInputHandler;

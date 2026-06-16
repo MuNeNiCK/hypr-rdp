@@ -14,7 +14,11 @@ use wayland_protocols_wlr::screencopy::v1::client::{
 use super::state::AppState;
 use super::{create_shm_fd, poll_dispatch, CaptureInfo, MmapRegion, POLL_TIMEOUT_MS};
 use crate::capture::frame::{FramePacer, FrameProcessor};
+use crate::capture::scale::{
+    output_downscaling_generation_action, prepare_presentation_frame, presentation_frame_shape,
+};
 use crate::egfx::{EgfxShared, H264RateControl};
+use crate::input::SharedOutputLayout;
 
 const WLR_FRAME_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const WLR_EMPTY_DAMAGE_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(500);
@@ -93,6 +97,7 @@ pub(super) fn capture_loop_wlr(
     shm: &wl_shm::WlShm,
     screencopy_mgr: &zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
     output_name: &str,
+    output_layout: Arc<SharedOutputLayout>,
     egfx_shared: Option<Arc<EgfxShared>>,
     info_tx: &mut Option<tokio::sync::oneshot::Sender<Result<CaptureInfo>>>,
     bitrate: u32,
@@ -184,12 +189,19 @@ pub(super) fn capture_loop_wlr(
 
     tracing::info!(width, height, ?shm_format, stride, output = %output_name, mode = "wlr", fps, "Starting capture loop (double-buffered)");
 
+    let snapshot = output_layout
+        .snapshot()
+        .context("output layout not initialized for capture scaling")?;
+    let (presentation_width, presentation_height, presentation_stride) =
+        presentation_frame_shape(width, height, stride, &snapshot)?;
+    let mut processor_generation = snapshot.geometry_generation;
+
     let mut proc = FrameProcessor::new(
-        egfx_shared,
-        width,
-        height,
+        egfx_shared.clone(),
+        presentation_width,
+        presentation_height,
         pixel_format,
-        stride,
+        presentation_stride,
         bitrate,
         quality,
         rate_control,
@@ -269,24 +281,57 @@ pub(super) fn capture_loop_wlr(
                 );
             }
 
-            proc.queue_damage(&damage_regions);
             let data = mmaps[completed_idx].as_slice();
-            proc.stats
-                .record_capture(width, height, damage_regions.len(), promoted_full_scan);
+            let snapshot = output_layout
+                .snapshot()
+                .context("output layout not initialized for capture scaling")?;
+            let prepared = prepare_presentation_frame(
+                data,
+                width,
+                height,
+                stride,
+                pixel_format,
+                &damage_regions,
+                &snapshot,
+            )?;
+            let action = output_downscaling_generation_action(processor_generation, &prepared);
+            if action.refresh_processor {
+                processor_generation = action.next_generation;
+                proc = FrameProcessor::new(
+                    egfx_shared.clone(),
+                    prepared.width,
+                    prepared.height,
+                    pixel_format,
+                    prepared.stride,
+                    bitrate,
+                    quality,
+                    rate_control,
+                    fps,
+                );
+            }
+            proc.queue_damage(&action.damage_regions);
+            proc.stats.record_capture(
+                prepared.width,
+                prepared.height,
+                prepared.damage_regions.len(),
+                promoted_full_scan,
+            );
             let has_pending_damage = proc.has_pending_damage();
             if !has_pending_damage && proc.sent_first_frame {
-                proc.stats.record_no_damage_skip(width, height);
+                proc.stats
+                    .record_no_damage_skip(prepared.width, prepared.height);
             } else if frame_pacer.should_send(
                 Instant::now(),
                 proc.sent_first_frame,
                 has_pending_damage,
                 proc.pacing_fps(),
             ) {
-                if !proc.process(data, &state.tx) {
+                if !proc.process(prepared.data.as_ref(), &state.tx) {
                     break;
                 }
             } else {
-                proc.stats.record_pacer_skip(width, height);
+                proc.stats
+                    .record_pacer_skip(prepared.width, prepared.height);
             }
         }
 

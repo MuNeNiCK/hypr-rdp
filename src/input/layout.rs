@@ -3,15 +3,19 @@ use std::sync::Mutex;
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 
+use crate::display::geometry::{PresentationGeometry, Size};
+
 #[derive(Clone, Debug)]
-pub(super) struct OutputLayoutSnapshot {
-    pub(super) output_name: String,
-    pub(super) output_w: u32,
-    pub(super) output_h: u32,
-    pub(super) layout_extent_w: u32,
-    pub(super) layout_extent_h: u32,
-    pub(super) output_offset_x: u32,
-    pub(super) output_offset_y: u32,
+pub(crate) struct OutputLayoutSnapshot {
+    pub(crate) output_name: String,
+    pub(crate) output_w: u32,
+    pub(crate) output_h: u32,
+    pub(crate) layout_extent_w: u32,
+    pub(crate) layout_extent_h: u32,
+    pub(crate) output_offset_x: u32,
+    pub(crate) output_offset_y: u32,
+    pub(crate) presentation_geometry: PresentationGeometry,
+    pub(crate) geometry_generation: u32,
 }
 
 #[derive(Debug, Default)]
@@ -33,6 +37,73 @@ impl SharedOutputLayout {
             output_offset_x,
             output_offset_y,
         ) = query_layout(output_name)?;
+        self.update_snapshot(
+            output_name,
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+            (output_w, output_h),
+        )
+    }
+
+    pub fn update_from_output_with_presentation(
+        &self,
+        output_name: &str,
+        presentation: (u32, u32),
+    ) -> Result<()> {
+        let (
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+        ) = query_layout(output_name)?;
+        self.update_snapshot(
+            output_name,
+            output_w,
+            output_h,
+            layout_extent_w,
+            layout_extent_h,
+            output_offset_x,
+            output_offset_y,
+            presentation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn update_snapshot(
+        &self,
+        output_name: &str,
+        output_w: u32,
+        output_h: u32,
+        layout_extent_w: u32,
+        layout_extent_h: u32,
+        output_offset_x: u32,
+        output_offset_y: u32,
+        presentation: (u32, u32),
+    ) -> Result<()> {
+        let source = Size::new(output_w, output_h).context("output has invalid source size")?;
+        let presentation = Size::new(presentation.0, presentation.1)
+            .context("output has invalid presentation size")?;
+        let presentation_geometry = PresentationGeometry::new(source, presentation);
+        let geometry_generation = self
+            .inner
+            .lock()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().map(|old| {
+                    if old.presentation_geometry == presentation_geometry {
+                        old.geometry_generation
+                    } else {
+                        old.geometry_generation.saturating_add(1)
+                    }
+                })
+            })
+            .unwrap_or(0);
         let snapshot = OutputLayoutSnapshot {
             output_name: output_name.to_string(),
             output_w,
@@ -41,9 +112,16 @@ impl SharedOutputLayout {
             layout_extent_h,
             output_offset_x,
             output_offset_y,
+            presentation_geometry,
+            geometry_generation,
         };
         tracing::info!(
             output = %snapshot.output_name,
+            source_w = snapshot.output_w,
+            source_h = snapshot.output_h,
+            presentation_w = snapshot.presentation_geometry.presentation().width,
+            presentation_h = snapshot.presentation_geometry.presentation().height,
+            geometry_generation = snapshot.geometry_generation,
             layout_extent_w = snapshot.layout_extent_w,
             layout_extent_h = snapshot.layout_extent_h,
             output_offset_x = snapshot.output_offset_x,
@@ -56,7 +134,7 @@ impl SharedOutputLayout {
         Ok(())
     }
 
-    pub(super) fn snapshot(&self) -> Option<OutputLayoutSnapshot> {
+    pub(crate) fn snapshot(&self) -> Option<OutputLayoutSnapshot> {
         self.inner.lock().ok()?.clone()
     }
 }

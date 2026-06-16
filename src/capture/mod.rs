@@ -2,6 +2,7 @@ mod damage;
 #[cfg(feature = "vaapi")]
 pub mod dmabuf;
 mod frame;
+mod scale;
 mod wayland;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
-use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
+use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorOrientation};
 use ironrdp_server::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use tokio::sync::{mpsc, Mutex};
 
@@ -21,6 +22,7 @@ pub(crate) use wayland::HeadlessOutputGuard;
 
 const H264_SOFTWARE_MAX_LONG_DIMENSION: u32 = 3840;
 const H264_SOFTWARE_MAX_SHORT_DIMENSION: u32 = 2160;
+const DISPLAYCONTROL_MAX_PRESENTATION_AREA: u64 = 3840 * 2400;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMode {
@@ -118,6 +120,150 @@ fn clamp_to_h264_software_limits(width: u32, height: u32) -> (u32, u32) {
     (scaled_width, scaled_height)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResizeTarget {
+    ManagedHeadlessOutput,
+    PhysicalPresentation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResizeDecision {
+    target: ResizeTarget,
+    width: u32,
+    height: u32,
+}
+
+fn startup_presentation_size(
+    physical_output: bool,
+    resolution_fixed: bool,
+    configured_resolution: (u32, u32),
+    source_size: (u32, u32),
+) -> (u32, u32) {
+    if physical_output && !resolution_fixed {
+        source_size
+    } else {
+        configured_resolution
+    }
+}
+
+fn initial_size_resize_decision(
+    physical_output: bool,
+    resolution_fixed: bool,
+    current_resolution: (u32, u32),
+    requested_size: (u32, u32),
+) -> Option<ResizeDecision> {
+    if resolution_fixed {
+        return None;
+    }
+
+    let (width, height) = requested_size;
+    if width == 0 || height == 0 || (width, height) == current_resolution {
+        return None;
+    }
+
+    Some(ResizeDecision {
+        target: if physical_output {
+            ResizeTarget::PhysicalPresentation
+        } else {
+            ResizeTarget::ManagedHeadlessOutput
+        },
+        width,
+        height,
+    })
+}
+
+fn display_control_resize_decision(
+    layout: &DisplayControlMonitorLayout,
+    physical_output: bool,
+    resolution_fixed: bool,
+    current_resolution: (u32, u32),
+) -> Option<ResizeDecision> {
+    if resolution_fixed {
+        return None;
+    }
+
+    let (requested_w, requested_h) = if physical_output {
+        physical_display_control_size(layout)?
+    } else {
+        headless_display_control_size(layout)?
+    };
+    let (width, height) = clamp_to_h264_software_limits(requested_w, requested_h);
+    if width == 0 || height == 0 || (width, height) == current_resolution {
+        return None;
+    }
+
+    Some(ResizeDecision {
+        target: if physical_output {
+            ResizeTarget::PhysicalPresentation
+        } else {
+            ResizeTarget::ManagedHeadlessOutput
+        },
+        width,
+        height,
+    })
+}
+
+fn headless_display_control_size(layout: &DisplayControlMonitorLayout) -> Option<(u32, u32)> {
+    let monitor = layout
+        .monitors()
+        .iter()
+        .find(|m| m.is_primary())
+        .or_else(|| layout.monitors().first())?;
+    Some(monitor.dimensions())
+}
+
+fn physical_display_control_size(layout: &DisplayControlMonitorLayout) -> Option<(u32, u32)> {
+    let [monitor] = layout.monitors() else {
+        return None;
+    };
+    if !monitor.is_primary() || monitor.position() != Some((0, 0)) {
+        return None;
+    }
+    if matches!(
+        monitor.orientation(),
+        Some(
+            MonitorOrientation::Portrait
+                | MonitorOrientation::LandscapeFlipped
+                | MonitorOrientation::PortraitFlipped
+        )
+    ) {
+        return None;
+    }
+
+    let (width, height) = monitor.dimensions();
+    if u64::from(width).saturating_mul(u64::from(height)) > DISPLAYCONTROL_MAX_PRESENTATION_AREA {
+        return None;
+    }
+
+    Some((width, height))
+}
+
+fn apply_presentation_state(inner: &mut HyprDisplayInner, width: u32, height: u32) -> DesktopSize {
+    inner.resolution = (width, height);
+    inner.width = width as u16;
+    inner.height = height as u16;
+    let desktop_size = DesktopSize {
+        width: inner.width,
+        height: inner.height,
+    };
+
+    if let Some(shared) = &inner.egfx_shared {
+        shared.set_surface_size(inner.width, inner.height);
+        shared.prepare_for_resize(inner.width, inner.height);
+    }
+    if let Err(e) = inner
+        .output_layout
+        .update_from_output_with_presentation(&inner.output_name, (width, height))
+    {
+        tracing::warn!(
+            "Failed to refresh input layout after presentation resize: {}",
+            e
+        );
+    }
+
+    desktop_size
+}
+
 /// RdpServerDisplay implementation that delegates to HyprDisplayInner.
 pub struct HyprDisplay {
     inner: Arc<Mutex<HyprDisplayInner>>,
@@ -139,13 +285,13 @@ impl HyprDisplay {
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
         let (tx, rx) = mpsc::channel(128);
         let requested_resolution = resolution;
-        let resolution = clamp_to_h264_software_limits(resolution.0, resolution.1);
-        if resolution != requested_resolution {
+        let configured_resolution = clamp_to_h264_software_limits(resolution.0, resolution.1);
+        if configured_resolution != requested_resolution {
             tracing::warn!(
                 requested_w = requested_resolution.0,
                 requested_h = requested_resolution.1,
-                applied_w = resolution.0,
-                applied_h = resolution.1,
+                applied_w = configured_resolution.0,
+                applied_h = configured_resolution.1,
                 "Configured resolution exceeds H.264 software encoder policy limit; clamping"
             );
         }
@@ -158,14 +304,14 @@ impl HyprDisplay {
             let stale = wayland::list_stale_headless_outputs().unwrap_or_default();
             if let Some(existing) = stale.into_iter().next() {
                 tracing::info!(name = %existing, "Reusing headless output from previous session");
-                let mode = format!("{}x{}@60", resolution.0, resolution.1);
+                let mode = format!("{}x{}@60", configured_resolution.0, configured_resolution.1);
                 let rule = format!("{},{},-9999x0,1", existing, mode);
                 crate::hyprland::keyword_monitor(&rule)
                     .context("failed to resize reused headless output")?;
                 wayland::wait_for_output_size(
                     &existing,
-                    resolution.0,
-                    resolution.1,
+                    configured_resolution.0,
+                    configured_resolution.1,
                     Duration::from_secs(5),
                 )?;
                 (
@@ -173,11 +319,14 @@ impl HyprDisplay {
                     Some(wayland::HeadlessOutputGuard::adopt(existing)),
                 )
             } else {
-                let (name, guard) = wayland::create_headless_output(resolution.0, resolution.1)?;
+                let (name, guard) = wayland::create_headless_output(
+                    configured_resolution.0,
+                    configured_resolution.1,
+                )?;
                 wayland::wait_for_output_size(
                     &name,
-                    resolution.0,
-                    resolution.1,
+                    configured_resolution.0,
+                    configured_resolution.1,
                     Duration::from_secs(5),
                 )?;
                 (name, Some(guard))
@@ -186,8 +335,14 @@ impl HyprDisplay {
 
         let capture_info = wayland::output_info(&output_name)
             .context("failed to get initial output dimensions")?;
+        let presentation_resolution = startup_presentation_size(
+            output.is_some(),
+            resolution_fixed,
+            configured_resolution,
+            (capture_info.width, capture_info.height),
+        );
         output_layout
-            .update_from_output(&output_name)
+            .update_from_output_with_presentation(&output_name, presentation_resolution)
             .context("failed to initialize input layout for output")?;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -199,14 +354,16 @@ impl HyprDisplay {
         tracing::info!(
             width = capture_info.width,
             height = capture_info.height,
+            presentation_w = presentation_resolution.0,
+            presentation_h = presentation_resolution.1,
             "Display prepared via {}; capture will start on client connection",
             protocol_name
         );
 
         let inner = Arc::new(Mutex::new(HyprDisplayInner {
-            width: capture_info.width as u16,
-            height: capture_info.height as u16,
-            resolution,
+            width: presentation_resolution.0 as u16,
+            height: presentation_resolution.1 as u16,
+            resolution: presentation_resolution,
             capture_mode,
             output_name: capture_info.output_name,
             egfx_shared: Some(egfx_shared),
@@ -225,7 +382,10 @@ impl HyprDisplay {
             pending_initial_resize: None,
         }));
 
-        let dims = (capture_info.width as u16, capture_info.height as u16);
+        let dims = (
+            presentation_resolution.0 as u16,
+            presentation_resolution.1 as u16,
+        );
         let handle = HyprDisplayHandle {
             inner: Arc::clone(&inner),
         };
@@ -260,39 +420,47 @@ impl RdpServerDisplay for HyprDisplay {
         }
 
         let mut inner = self.inner.lock().await;
-        if cw > 0
-            && ch > 0
-            && (cw != inner.resolution.0 || ch != inner.resolution.1)
-            && !inner.resolution_fixed
-            && inner.output.is_none()
-        {
-            tracing::info!(
-                client_w = requested_w,
-                client_h = requested_h,
-                applied_w = cw,
-                applied_h = ch,
-                server_w = inner.width,
-                server_h = inner.height,
-                "Client requested initial size; resizing headless output"
-            );
+        if let Some(decision) = initial_size_resize_decision(
+            inner.output.is_some(),
+            inner.resolution_fixed,
+            inner.resolution,
+            (cw, ch),
+        ) {
+            match decision.target {
+                ResizeTarget::ManagedHeadlessOutput => {
+                    tracing::info!(
+                        client_w = requested_w,
+                        client_h = requested_h,
+                        applied_w = decision.width,
+                        applied_h = decision.height,
+                        server_w = inner.width,
+                        server_h = inner.height,
+                        "Client requested initial size; resizing headless output"
+                    );
 
-            if let Err(e) = resize_headless_output(&inner.output_name, cw, ch) {
-                tracing::warn!("Failed to apply client initial size: {}", e);
-            } else {
-                inner.resolution = (cw, ch);
-                inner.width = cw as u16;
-                inner.height = ch as u16;
-                let desktop_size = DesktopSize {
-                    width: inner.width,
-                    height: inner.height,
-                };
-                inner.pending_initial_resize = Some(desktop_size);
-                if let Some(shared) = &inner.egfx_shared {
-                    shared.set_surface_size(inner.width, inner.height);
-                    shared.prepare_for_resize(inner.width, inner.height);
+                    if let Err(e) =
+                        resize_headless_output(&inner.output_name, decision.width, decision.height)
+                    {
+                        tracing::warn!("Failed to apply client initial size: {}", e);
+                    } else {
+                        let desktop_size =
+                            apply_presentation_state(&mut inner, decision.width, decision.height);
+                        inner.pending_initial_resize = Some(desktop_size);
+                    }
                 }
-                if let Err(e) = inner.output_layout.update_from_output(&inner.output_name) {
-                    tracing::warn!("Failed to refresh input layout after initial resize: {}", e);
+                ResizeTarget::PhysicalPresentation => {
+                    tracing::info!(
+                        client_w = requested_w,
+                        client_h = requested_h,
+                        applied_w = decision.width,
+                        applied_h = decision.height,
+                        server_w = inner.width,
+                        server_h = inner.height,
+                        "Client requested initial size; updating physical-output presentation"
+                    );
+                    let desktop_size =
+                        apply_presentation_state(&mut inner, decision.width, decision.height);
+                    inner.pending_initial_resize = Some(desktop_size);
                 }
             }
         } else if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
@@ -338,68 +506,64 @@ impl RdpServerDisplay for HyprDisplay {
             "Client requested DisplayControl layout"
         );
 
-        if requested_w == 0
-            || requested_h == 0
-            || requested_w > u16::MAX as u32
-            || requested_h > u16::MAX as u32
-        {
-            tracing::warn!(
-                w = requested_w,
-                h = requested_h,
-                "Ignoring invalid DisplayControl dimensions"
+        let mut inner = self.inner.blocking_lock();
+        let Some(decision) = display_control_resize_decision(
+            &layout,
+            inner.output.is_some(),
+            inner.resolution_fixed,
+            inner.resolution,
+        ) else {
+            tracing::trace!(
+                resolution_fixed = inner.resolution_fixed,
+                physical_output = inner.output.is_some(),
+                "Ignoring DisplayControl layout for current output policy"
             );
             return;
-        }
+        };
 
-        let (w, h) = clamp_to_h264_software_limits(requested_w, requested_h);
-        if w != (requested_w & !1) || h != (requested_h & !1) {
+        if decision.width != (requested_w & !1) || decision.height != (requested_h & !1) {
             tracing::warn!(
                 requested_w,
                 requested_h,
-                applied_w = w,
-                applied_h = h,
+                applied_w = decision.width,
+                applied_h = decision.height,
                 "DisplayControl size exceeds H.264 software encoder policy limit; clamping"
             );
         }
 
-        if w == 0 || h == 0 {
-            tracing::warn!("Dimensions too small after even-rounding, ignoring");
-            return;
+        match decision.target {
+            ResizeTarget::ManagedHeadlessOutput => {
+                tracing::info!(
+                    w = decision.width,
+                    h = decision.height,
+                    "Client requested resize via DisplayControl"
+                );
+
+                if let Err(e) =
+                    resize_headless_output(&inner.output_name, decision.width, decision.height)
+                {
+                    tracing::warn!("Failed to resize headless output: {}", e);
+                    return;
+                }
+                let desktop_size =
+                    apply_presentation_state(&mut inner, decision.width, decision.height);
+                let _ = inner
+                    .update_tx
+                    .try_send(DisplayUpdate::Resize(desktop_size));
+            }
+            ResizeTarget::PhysicalPresentation => {
+                tracing::info!(
+                    w = decision.width,
+                    h = decision.height,
+                    "Client requested physical-output presentation resize via DisplayControl"
+                );
+                let desktop_size =
+                    apply_presentation_state(&mut inner, decision.width, decision.height);
+                let _ = inner
+                    .update_tx
+                    .try_send(DisplayUpdate::Resize(desktop_size));
+            }
         }
-
-        let mut inner = self.inner.blocking_lock();
-
-        if (w == inner.resolution.0 && h == inner.resolution.1)
-            || inner.output.is_some()
-            || inner.resolution_fixed
-        {
-            return;
-        }
-
-        tracing::info!(w, h, "Client requested resize via DisplayControl");
-
-        if let Err(e) = resize_headless_output(&inner.output_name, w, h) {
-            tracing::warn!("Failed to resize headless output: {}", e);
-            return;
-        }
-
-        inner.resolution = (w, h);
-        inner.width = w as u16;
-        inner.height = h as u16;
-
-        if let Some(shared) = &inner.egfx_shared {
-            shared.set_surface_size(inner.width, inner.height);
-            shared.prepare_for_resize(inner.width, inner.height);
-        }
-
-        if let Err(e) = inner.output_layout.update_from_output(&inner.output_name) {
-            tracing::warn!("Failed to refresh input layout after resize: {}", e);
-        }
-
-        let _ = inner.update_tx.try_send(DisplayUpdate::Resize(DesktopSize {
-            width: w as u16,
-            height: h as u16,
-        }));
     }
 
     async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
@@ -438,9 +602,17 @@ impl RdpServerDisplay for HyprDisplay {
         )
         .await?;
         inner.capture_handle = Some(capture_handle);
-        inner.width = capture_info.width as u16;
-        inner.height = capture_info.height as u16;
         inner.output_name = capture_info.output_name;
+        if let Some(snapshot) = inner.output_layout.snapshot() {
+            let presentation = snapshot.presentation_geometry.presentation();
+            inner.width = presentation.width as u16;
+            inner.height = presentation.height as u16;
+            inner.resolution = (presentation.width, presentation.height);
+        } else {
+            inner.width = capture_info.width as u16;
+            inner.height = capture_info.height as u16;
+            inner.resolution = (capture_info.width, capture_info.height);
+        }
 
         Ok(Box::new(HyprDisplayUpdates { rx }))
     }
@@ -480,5 +652,210 @@ mod tests {
     #[test]
     fn h264_software_limit_rounds_to_even_dimensions() {
         assert_eq!(clamp_to_h264_software_limits(5121, 1441), (3840, 1080));
+    }
+}
+
+#[cfg(test)]
+mod output_downscaling {
+    use super::*;
+    use ironrdp_displaycontrol::pdu::{
+        DeviceScaleFactor, DisplayControlMonitorLayout, MonitorLayoutEntry, MonitorOrientation,
+    };
+
+    fn single_primary(width: u32, height: u32) -> DisplayControlMonitorLayout {
+        DisplayControlMonitorLayout::new(&[MonitorLayoutEntry::new_primary(width, height).unwrap()])
+            .unwrap()
+    }
+
+    #[test]
+    fn physical_output_startup_uses_explicit_resolution_as_presentation() {
+        assert_eq!(
+            startup_presentation_size(true, true, (1920, 1080), (3840, 2160)),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn physical_output_startup_uses_source_size_when_resolution_is_omitted() {
+        assert_eq!(
+            startup_presentation_size(true, false, (1920, 1080), (3840, 2160)),
+            (3840, 2160)
+        );
+    }
+
+    #[test]
+    fn headless_startup_keeps_configured_session_resolution() {
+        assert_eq!(
+            startup_presentation_size(false, false, (1920, 1080), (3840, 2160)),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn physical_output_initial_size_updates_presentation_only() {
+        let decision =
+            initial_size_resize_decision(true, false, (3840, 2160), (1600, 900)).unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1600, 900));
+    }
+
+    #[test]
+    fn physical_output_initial_size_uses_desktop_size_policy_not_displaycontrol_layout_policy() {
+        let decision = initial_size_resize_decision(true, false, (3840, 2160), (100, 100)).unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (100, 100));
+    }
+
+    #[test]
+    fn fixed_zero_and_unchanged_initial_size_requests_are_noops() {
+        assert_eq!(
+            initial_size_resize_decision(true, true, (1920, 1080), (1600, 900)),
+            None
+        );
+        assert_eq!(
+            initial_size_resize_decision(true, false, (1920, 1080), (0, 900)),
+            None
+        );
+        assert_eq!(
+            initial_size_resize_decision(true, false, (1920, 1080), (1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_accepts_single_primary_at_origin() {
+        let decision =
+            display_control_resize_decision(&single_primary(1280, 720), true, false, (1920, 1080))
+                .unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1280, 720));
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_ignores_physical_size_and_scale_fields() {
+        let monitor = MonitorLayoutEntry::new_primary(1280, 720)
+            .unwrap()
+            .with_physical_dimensions(1000, 500)
+            .unwrap()
+            .with_desktop_scale_factor(150)
+            .unwrap()
+            .with_device_scale_factor(DeviceScaleFactor::Scale140Percent);
+        let layout = DisplayControlMonitorLayout::new(&[monitor]).unwrap();
+
+        let decision = display_control_resize_decision(&layout, true, false, (1920, 1080)).unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1280, 720));
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_rejects_multi_monitor_layouts() {
+        let monitors = [
+            MonitorLayoutEntry::new_primary(1280, 720).unwrap(),
+            MonitorLayoutEntry::new_secondary(1024, 768).unwrap(),
+        ];
+        let layout = DisplayControlMonitorLayout::new(&monitors).unwrap();
+
+        assert_eq!(
+            display_control_resize_decision(&layout, true, false, (1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_rejects_valid_rotated_orientation() {
+        let monitor = MonitorLayoutEntry::new_primary(1280, 720)
+            .unwrap()
+            .with_orientation(MonitorOrientation::Portrait);
+        let layout = DisplayControlMonitorLayout::new(&[monitor]).unwrap();
+
+        assert_eq!(
+            display_control_resize_decision(&layout, true, false, (1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_rejects_layouts_over_advertised_area_cap() {
+        assert_eq!(
+            display_control_resize_decision(&single_primary(8192, 2000), true, false, (1920, 1080)),
+            None
+        );
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_normalizes_odd_height_for_h264() {
+        let decision =
+            display_control_resize_decision(&single_primary(1280, 721), true, false, (1920, 1080))
+                .unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1280, 720));
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_fixed_and_unchanged_requests_are_noops() {
+        assert_eq!(
+            display_control_resize_decision(&single_primary(1280, 720), true, true, (1920, 1080)),
+            None
+        );
+        assert_eq!(
+            display_control_resize_decision(&single_primary(1920, 1080), true, false, (1920, 1080)),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod managed_headless_resize {
+    use super::*;
+    use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorLayoutEntry};
+
+    fn single_primary(width: u32, height: u32) -> DisplayControlMonitorLayout {
+        DisplayControlMonitorLayout::new(&[MonitorLayoutEntry::new_primary(width, height).unwrap()])
+            .unwrap()
+    }
+
+    #[test]
+    fn managed_headless_initial_size_still_targets_headless_output_resize() {
+        let decision =
+            initial_size_resize_decision(false, false, (1920, 1080), (1600, 900)).unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::ManagedHeadlessOutput);
+        assert_eq!((decision.width, decision.height), (1600, 900));
+    }
+
+    #[test]
+    fn managed_headless_displaycontrol_still_targets_headless_output_resize() {
+        let decision =
+            display_control_resize_decision(&single_primary(1600, 900), false, false, (1920, 1080))
+                .unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::ManagedHeadlessOutput);
+        assert_eq!((decision.width, decision.height), (1600, 900));
+    }
+
+    #[test]
+    fn managed_headless_fixed_and_unchanged_resize_requests_remain_noops() {
+        assert_eq!(
+            initial_size_resize_decision(false, true, (1920, 1080), (1600, 900)),
+            None
+        );
+        assert_eq!(
+            display_control_resize_decision(&single_primary(1600, 900), false, true, (1920, 1080)),
+            None
+        );
+        assert_eq!(
+            display_control_resize_decision(
+                &single_primary(1920, 1080),
+                false,
+                false,
+                (1920, 1080)
+            ),
+            None
+        );
     }
 }

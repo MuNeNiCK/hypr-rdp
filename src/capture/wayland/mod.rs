@@ -254,9 +254,19 @@ fn capture_thread_inner(
 ) -> Result<()> {
     verify_output_exists(&output_name)?;
 
-    output_layout
-        .update_from_output(&output_name)
-        .context("failed to refresh input layout for headless output")?;
+    if let Some(snapshot) = output_layout.snapshot() {
+        let presentation = snapshot.presentation_geometry.presentation();
+        output_layout
+            .update_from_output_with_presentation(
+                &output_name,
+                (presentation.width, presentation.height),
+            )
+            .context("failed to refresh input layout for output")?;
+    } else {
+        output_layout
+            .update_from_output(&output_name)
+            .context("failed to refresh input layout for output")?;
+    }
 
     let conn = Connection::connect_to_env().context("failed to connect to Wayland display")?;
     let mut event_queue = conn.new_event_queue::<AppState>();
@@ -296,6 +306,7 @@ fn capture_thread_inner(
             &wl_output,
             &shm,
             &output_name,
+            Arc::clone(&output_layout),
             egfx_shared,
             info_tx,
             bitrate,
@@ -319,6 +330,7 @@ fn capture_thread_inner(
                 &shm,
                 &screencopy_mgr,
                 &output_name,
+                Arc::clone(&output_layout),
                 egfx_shared,
                 info_tx,
                 bitrate,
