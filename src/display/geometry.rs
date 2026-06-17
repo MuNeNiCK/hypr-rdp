@@ -46,30 +46,11 @@ pub(crate) struct PresentationGeometry {
 
 impl PresentationGeometry {
     pub(crate) fn new(source: Size, presentation: Size) -> Self {
-        let source_w = u64::from(source.width);
-        let source_h = u64::from(source.height);
-        let presentation_w = u64::from(presentation.width);
-        let presentation_h = u64::from(presentation.height);
-
-        let (visible_w, visible_h) = if source_w * presentation_h > presentation_w * source_h {
-            let visible_h = ((presentation_w * source_h) / source_w)
-                .max(1)
-                .min(presentation_h);
-            (presentation_w, visible_h)
-        } else {
-            let visible_w = ((presentation_h * source_w) / source_h)
-                .max(1)
-                .min(presentation_w);
-            (visible_w, presentation_h)
-        };
-
-        let visible_w = visible_w as u32;
-        let visible_h = visible_h as u32;
         let visible = Rect {
-            x: (presentation.width - visible_w) / 2,
-            y: (presentation.height - visible_h) / 2,
-            width: visible_w,
-            height: visible_h,
+            x: 0,
+            y: 0,
+            width: presentation.width,
+            height: presentation.height,
         };
 
         Self {
@@ -199,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn aspect_fit_keeps_equal_aspect_ratio_full_frame() {
+    fn presentation_geometry_uses_full_frame_for_equal_aspect_ratio() {
         let geom = geometry((3840, 2160), (1280, 720));
 
         assert_eq!(
@@ -214,30 +195,30 @@ mod tests {
     }
 
     #[test]
-    fn aspect_fit_adds_horizontal_letterbox_bars() {
+    fn presentation_geometry_uses_full_frame_for_taller_presentation() {
         let geom = geometry((3840, 2160), (1024, 768));
 
         assert_eq!(
             geom.visible_rect(),
             Rect {
                 x: 0,
-                y: 96,
+                y: 0,
                 width: 1024,
-                height: 576
+                height: 768
             }
         );
     }
 
     #[test]
-    fn aspect_fit_adds_vertical_pillarbox_bars() {
+    fn presentation_geometry_uses_full_frame_for_wider_presentation() {
         let geom = geometry((1080, 1920), (1280, 720));
 
         assert_eq!(
             geom.visible_rect(),
             Rect {
-                x: 437,
+                x: 0,
                 y: 0,
-                width: 405,
+                width: 1280,
                 height: 720
             }
         );
@@ -256,16 +237,20 @@ mod tests {
 
         assert_eq!(
             geom.map_source_damage(&[(-10, -10, 20, 20)]),
-            vec![(0, 96, 3, 3)]
+            vec![(0, 0, 3, 4)]
         );
     }
 
     #[test]
-    fn presentation_points_in_bars_clamp_to_source_edges() {
+    fn presentation_points_map_full_surface_to_source_edges() {
         let geom = geometry((1920, 1080), (1024, 768));
 
-        assert_eq!(geom.map_presentation_point_to_source(512, 10).1, 0);
-        assert_eq!(geom.map_presentation_point_to_source(512, 760).1, 1079);
+        assert_eq!(geom.map_presentation_point_to_source(0, 0), (0, 0));
+        assert_eq!(
+            geom.map_presentation_point_to_source(1023, 767),
+            (1919, 1079)
+        );
+        assert_eq!(geom.map_presentation_point_to_source(512, 384), (960, 540));
     }
 
     proptest! {

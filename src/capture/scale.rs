@@ -26,7 +26,7 @@ pub(super) fn prepare_presentation_frame<'a>(
     source_width: u32,
     source_height: u32,
     source_stride: u32,
-    pixel_format: PixelFormat,
+    _pixel_format: PixelFormat,
     source_damage_regions: &[(i32, i32, i32, i32)],
     snapshot: &OutputLayoutSnapshot,
 ) -> Result<PreparedPresentationFrame<'a>> {
@@ -70,7 +70,6 @@ pub(super) fn prepare_presentation_frame<'a>(
         .and_then(|len| usize::try_from(len).ok())
         .context("presentation frame size overflow")?;
     let mut output = vec![0; len];
-    fill_black_bars(&mut output, pixel_format);
     copy_scaled_visible_rect(source_data, source_stride, &mut output, stride, geometry)?;
 
     Ok(PreparedPresentationFrame {
@@ -128,23 +127,6 @@ pub(super) fn presentation_frame_shape(
             .checked_mul(4)
             .context("presentation stride overflow")?;
         Ok((presentation.width, presentation.height, stride))
-    }
-}
-
-fn fill_black_bars(output: &mut [u8], pixel_format: PixelFormat) {
-    for pixel in output.chunks_exact_mut(4) {
-        pixel[0] = 0;
-        pixel[1] = 0;
-        pixel[2] = 0;
-        pixel[3] = 0;
-        match pixel_format {
-            PixelFormat::ARgb32 | PixelFormat::ABgr32 => pixel[0] = 255,
-            PixelFormat::BgrA32 | PixelFormat::RgbA32 => pixel[3] = 255,
-            PixelFormat::XRgb32
-            | PixelFormat::XBgr32
-            | PixelFormat::BgrX32
-            | PixelFormat::RgbX32 => {}
-        }
     }
 }
 
@@ -256,7 +238,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_scale_maps_source_frame_to_presentation_with_black_bars() {
+    fn capture_scale_maps_source_frame_to_full_presentation_without_bars() {
         let source = frame(4, 2, 16);
         let prepared = prepare_presentation_frame(
             &source,
@@ -273,9 +255,9 @@ mod tests {
         assert_eq!(prepared.width, 4);
         assert_eq!(prepared.height, 4);
         assert_eq!(prepared.stride, 16);
-        assert_eq!(&prepared.data[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&prepared.data[0..4], &[0, 0, 0x80, 0xff]);
         assert_eq!(&prepared.data[16..20], &[0, 0, 0x80, 0xff]);
-        assert_eq!(&prepared.data[48..52], &[0, 0, 0, 255]);
+        assert_eq!(&prepared.data[48..52], &[0, 1, 0x80, 0xff]);
     }
 
     #[test]
