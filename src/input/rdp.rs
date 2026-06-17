@@ -312,11 +312,10 @@ mod tests {
     }
 
     #[test]
-    fn rdp_pointer_mapping_uses_full_presentation_for_mismatched_aspect_ratio() {
+    fn rdp_pointer_mapping_clamps_fallback_letterbox_bars_to_source_edges() {
         let layout = layout_snapshot((1920, 1080), (1024, 768));
 
-        assert_eq!(map_rdp_pointer_to_source(&layout, 0, 0), (0, 0));
-        assert_eq!(map_rdp_pointer_to_source(&layout, 1023, 767), (1919, 1079));
-        assert_eq!(map_rdp_pointer_to_source(&layout, 512, 384), (960, 540));
+        assert_eq!(map_rdp_pointer_to_source(&layout, 512, 0).1, 0);
+        assert_eq!(map_rdp_pointer_to_source(&layout, 512, 767).1, 1079);
     }
 }

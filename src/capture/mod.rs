@@ -120,6 +120,45 @@ fn clamp_to_h264_software_limits(width: u32, height: u32) -> (u32, u32) {
     (scaled_width, scaled_height)
 }
 
+fn normalize_to_source_aspect_bounds(
+    requested_size: (u32, u32),
+    source_size: (u32, u32),
+) -> (u32, u32) {
+    let (requested_w, requested_h) =
+        clamp_to_h264_software_limits(requested_size.0, requested_size.1);
+    let (source_w, source_h) = source_size;
+    if requested_w == 0 || requested_h == 0 || source_w == 0 || source_h == 0 {
+        return (0, 0);
+    }
+
+    let requested_w_u64 = u64::from(requested_w);
+    let requested_h_u64 = u64::from(requested_h);
+    let source_w_u64 = u64::from(source_w);
+    let source_h_u64 = u64::from(source_h);
+
+    let (width, height) = if requested_w_u64.saturating_mul(source_h_u64)
+        <= requested_h_u64.saturating_mul(source_w_u64)
+    {
+        (
+            requested_w,
+            ((requested_w_u64 * source_h_u64) / source_w_u64) as u32,
+        )
+    } else {
+        (
+            ((requested_h_u64 * source_w_u64) / source_h_u64) as u32,
+            requested_h,
+        )
+    };
+
+    let width = width & !1;
+    let height = height & !1;
+    if width == 0 || height == 0 {
+        (0, 0)
+    } else {
+        (width, height)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ResizeTarget {
     ManagedHeadlessOutput,
@@ -139,10 +178,15 @@ fn startup_presentation_size(
     configured_resolution: (u32, u32),
     source_size: (u32, u32),
 ) -> (u32, u32) {
-    if physical_output && !resolution_fixed {
+    let requested = if physical_output && !resolution_fixed {
         source_size
     } else {
         configured_resolution
+    };
+    if physical_output {
+        normalize_to_source_aspect_bounds(requested, source_size)
+    } else {
+        requested
     }
 }
 
@@ -151,12 +195,17 @@ fn initial_size_resize_decision(
     resolution_fixed: bool,
     current_resolution: (u32, u32),
     requested_size: (u32, u32),
+    source_size: Option<(u32, u32)>,
 ) -> Option<ResizeDecision> {
     if resolution_fixed {
         return None;
     }
 
-    let (width, height) = requested_size;
+    let (width, height) = if physical_output {
+        normalize_to_source_aspect_bounds(requested_size, source_size?)
+    } else {
+        requested_size
+    };
     if width == 0 || height == 0 || (width, height) == current_resolution {
         return None;
     }
@@ -177,6 +226,7 @@ fn display_control_resize_decision(
     physical_output: bool,
     resolution_fixed: bool,
     current_resolution: (u32, u32),
+    source_size: Option<(u32, u32)>,
 ) -> Option<ResizeDecision> {
     if resolution_fixed {
         return None;
@@ -187,7 +237,11 @@ fn display_control_resize_decision(
     } else {
         headless_display_control_size(layout)?
     };
-    let (width, height) = clamp_to_h264_software_limits(requested_w, requested_h);
+    let (width, height) = if physical_output {
+        normalize_to_source_aspect_bounds((requested_w, requested_h), source_size?)
+    } else {
+        clamp_to_h264_software_limits(requested_w, requested_h)
+    };
     if width == 0 || height == 0 || (width, height) == current_resolution {
         return None;
     }
@@ -368,12 +422,28 @@ impl HyprDisplay {
 
         let capture_info = wayland::output_info(&output_name)
             .context("failed to get initial output dimensions")?;
+        let requested_presentation_resolution = if output.is_some() && !resolution_fixed {
+            (capture_info.width, capture_info.height)
+        } else {
+            configured_resolution
+        };
         let presentation_resolution = startup_presentation_size(
             output.is_some(),
             resolution_fixed,
             configured_resolution,
             (capture_info.width, capture_info.height),
         );
+        if output.is_some() && presentation_resolution != requested_presentation_resolution {
+            tracing::info!(
+                requested_w = requested_presentation_resolution.0,
+                requested_h = requested_presentation_resolution.1,
+                source_w = capture_info.width,
+                source_h = capture_info.height,
+                applied_w = presentation_resolution.0,
+                applied_h = presentation_resolution.1,
+                "Physical output presentation bounds normalized to source aspect"
+            );
+        }
         output_layout
             .update_from_output_with_presentation(&output_name, presentation_resolution)
             .context("failed to initialize input layout for output")?;
@@ -447,11 +517,16 @@ impl HyprDisplay {
         }
 
         let mut inner = self.inner.lock().await;
+        let source_size = inner
+            .output_layout
+            .snapshot()
+            .map(|snapshot| (snapshot.output_w, snapshot.output_h));
         if let Some(decision) = initial_size_resize_decision(
             inner.output.is_some(),
             inner.resolution_fixed,
             inner.resolution,
             (cw, ch),
+            source_size,
         ) {
             match decision.target {
                 ResizeTarget::ManagedHeadlessOutput => {
@@ -543,11 +618,16 @@ impl HyprDisplay {
         );
 
         let mut inner = self.inner.blocking_lock();
+        let source_size = inner
+            .output_layout
+            .snapshot()
+            .map(|snapshot| (snapshot.output_w, snapshot.output_h));
         let Some(decision) = display_control_resize_decision(
             &layout,
             inner.output.is_some(),
             inner.resolution_fixed,
             inner.resolution,
+            source_size,
         ) else {
             tracing::trace!(
                 resolution_fixed = inner.resolution_fixed,
@@ -558,13 +638,26 @@ impl HyprDisplay {
         };
 
         if decision.width != (requested_w & !1) || decision.height != (requested_h & !1) {
-            tracing::warn!(
-                requested_w,
-                requested_h,
-                applied_w = decision.width,
-                applied_h = decision.height,
-                "DisplayControl size exceeds H.264 software encoder policy limit; clamping"
-            );
+            match decision.target {
+                ResizeTarget::PhysicalPresentation => {
+                    tracing::info!(
+                        requested_w,
+                        requested_h,
+                        applied_w = decision.width,
+                        applied_h = decision.height,
+                        "DisplayControl presentation bounds normalized to physical output aspect"
+                    );
+                }
+                ResizeTarget::ManagedHeadlessOutput => {
+                    tracing::warn!(
+                        requested_w,
+                        requested_h,
+                        applied_w = decision.width,
+                        applied_h = decision.height,
+                        "DisplayControl size exceeds H.264 software encoder policy limit; clamping"
+                    );
+                }
+            }
         }
 
         match decision.target {
@@ -744,6 +837,18 @@ mod output_downscaling {
         Arc<EgfxShared>,
         Arc<SharedOutputLayout>,
     ) {
+        physical_display_for_callback_test_with_source(resolution, resolution)
+    }
+
+    fn physical_display_for_callback_test_with_source(
+        source: (u32, u32),
+        resolution: (u32, u32),
+    ) -> (
+        HyprDisplay,
+        mpsc::Receiver<DisplayUpdate>,
+        Arc<EgfxShared>,
+        Arc<SharedOutputLayout>,
+    ) {
         let (tx, rx) = mpsc::channel(4);
         let shared = Arc::new(EgfxShared::with_codec_policy(
             DEFAULT_MAX_FRAMES_IN_FLIGHT,
@@ -753,14 +858,7 @@ mod output_downscaling {
         let output_layout = Arc::new(SharedOutputLayout::new());
         output_layout
             .update_snapshot_for_test(
-                "DP-1",
-                resolution.0,
-                resolution.1,
-                resolution.0,
-                resolution.1,
-                0,
-                0,
-                resolution,
+                "DP-1", source.0, source.1, source.0, source.1, 0, 0, resolution,
             )
             .expect("initial physical layout");
         let inner = HyprDisplayInner {
@@ -814,10 +912,14 @@ mod output_downscaling {
     }
 
     #[test]
-    fn physical_output_startup_uses_explicit_resolution_as_presentation() {
+    fn physical_output_startup_normalizes_explicit_resolution_bounds_to_source_aspect() {
         assert_eq!(
-            startup_presentation_size(true, true, (1920, 1080), (3840, 2160)),
-            (1920, 1080)
+            startup_presentation_size(true, true, (1920, 1200), (3840, 1080)),
+            (1920, 540)
+        );
+        assert_eq!(
+            startup_presentation_size(true, true, (1600, 900), (3840, 2160)),
+            (1600, 900)
         );
     }
 
@@ -839,22 +941,44 @@ mod output_downscaling {
 
     #[test]
     fn physical_output_initial_size_updates_presentation_only() {
-        let decision =
-            initial_size_resize_decision(true, false, (3840, 2160), (1600, 900)).unwrap();
+        let decision = initial_size_resize_decision(
+            true,
+            false,
+            (3840, 2160),
+            (1600, 900),
+            Some((3840, 2160)),
+        )
+        .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
         assert_eq!((decision.width, decision.height), (1600, 900));
     }
 
+    #[test]
+    fn physical_output_initial_size_uses_client_size_as_source_aspect_bounds() {
+        let decision = initial_size_resize_decision(
+            true,
+            false,
+            (3840, 1080),
+            (1920, 1200),
+            Some((3840, 1080)),
+        )
+        .unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1920, 540));
+    }
+
     #[tokio::test]
     async fn physical_output_initial_size_callback_updates_presentation_state() {
-        let (mut display, _rx, shared, _layout) = physical_display_for_callback_test((3840, 2160));
+        let (mut display, _rx, shared, _layout) =
+            physical_display_for_callback_test_with_source((3840, 1080), (3840, 1080));
 
         let size = display
             .request_initial_size_with(
                 DesktopSize {
-                    width: 1600,
-                    height: 900,
+                    width: 1920,
+                    height: 1200,
                 },
                 |_name, _width, _height| panic!("physical output must not resize headless output"),
                 refresh_physical_layout_for_test,
@@ -864,19 +988,19 @@ mod output_downscaling {
         assert_eq!(
             size,
             DesktopSize {
-                width: 1600,
-                height: 900
+                width: 1920,
+                height: 540
             }
         );
-        assert_eq!(shared.get_surface_size(), (1600, 900));
+        assert_eq!(shared.get_surface_size(), (1920, 540));
 
         let inner = display.inner.lock().await;
-        assert_eq!(inner.resolution, (1600, 900));
+        assert_eq!(inner.resolution, (1920, 540));
         assert_eq!(
             inner.pending_initial_resize,
             Some(DesktopSize {
-                width: 1600,
-                height: 900
+                width: 1920,
+                height: 540
             })
         );
     }
@@ -912,36 +1036,64 @@ mod output_downscaling {
 
     #[test]
     fn physical_output_initial_size_uses_desktop_size_policy_not_displaycontrol_layout_policy() {
-        let decision = initial_size_resize_decision(true, false, (3840, 2160), (100, 100)).unwrap();
+        let decision =
+            initial_size_resize_decision(true, false, (3840, 2160), (100, 100), Some((3840, 2160)))
+                .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
-        assert_eq!((decision.width, decision.height), (100, 100));
+        assert_eq!((decision.width, decision.height), (100, 56));
     }
 
     #[test]
     fn fixed_zero_and_unchanged_initial_size_requests_are_noops() {
         assert_eq!(
-            initial_size_resize_decision(true, true, (1920, 1080), (1600, 900)),
+            initial_size_resize_decision(true, true, (1920, 1080), (1600, 900), Some((1920, 1080))),
             None
         );
         assert_eq!(
-            initial_size_resize_decision(true, false, (1920, 1080), (0, 900)),
+            initial_size_resize_decision(true, false, (1920, 1080), (0, 900), Some((1920, 1080))),
             None
         );
         assert_eq!(
-            initial_size_resize_decision(true, false, (1920, 1080), (1920, 1080)),
+            initial_size_resize_decision(
+                true,
+                false,
+                (1920, 540),
+                (1920, 1200),
+                Some((3840, 1080))
+            ),
             None
         );
     }
 
     #[test]
     fn physical_output_displaycontrol_accepts_single_primary_at_origin() {
-        let decision =
-            display_control_resize_decision(&single_primary(1280, 720), true, false, (1920, 1080))
-                .unwrap();
+        let decision = display_control_resize_decision(
+            &single_primary(1280, 720),
+            true,
+            false,
+            (1920, 1080),
+            Some((1920, 1080)),
+        )
+        .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
         assert_eq!((decision.width, decision.height), (1280, 720));
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_uses_monitor_size_as_source_aspect_bounds() {
+        let decision = display_control_resize_decision(
+            &single_primary(1920, 1200),
+            true,
+            false,
+            (3840, 1080),
+            Some((3840, 1080)),
+        )
+        .unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1920, 540));
     }
 
     #[test]
@@ -1002,7 +1154,9 @@ mod output_downscaling {
             .with_device_scale_factor(DeviceScaleFactor::Scale140Percent);
         let layout = DisplayControlMonitorLayout::new(&[monitor]).unwrap();
 
-        let decision = display_control_resize_decision(&layout, true, false, (1920, 1080)).unwrap();
+        let decision =
+            display_control_resize_decision(&layout, true, false, (1920, 1080), Some((1920, 1080)))
+                .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
         assert_eq!((decision.width, decision.height), (1280, 720));
@@ -1017,7 +1171,7 @@ mod output_downscaling {
         let layout = DisplayControlMonitorLayout::new(&monitors).unwrap();
 
         assert_eq!(
-            display_control_resize_decision(&layout, true, false, (1920, 1080)),
+            display_control_resize_decision(&layout, true, false, (1920, 1080), Some((1920, 1080))),
             None
         );
     }
@@ -1030,7 +1184,7 @@ mod output_downscaling {
         let layout = DisplayControlMonitorLayout::new(&[monitor]).unwrap();
 
         assert_eq!(
-            display_control_resize_decision(&layout, true, false, (1920, 1080)),
+            display_control_resize_decision(&layout, true, false, (1920, 1080), Some((1920, 1080))),
             None
         );
     }
@@ -1038,16 +1192,27 @@ mod output_downscaling {
     #[test]
     fn physical_output_displaycontrol_rejects_layouts_over_advertised_area_cap() {
         assert_eq!(
-            display_control_resize_decision(&single_primary(8192, 2000), true, false, (1920, 1080)),
+            display_control_resize_decision(
+                &single_primary(8192, 2000),
+                true,
+                false,
+                (1920, 1080),
+                Some((1920, 1080))
+            ),
             None
         );
     }
 
     #[test]
     fn physical_output_displaycontrol_normalizes_odd_height_for_h264() {
-        let decision =
-            display_control_resize_decision(&single_primary(1280, 721), true, false, (1920, 1080))
-                .unwrap();
+        let decision = display_control_resize_decision(
+            &single_primary(1280, 721),
+            true,
+            false,
+            (1920, 1080),
+            Some((1920, 1080)),
+        )
+        .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
         assert_eq!((decision.width, decision.height), (1280, 720));
@@ -1056,11 +1221,23 @@ mod output_downscaling {
     #[test]
     fn physical_output_displaycontrol_fixed_and_unchanged_requests_are_noops() {
         assert_eq!(
-            display_control_resize_decision(&single_primary(1280, 720), true, true, (1920, 1080)),
+            display_control_resize_decision(
+                &single_primary(1280, 720),
+                true,
+                true,
+                (1920, 1080),
+                Some((1920, 1080))
+            ),
             None
         );
         assert_eq!(
-            display_control_resize_decision(&single_primary(1920, 1080), true, false, (1920, 1080)),
+            display_control_resize_decision(
+                &single_primary(1920, 1080),
+                true,
+                false,
+                (1920, 1080),
+                Some((1920, 1080))
+            ),
             None
         );
     }
@@ -1155,7 +1332,7 @@ mod managed_headless_resize {
     #[test]
     fn managed_headless_initial_size_still_targets_headless_output_resize() {
         let decision =
-            initial_size_resize_decision(false, false, (1920, 1080), (1600, 900)).unwrap();
+            initial_size_resize_decision(false, false, (1920, 1080), (1600, 900), None).unwrap();
 
         assert_eq!(decision.target, ResizeTarget::ManagedHeadlessOutput);
         assert_eq!((decision.width, decision.height), (1600, 900));
@@ -1202,9 +1379,14 @@ mod managed_headless_resize {
 
     #[test]
     fn managed_headless_displaycontrol_still_targets_headless_output_resize() {
-        let decision =
-            display_control_resize_decision(&single_primary(1600, 900), false, false, (1920, 1080))
-                .unwrap();
+        let decision = display_control_resize_decision(
+            &single_primary(1600, 900),
+            false,
+            false,
+            (1920, 1080),
+            None,
+        )
+        .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::ManagedHeadlessOutput);
         assert_eq!((decision.width, decision.height), (1600, 900));
@@ -1340,11 +1522,17 @@ mod managed_headless_resize {
     #[test]
     fn managed_headless_fixed_and_unchanged_resize_requests_remain_noops() {
         assert_eq!(
-            initial_size_resize_decision(false, true, (1920, 1080), (1600, 900)),
+            initial_size_resize_decision(false, true, (1920, 1080), (1600, 900), None),
             None
         );
         assert_eq!(
-            display_control_resize_decision(&single_primary(1600, 900), false, true, (1920, 1080)),
+            display_control_resize_decision(
+                &single_primary(1600, 900),
+                false,
+                true,
+                (1920, 1080),
+                None
+            ),
             None
         );
         assert_eq!(
@@ -1352,7 +1540,8 @@ mod managed_headless_resize {
                 &single_primary(1920, 1080),
                 false,
                 false,
-                (1920, 1080)
+                (1920, 1080),
+                None
             ),
             None
         );
