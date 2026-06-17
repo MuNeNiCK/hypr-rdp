@@ -856,6 +856,8 @@ impl FrameProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capture::scale::prepare_presentation_frame;
+    use crate::display::geometry::{PresentationGeometry, Size};
     use crate::egfx::test_support::{
         ack_frame, drain_gfx_pdus, negotiated_avc444_egfx, negotiated_egfx_with_policy,
         negotiated_no_avc_egfx, process_avc444_capabilities, start_gfx_channel,
@@ -865,6 +867,7 @@ mod tests {
     use crate::egfx::{
         EgfxCodecPolicy, H264RateControl, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT,
     };
+    use crate::input::OutputLayoutSnapshot;
     use ironrdp_server::{DisplayUpdate, PixelFormat};
     use ironrdp_server::{GfxServerFactory, ServerEventSender};
     use std::sync::Arc;
@@ -954,6 +957,25 @@ mod tests {
         frame[offset + 1] = g;
         frame[offset + 2] = r;
         frame[offset + 3] = 255;
+    }
+
+    fn output_layout_snapshot(
+        source: (u32, u32),
+        presentation: (u32, u32),
+    ) -> OutputLayoutSnapshot {
+        let source_size = Size::new(source.0, source.1).unwrap();
+        let presentation_size = Size::new(presentation.0, presentation.1).unwrap();
+        OutputLayoutSnapshot {
+            output_name: "DP-1".into(),
+            output_w: source.0,
+            output_h: source.1,
+            layout_extent_w: source.0,
+            layout_extent_h: source.1,
+            output_offset_x: 0,
+            output_offset_y: 0,
+            presentation_geometry: PresentationGeometry::new(source_size, presentation_size),
+            geometry_generation: 0,
+        }
     }
 
     fn mutate_bgra_tile(
@@ -1199,6 +1221,53 @@ mod tests {
             stride,
             PixelFormat::BgrA32,
             &frame,
+        );
+    }
+
+    #[test]
+    fn bitmap_output_downscaling_uses_presentation_dimensions_stride_and_payload() {
+        let source_width = 4;
+        let source_height = 2;
+        let source_stride = source_width * 4;
+        let source = gradient_bgra_frame(source_width, source_height, source_stride);
+        let prepared = prepare_presentation_frame(
+            &source,
+            source_width as u32,
+            source_height as u32,
+            source_stride as u32,
+            PixelFormat::BgrA32,
+            &[(0, 0, source_width as i32, source_height as i32)],
+            &output_layout_snapshot(
+                (source_width as u32, source_height as u32),
+                (source_width as u32, 4),
+            ),
+        )
+        .expect("scaled frame prepares");
+
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let mut processor = FrameProcessor::new(
+            None,
+            prepared.width,
+            prepared.height,
+            PixelFormat::BgrA32,
+            prepared.stride,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        );
+        processor.queue_damage(&prepared.damage_regions);
+
+        assert!(processor.process(prepared.data.as_ref(), &display_tx));
+        assert!(processor.sent_first_frame);
+        assert!(processor.pending_damage_regions.is_empty());
+        assert_bitmap_update(
+            &mut display_rx,
+            prepared.width as usize,
+            prepared.height as usize,
+            prepared.stride as usize,
+            PixelFormat::BgrA32,
+            prepared.data.as_ref(),
         );
     }
 

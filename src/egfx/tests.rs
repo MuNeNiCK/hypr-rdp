@@ -64,6 +64,43 @@ fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
 }
 
 #[test]
+fn egfx_output_downscaling_surface_lifecycle_uses_presentation_dimensions() {
+    let (_shared, _bridge, handle, event_tx, mut event_rx) =
+        negotiated_avc420_session(1920, 1080, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+
+    let surface_id =
+        EgfxShared::init_surface(&handle, &event_tx, 1920, 1080).expect("surface init");
+    let pdus = drain_gfx_pdus(&mut event_rx);
+
+    assert_eq!(pdus.len(), 3);
+    match &pdus.as_slice()[0] {
+        GfxPdu::ResetGraphics(reset) => {
+            assert_eq!(reset.width, 1920);
+            assert_eq!(reset.height, 1080);
+            assert!(reset.monitors.is_empty());
+        }
+        other => panic!("expected ResetGraphics first, got {other:?}"),
+    }
+    match &pdus.as_slice()[1] {
+        GfxPdu::CreateSurface(create) => {
+            assert_eq!(create.surface_id, surface_id);
+            assert_eq!(create.width, 1920);
+            assert_eq!(create.height, 1080);
+            assert_eq!(create.pixel_format, PixelFormat::XRgb);
+        }
+        other => panic!("expected CreateSurface second, got {other:?}"),
+    }
+    match &pdus.as_slice()[2] {
+        GfxPdu::MapSurfaceToOutput(map) => {
+            assert_eq!(map.surface_id, surface_id);
+            assert_eq!(map.output_origin_x, 0);
+            assert_eq!(map.output_origin_y, 0);
+        }
+        other => panic!("expected MapSurfaceToOutput third, got {other:?}"),
+    }
+}
+
+#[test]
 fn surface_reuse_does_not_emit_duplicate_create_or_map_for_same_size() {
     let (shared, _bridge, handle, event_tx, mut event_rx) =
         negotiated_avc420_session(1280, 720, DEFAULT_MAX_FRAMES_IN_FLIGHT);

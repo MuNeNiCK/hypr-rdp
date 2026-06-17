@@ -2,6 +2,7 @@ use ironrdp_server::{ClientKeyboardData, KeyboardEvent, MouseEvent, RdpServerInp
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 
 use super::keyboard::{generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout};
+use super::layout::OutputLayoutSnapshot;
 use super::wayland::HyprInputHandler;
 use super::{keymap, wayland::InputState, KeyboardLayoutPolicy};
 
@@ -100,9 +101,10 @@ impl RdpServerInputHandler for HyprInputHandler {
                 let Some(layout) = state.output_layout.snapshot() else {
                     return;
                 };
+                let (source_x, source_y) = map_rdp_pointer_to_source(&layout, x, y);
                 state
                     .vp
-                    .motion_absolute(t, x as u32, y as u32, layout.output_w, layout.output_h);
+                    .motion_absolute(t, source_x, source_y, layout.output_w, layout.output_h);
                 state.vp.frame();
                 state.flush();
             }
@@ -197,6 +199,12 @@ impl RdpServerInputHandler for HyprInputHandler {
     }
 }
 
+fn map_rdp_pointer_to_source(layout: &OutputLayoutSnapshot, x: u16, y: u16) -> (u32, u32) {
+    layout
+        .presentation_geometry
+        .map_presentation_point_to_source(u32::from(x), u32::from(y))
+}
+
 fn client_keymap_from_keyboard_layout(
     keyboard_layout_policy: KeyboardLayoutPolicy,
     keyboard_layout: u32,
@@ -248,9 +256,27 @@ fn apply_client_keymap(
 
 #[cfg(test)]
 mod tests {
-    use super::client_keymap_from_keyboard_layout;
+    use super::{client_keymap_from_keyboard_layout, map_rdp_pointer_to_source};
+    use crate::display::geometry::{PresentationGeometry, Size};
     use crate::input::keyboard::KeyboardStateTracker;
     use crate::input::KeyboardLayoutPolicy;
+    use crate::input::OutputLayoutSnapshot;
+
+    fn layout_snapshot(source: (u32, u32), presentation: (u32, u32)) -> OutputLayoutSnapshot {
+        let source_size = Size::new(source.0, source.1).unwrap();
+        let presentation_size = Size::new(presentation.0, presentation.1).unwrap();
+        OutputLayoutSnapshot {
+            output_name: "DP-1".into(),
+            output_w: source.0,
+            output_h: source.1,
+            layout_extent_w: source.0,
+            layout_extent_h: source.1,
+            output_offset_x: 0,
+            output_offset_y: 0,
+            presentation_geometry: PresentationGeometry::new(source_size, presentation_size),
+            geometry_generation: 0,
+        }
+    }
 
     #[test]
     fn client_keyboard_layout_generates_non_us_keymap() {
@@ -275,5 +301,21 @@ mod tests {
             client_keymap_from_keyboard_layout(KeyboardLayoutPolicy::Compositor, 0x00000407,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn rdp_pointer_mapping_uses_source_coordinates_for_scaled_output() {
+        let layout = layout_snapshot((3840, 2160), (1920, 1080));
+
+        assert_eq!(map_rdp_pointer_to_source(&layout, 960, 540), (1920, 1080));
+        assert_eq!(map_rdp_pointer_to_source(&layout, 1919, 1079), (3839, 2159));
+    }
+
+    #[test]
+    fn rdp_pointer_mapping_clamps_fallback_letterbox_bars_to_source_edges() {
+        let layout = layout_snapshot((1920, 1080), (1024, 768));
+
+        assert_eq!(map_rdp_pointer_to_source(&layout, 512, 0).1, 0);
+        assert_eq!(map_rdp_pointer_to_source(&layout, 512, 767).1, 1079);
     }
 }
