@@ -81,7 +81,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .context("failed to create TLS acceptor")?;
 
     let mut server = builder
-        .with_tls(acceptor)
+        .with_hybrid(acceptor, tls_ctx.pub_key)
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_gfx_factory(Some(Box::new(gfx_factory)))
