@@ -46,7 +46,9 @@ tar xzf hypr-rdp-v*.tar.gz
 sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-Runtime dependencies: `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon`
+Runtime dependencies: `ffmpeg`/`libavcodec`, `libva`, `pipewire`, `libxkbcommon`,
+and `pactl` through PipeWire's PulseAudio compatibility layer for the default
+remote-audio routing mode.
 
 For VA-API hardware encoding, install a VA-API driver such as
 `intel-media-driver` for Intel GPUs or `libva-mesa-driver` for AMD GPUs.
@@ -101,6 +103,7 @@ bitrate = 10000000
 quality = 23
 fps = 30
 egfx_codec = "avc420"
+# audio_mode = "redirect"
 # keyboard_layout_policy = "client"
 # output = "DP-1"
 ```
@@ -124,6 +127,7 @@ CLI arguments override config file values.
 | `--fps` | Max framerate | `30` |
 | `--max-frames-in-flight` | Max unacknowledged EGFX frames | `3` |
 | `--egfx-codec` | EGFX codec policy: `avc420`, experimental `avc444`, or `auto` | `avc420` |
+| `--audio-mode` | Audio policy: `redirect` routes playback to a temporary RDP sink while connected, `mirror` captures the current sink audio, `off` disables RDPSND | `redirect` |
 | `--keyboard-layout-policy` | Keyboard layout policy: `client` applies the RDP client layout; `compositor` keeps the compositor/Hyprland keymap | `client` |
 | `--output` | Specific output name | _(headless)_ |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |

@@ -9,6 +9,7 @@ license=('MIT')
 options=(!debug)
 depends=(
     'ffmpeg'
+    'libpulse'
     'libva'
     'libxkbcommon'
     'mesa'
