@@ -1,9 +1,11 @@
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 
 use ironrdp_rdpsnd::server::RdpsndServerMessage;
 use ironrdp_server::ServerEvent;
+use pipewire::spa::buffer::ChunkFlags;
 use tokio::sync::mpsc;
 
 use super::format::{BLOCK_ALIGN, CHANNELS, SAMPLE_RATE};
@@ -144,18 +146,19 @@ fn run_capture_inner(
             }
 
             let chunk = datas[0].chunk();
-            let size = chunk.size() as usize;
-            if size == 0 {
-                return;
-            }
+            let offset = chunk.offset();
+            let size = chunk.size();
+            let flags = chunk.flags();
 
             let Some(slice) = datas[0].data() else {
                 return;
             };
 
-            let byte_count = size.min(slice.len());
+            let Some(payload) = chunk_payload(slice, offset, size, flags) else {
+                return;
+            };
 
-            let Some(pcm_bytes) = convert_to_s16le(data.format.format(), slice, byte_count) else {
+            let Some(pcm_bytes) = convert_to_s16le(data.format.format(), payload.as_ref(), payload.len()) else {
                 return;
             };
 
@@ -205,6 +208,27 @@ fn run_capture_inner(
 
     tracing::trace!("Audio: PipeWire capture stopped");
     Ok(())
+}
+
+fn chunk_payload(input: &[u8], offset: u32, size: u32, flags: ChunkFlags) -> Option<Cow<'_, [u8]>> {
+    if input.is_empty() || size == 0 || flags.contains(ChunkFlags::CORRUPTED) {
+        return None;
+    }
+
+    let byte_count = (size as usize).min(input.len());
+    let start = (offset as usize) % input.len();
+    let end = start + byte_count;
+
+    if end <= input.len() {
+        Some(Cow::Borrowed(&input[start..end]))
+    } else {
+        let first_len = input.len() - start;
+        let second_len = byte_count - first_len;
+        let mut out = Vec::with_capacity(byte_count);
+        out.extend_from_slice(&input[start..]);
+        out.extend_from_slice(&input[..second_len]);
+        Some(Cow::Owned(out))
+    }
 }
 
 fn convert_to_s16le(format: SpaAudioFormat, input: &[u8], byte_count: usize) -> Option<Vec<u8>> {
@@ -258,6 +282,7 @@ fn emit_wave_chunk(
 #[cfg(test)]
 mod tests {
     use ironrdp_rdpsnd::server::RdpsndServerMessage;
+    use pipewire::spa::buffer::ChunkFlags;
 
     use super::*;
 
@@ -267,6 +292,45 @@ mod tests {
 
     fn f32be_bytes(values: &[f32]) -> Vec<u8> {
         values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    #[test]
+    fn pipewire_chunk_payload_uses_offset_size_and_wraps_at_buffer_end() {
+        let input = [0, 1, 2, 3, 4, 5];
+
+        assert_eq!(
+            chunk_payload(&input, 2, 3, ChunkFlags::empty())
+                .unwrap()
+                .as_ref(),
+            &[2, 3, 4]
+        );
+        assert_eq!(
+            chunk_payload(&input, 8, 2, ChunkFlags::empty())
+                .unwrap()
+                .as_ref(),
+            &[2, 3]
+        );
+        assert_eq!(
+            chunk_payload(&input, 4, 4, ChunkFlags::empty())
+                .unwrap()
+                .as_ref(),
+            &[4, 5, 0, 1]
+        );
+        assert_eq!(
+            chunk_payload(&input, 0, 99, ChunkFlags::empty())
+                .unwrap()
+                .as_ref(),
+            &input
+        );
+        assert!(chunk_payload(&input, 0, 0, ChunkFlags::empty()).is_none());
+        assert!(chunk_payload(&[], 0, 1, ChunkFlags::empty()).is_none());
+    }
+
+    #[test]
+    fn pipewire_corrupted_chunk_is_not_forwarded() {
+        let input = [1, 2, 3, 4];
+
+        assert!(chunk_payload(&input, 0, 4, ChunkFlags::CORRUPTED).is_none());
     }
 
     #[test]
