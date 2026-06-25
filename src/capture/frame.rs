@@ -18,6 +18,11 @@ use super::damage::{
 /// Maximum consecutive encode failures before falling back to software encoder.
 const MAX_ENCODE_FAILURES: u32 = 5;
 
+#[cfg(not(test))]
+const FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const FRAME_STATS_LOG_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// Common frame processing: EGFX H.264/RFX encoding or bitmap fallback.
 pub(super) struct FrameProcessor {
     egfx_shared: Option<Arc<EgfxShared>>,
@@ -236,7 +241,7 @@ impl FrameStats {
 
     fn maybe_log(&mut self, width: u32, height: u32) {
         let elapsed = self.window_start.elapsed();
-        if elapsed < Duration::from_secs(1) {
+        if elapsed < FRAME_STATS_LOG_INTERVAL {
             return;
         }
 
