@@ -80,8 +80,13 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .make_acceptor()
         .context("failed to create TLS acceptor")?;
 
-    let mut server = builder
-        .with_tls(acceptor)
+    let credentials = credentials_from_config(&username, &password);
+    let secured_builder = match security_mode_for_credentials(&credentials) {
+        ServerSecurityMode::Tls => builder.with_tls(acceptor),
+        ServerSecurityMode::Hybrid => builder.with_hybrid(acceptor, tls_ctx.pub_key),
+    };
+
+    let mut server = secured_builder
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_gfx_factory(Some(Box::new(gfx_factory)))
@@ -89,7 +94,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_sound_factory(Some(Box::new(sound_factory)))
         .build();
 
-    server.set_credentials(credentials_from_config(&username, &password));
+    server.set_credentials(credentials);
 
     tracing::info!("RDP server configured for {}", addr);
 
@@ -112,6 +117,20 @@ fn credentials_from_config(username: &str, password: &str) -> Option<Credentials
             password: password.to_string(),
             domain: None,
         })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerSecurityMode {
+    Tls,
+    Hybrid,
+}
+
+fn security_mode_for_credentials(credentials: &Option<Credentials>) -> ServerSecurityMode {
+    if credentials.is_some() {
+        ServerSecurityMode::Hybrid
+    } else {
+        ServerSecurityMode::Tls
     }
 }
 
@@ -148,6 +167,26 @@ mod tests {
         let with_password = credentials_from_config("", "pass").expect("credentials");
         assert_eq!(with_password.username, "");
         assert_eq!(with_password.password, "pass");
+    }
+
+    #[test]
+    fn server_security_mode_uses_hybrid_only_when_credentials_are_configured() {
+        assert_eq!(
+            security_mode_for_credentials(&credentials_from_config("", "")),
+            ServerSecurityMode::Tls
+        );
+        assert_eq!(
+            security_mode_for_credentials(&credentials_from_config("user", "pass")),
+            ServerSecurityMode::Hybrid
+        );
+        assert_eq!(
+            security_mode_for_credentials(&credentials_from_config("user", "")),
+            ServerSecurityMode::Hybrid
+        );
+        assert_eq!(
+            security_mode_for_credentials(&credentials_from_config("", "pass")),
+            ServerSecurityMode::Hybrid
+        );
     }
 
     #[test]
