@@ -33,14 +33,16 @@ impl RdpServerInputHandler for HyprInputHandler {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        state.refresh_keyboard_group(self.keyboard_layout_policy);
 
         let t = state.timestamp();
         match event {
             KeyboardEvent::Pressed { code, extended } => {
                 if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
                     state.vk.key(t, evdev_key, 1);
-                    state.keyboard_state.key(evdev_key, true);
-                    state.keyboard_state.send_modifiers(&state.vk);
+                    if state.keyboard_state.key(evdev_key, true) {
+                        state.keyboard_state.send_modifiers(&state.vk);
+                    }
                     state.flush();
                 } else {
                     tracing::trace!(code, extended, "No evdev mapping for scancode");
@@ -49,8 +51,9 @@ impl RdpServerInputHandler for HyprInputHandler {
             KeyboardEvent::Released { code, extended } => {
                 if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
                     state.vk.key(t, evdev_key, 0);
-                    state.keyboard_state.key(evdev_key, false);
-                    state.keyboard_state.send_modifiers(&state.vk);
+                    if state.keyboard_state.key(evdev_key, false) {
+                        state.keyboard_state.send_modifiers(&state.vk);
+                    }
                     state.flush();
                 }
             }

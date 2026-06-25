@@ -56,9 +56,14 @@ pub(super) fn xkb_names_for_rdp_keyboard_layout(keyboard_layout: u32) -> Option<
         0x0816 => "pt",
         _ => return None,
     };
+    let variant = match keyboard_layout {
+        0x00010405 => Some("qwerty"),
+        _ => None,
+    };
 
     Some(XkbKeymapNames {
         layout: Some(layout.to_owned()),
+        variant: variant.map(str::to_owned),
         ..Default::default()
     })
 }
@@ -76,10 +81,19 @@ pub(super) struct KeyboardStateTracker {
     pressed_keys: HashSet<u32>,
     depressed_mods: u32,
     locked_mods: u32,
+    group: u32,
     caps_lock_mask: u32,
     num_lock_mask: u32,
     scroll_lock_mask: u32,
     kana_lock_mask: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyboardModifierState {
+    depressed: u32,
+    latched: u32,
+    locked: u32,
+    group: u32,
 }
 
 impl KeyboardStateTracker {
@@ -92,6 +106,7 @@ impl KeyboardStateTracker {
             pressed_keys: HashSet::new(),
             depressed_mods: 0,
             locked_mods: 0,
+            group: 0,
             caps_lock_mask: locked_mask_for_key(&keymap, KEY_CAPSLOCK),
             num_lock_mask: locked_mask_for_key(&keymap, KEY_NUMLOCK),
             scroll_lock_mask: locked_mask_for_key(&keymap, KEY_SCROLLLOCK),
@@ -103,7 +118,8 @@ impl KeyboardStateTracker {
         self.unicode_to_keycode.get(&code_point).copied()
     }
 
-    pub(super) fn key(&mut self, evdev_key: u32, pressed: bool) {
+    pub(super) fn key(&mut self, evdev_key: u32, pressed: bool) -> bool {
+        let before = self.modifier_state();
         if pressed {
             self.pressed_keys.insert(evdev_key);
             let lock_mask = self.lock_mask_for_key(evdev_key);
@@ -119,14 +135,35 @@ impl KeyboardStateTracker {
             .iter()
             .filter_map(|key| self.modifier_masks_by_key.get(key))
             .fold(0, |mods, mask| mods | *mask);
+
+        self.modifier_state() != before
     }
 
     pub(super) fn synchronize_locks(&mut self, flags: SynchronizeFlags) {
         self.locked_mods = self.locked_mods_from_flags(flags);
     }
 
+    pub(super) fn set_group(&mut self, group: u32) {
+        self.group = group;
+    }
+
     pub(super) fn send_modifiers(&self, vk: &ZwpVirtualKeyboardV1) {
-        vk.modifiers(self.depressed_mods, 0, self.locked_mods, 0);
+        let state = self.modifier_state();
+        vk.modifiers(state.depressed, state.latched, state.locked, state.group);
+    }
+
+    fn modifier_state(&self) -> KeyboardModifierState {
+        KeyboardModifierState {
+            depressed: self.depressed_mods,
+            latched: 0,
+            locked: self.locked_mods,
+            group: self.group,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn group(&self) -> u32 {
+        self.group
     }
 
     fn locked_mods_from_flags(&self, flags: SynchronizeFlags) -> u32 {
@@ -282,8 +319,8 @@ pub(super) fn create_keymap_fd(keymap: &[u8]) -> Result<OwnedFd> {
 #[cfg(test)]
 mod tests {
     use super::{
-        generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout, KeyboardStateTracker,
-        XkbKeymapNames,
+        generate_xkb_keymap, generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout,
+        KeyboardStateTracker, XkbKeymapNames,
     };
 
     #[test]
@@ -310,6 +347,16 @@ mod tests {
     }
 
     #[test]
+    fn rdp_keyboard_layout_preserves_czech_qwerty_variant() {
+        let names =
+            xkb_names_for_rdp_keyboard_layout(0x00010405).expect("Czech QWERTY HKL is supported");
+
+        assert_eq!(names.layout.as_deref(), Some("cz"));
+        assert_eq!(names.variant.as_deref(), Some("qwerty"));
+        assert_eq!(names.options, None);
+    }
+
+    #[test]
     fn rdp_keyboard_layout_returns_none_for_unknown_hkl() {
         assert_eq!(xkb_names_for_rdp_keyboard_layout(0x0000ffff), None);
     }
@@ -322,5 +369,49 @@ mod tests {
 
         assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 21);
         assert_eq!(tracker.unicode_to_evdev('y' as u16).unwrap().evdev_key, 44);
+    }
+
+    #[test]
+    fn rdp_keyboard_layout_czech_qwerty_generated_keymap_affects_unicode_lookup() {
+        let names =
+            xkb_names_for_rdp_keyboard_layout(0x00010405).expect("Czech QWERTY HKL is supported");
+        let keymap = generate_xkb_keymap_from_names(&names).expect("Czech QWERTY keymap compiles");
+        let tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert_eq!(tracker.unicode_to_evdev('y' as u16).unwrap().evdev_key, 21);
+        assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 44);
+    }
+
+    #[test]
+    fn modifier_state_preserves_active_keyboard_group() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("cz,us".into()),
+            variant: Some("qwerty,".into()),
+            ..Default::default()
+        })
+        .expect("multi-layout keymap compiles");
+        let mut tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        tracker.set_group(1);
+
+        assert_eq!(tracker.modifier_state().group, 1);
+    }
+
+    #[test]
+    fn normal_key_does_not_report_modifier_state_change() {
+        let keymap = generate_xkb_keymap().expect("default keymap compiles");
+        let mut tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert!(!tracker.key(30, true));
+        assert!(!tracker.key(30, false));
+    }
+
+    #[test]
+    fn modifier_key_reports_modifier_state_change() {
+        let keymap = generate_xkb_keymap().expect("default keymap compiles");
+        let mut tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert!(tracker.key(42, true));
+        assert!(tracker.key(42, false));
     }
 }
