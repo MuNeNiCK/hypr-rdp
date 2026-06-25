@@ -49,6 +49,7 @@
             packages = with pkgs; [
               cargo
               clippy
+              pulseaudio
               rustc
               rustfmt
             ];

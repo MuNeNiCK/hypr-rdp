@@ -7,5 +7,7 @@
 mod backend;
 mod format;
 mod pipewire;
+mod routing;
 
 pub use backend::HyprSoundFactory;
+pub use routing::AudioMode;

@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use super::format::{advertised_format, BITS_PER_SAMPLE, CHANNELS, SAMPLE_RATE};
 use super::pipewire::run_capture;
+use super::routing::{ActiveAudioRouting, AudioMode, AudioRoutingRunner, PipeWireRoutingRunner};
 
 const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
 type AudioStartupStatus = Result<(), String>;
@@ -54,11 +55,15 @@ impl AudioCaptureRunner for PipeWireCaptureRunner {
 
 pub struct HyprSoundFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+    audio_mode: AudioMode,
 }
 
 impl HyprSoundFactory {
-    pub fn new() -> Self {
-        Self { event_sender: None }
+    pub fn new(audio_mode: AudioMode) -> Self {
+        Self {
+            event_sender: None,
+            audio_mode,
+        }
     }
 }
 
@@ -75,7 +80,10 @@ impl SoundServerFactory for HyprSoundFactory {
             stop_signal: None,
             capture_thread: None,
             capture_runner: Arc::new(PipeWireCaptureRunner),
+            routing_runner: Arc::new(PipeWireRoutingRunner::new()),
+            active_routing: None,
             formats: vec![advertised_format()],
+            audio_mode: self.audio_mode,
         })
     }
 }
@@ -85,7 +93,10 @@ struct HyprSoundHandler {
     stop_signal: Option<Arc<AtomicBool>>,
     capture_thread: Option<thread::JoinHandle<()>>,
     capture_runner: Arc<dyn AudioCaptureRunner>,
+    routing_runner: Arc<dyn AudioRoutingRunner>,
+    active_routing: Option<Box<dyn ActiveAudioRouting>>,
     formats: Vec<AudioFormat>,
+    audio_mode: AudioMode,
 }
 
 impl fmt::Debug for HyprSoundHandler {
@@ -123,6 +134,14 @@ impl RdpsndServerHandler for HyprSoundHandler {
             return None;
         };
 
+        let active_routing = match self.routing_runner.start(self.audio_mode) {
+            Ok(active_routing) => active_routing,
+            Err(e) => {
+                tracing::error!("Audio: failed to configure audio routing: {:#}", e);
+                return None;
+            }
+        };
+
         let stop_signal = Arc::new(AtomicBool::new(false));
         let (startup_tx, startup_rx) = std_mpsc::channel();
 
@@ -134,6 +153,7 @@ impl RdpsndServerHandler for HyprSoundHandler {
                 Ok(handle) => handle,
                 Err(e) => {
                     tracing::error!("Audio: failed to spawn capture thread: {}", e);
+                    drop(active_routing);
                     return None;
                 }
             };
@@ -146,6 +166,7 @@ impl RdpsndServerHandler for HyprSoundHandler {
             Ok(Err(e)) => {
                 tracing::error!("Audio: PipeWire startup failed: {}", e);
                 let _ = handle.join();
+                drop(active_routing);
                 return None;
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
@@ -156,15 +177,18 @@ impl RdpsndServerHandler for HyprSoundHandler {
                 stop_signal.store(true, Ordering::SeqCst);
                 self.stop_signal = Some(stop_signal);
                 self.capture_thread = Some(handle);
+                drop(active_routing);
                 return None;
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::error!("Audio: capture thread exited before reporting startup");
                 let _ = handle.join();
+                drop(active_routing);
                 return None;
             }
         }
 
+        self.active_routing = active_routing;
         tracing::trace!(client_format_index, "Audio: PipeWire capture started");
         Some(client_format_index)
     }
@@ -179,6 +203,8 @@ impl RdpsndServerHandler for HyprSoundHandler {
         if let Some(handle) = self.capture_thread.take() {
             let _ = handle.join();
         }
+
+        self.active_routing.take();
     }
 }
 
@@ -209,6 +235,35 @@ mod tests {
 
     use super::*;
     use crate::audio::format::BLOCK_ALIGN;
+
+    struct NoopRoutingGuard;
+
+    impl ActiveAudioRouting for NoopRoutingGuard {}
+
+    struct NoopRoutingRunner;
+
+    impl AudioRoutingRunner for NoopRoutingRunner {
+        fn start(&self, _mode: AudioMode) -> anyhow::Result<Option<Box<dyn ActiveAudioRouting>>> {
+            Ok(None)
+        }
+    }
+
+    struct ReadyRoutingRunner;
+
+    impl AudioRoutingRunner for ReadyRoutingRunner {
+        fn start(&self, mode: AudioMode) -> anyhow::Result<Option<Box<dyn ActiveAudioRouting>>> {
+            Ok((mode == AudioMode::Redirect)
+                .then(|| Box::new(NoopRoutingGuard) as Box<dyn ActiveAudioRouting>))
+        }
+    }
+
+    struct FailingRoutingRunner;
+
+    impl AudioRoutingRunner for FailingRoutingRunner {
+        fn start(&self, _mode: AudioMode) -> anyhow::Result<Option<Box<dyn ActiveAudioRouting>>> {
+            anyhow::bail!("routing unavailable")
+        }
+    }
 
     struct PanicRunner;
 
@@ -273,12 +328,29 @@ mod tests {
         event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
         capture_runner: Arc<dyn AudioCaptureRunner>,
     ) -> HyprSoundHandler {
+        handler_with_runner_and_routing(
+            event_sender,
+            capture_runner,
+            Arc::new(NoopRoutingRunner),
+            AudioMode::Mirror,
+        )
+    }
+
+    fn handler_with_runner_and_routing(
+        event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
+        capture_runner: Arc<dyn AudioCaptureRunner>,
+        routing_runner: Arc<dyn AudioRoutingRunner>,
+        audio_mode: AudioMode,
+    ) -> HyprSoundHandler {
         HyprSoundHandler {
             event_sender,
             stop_signal: None,
             capture_thread: None,
             capture_runner,
+            routing_runner,
+            active_routing: None,
             formats: vec![advertised_format()],
+            audio_mode,
         }
     }
 
@@ -397,8 +469,43 @@ mod tests {
     }
 
     #[test]
+    fn start_accepts_redirect_mode_after_routing_and_capture_start() {
+        let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
+        let mut handler = handler_with_runner_and_routing(
+            Some(sender),
+            Arc::new(ReadyRunner),
+            Arc::new(ReadyRoutingRunner),
+            AudioMode::Redirect,
+        );
+        let client_format = client_formats(vec![advertised_format()]);
+
+        assert_eq!(handler.start(&client_format), Some(0));
+        assert!(handler.active_routing.is_some());
+
+        handler.stop();
+        assert!(handler.active_routing.is_none());
+    }
+
+    #[test]
+    fn start_rejects_redirect_mode_when_routing_fails_before_capture_spawn() {
+        let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
+        let mut handler = handler_with_runner_and_routing(
+            Some(sender),
+            Arc::new(PanicRunner),
+            Arc::new(FailingRoutingRunner),
+            AudioMode::Redirect,
+        );
+        let client_format = client_formats(vec![advertised_format()]);
+
+        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.stop_signal.is_none());
+        assert!(handler.capture_thread.is_none());
+        assert!(handler.active_routing.is_none());
+    }
+
+    #[test]
     fn sound_factory_backend_advertises_the_local_audio_format() {
-        let handler = HyprSoundFactory::new().build_backend();
+        let handler = HyprSoundFactory::new(AudioMode::Mirror).build_backend();
 
         assert_eq!(handler.get_formats(), &[advertised_format()]);
     }

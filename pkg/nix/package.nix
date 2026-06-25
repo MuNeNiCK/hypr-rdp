@@ -4,6 +4,7 @@
   pkg-config,
   cmake,
   clang,
+  makeWrapper,
   ffmpeg,
   libdrm,
   libgbm,
@@ -11,6 +12,7 @@
   libxkbcommon,
   mesa,
   pipewire,
+  pulseaudio,
   wayland,
 }:
 
@@ -29,6 +31,7 @@ rustPlatform.buildRustPackage {
     pkg-config
     cmake
     clang
+    makeWrapper
     rustPlatform.bindgenHook
   ];
 
@@ -42,6 +45,11 @@ rustPlatform.buildRustPackage {
     pipewire
     wayland
   ];
+
+  postInstall = ''
+    wrapProgram $out/bin/hypr-rdp \
+      --prefix PATH : ${lib.makeBinPath [ pulseaudio ]}
+  '';
 
   doCheck = false;
 

@@ -3,9 +3,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx};
+use ironrdp_server::{Credentials, RdpServer, SoundServerFactory, TlsIdentityCtx};
 
-use crate::audio::HyprSoundFactory;
+use crate::audio::{AudioMode, HyprSoundFactory};
 use crate::capture::{HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
 use crate::config::RuntimeConfig;
@@ -35,6 +35,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         max_frames_in_flight,
         egfx_codec,
         keyboard_layout_policy,
+        audio_mode,
         resolution_fixed,
         output,
     } = config;
@@ -68,7 +69,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
 
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
-    let sound_factory = HyprSoundFactory::new();
+    let sound_factory = sound_factory_for_audio_mode(audio_mode);
 
     let builder = RdpServer::builder().with_addr(addr);
 
@@ -91,7 +92,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_display_handler(display)
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
-        .with_sound_factory(Some(Box::new(sound_factory)))
+        .with_sound_factory(sound_factory)
         .build();
 
     server.set_credentials(credentials);
@@ -102,6 +103,15 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         server,
         display_handle,
     })
+}
+
+fn sound_factory_for_audio_mode(audio_mode: AudioMode) -> Option<Box<dyn SoundServerFactory>> {
+    match audio_mode {
+        AudioMode::Mirror | AudioMode::Redirect => {
+            Some(Box::new(HyprSoundFactory::new(audio_mode)))
+        }
+        AudioMode::Off => None,
+    }
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
@@ -187,6 +197,13 @@ mod tests {
             security_mode_for_credentials(&credentials_from_config("", "pass")),
             ServerSecurityMode::Hybrid
         );
+    }
+
+    #[test]
+    fn audio_mode_off_disables_sound_factory_wiring() {
+        assert!(sound_factory_for_audio_mode(AudioMode::Mirror).is_some());
+        assert!(sound_factory_for_audio_mode(AudioMode::Redirect).is_some());
+        assert!(sound_factory_for_audio_mode(AudioMode::Off).is_none());
     }
 
     #[test]

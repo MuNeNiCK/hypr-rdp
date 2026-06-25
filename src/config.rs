@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use serde::Deserialize;
 
+use crate::audio::AudioMode;
 use crate::capture::CaptureMode;
 use crate::egfx::{EgfxCodecPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 use crate::input::KeyboardLayoutPolicy;
@@ -66,6 +67,10 @@ struct Args {
     #[arg(long)]
     keyboard_layout_policy: Option<String>,
 
+    /// Audio output policy: "redirect" (default), "mirror", or "off"
+    #[arg(long)]
+    audio_mode: Option<String>,
+
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
     output: Option<String>,
@@ -91,6 +96,7 @@ struct ConfigFile {
     max_frames_in_flight: Option<u32>,
     egfx_codec: Option<String>,
     keyboard_layout_policy: Option<String>,
+    audio_mode: Option<String>,
     output: Option<String>,
 }
 
@@ -154,6 +160,7 @@ pub struct RuntimeConfig {
     pub max_frames_in_flight: u32,
     pub egfx_codec: EgfxCodecPolicy,
     pub keyboard_layout_policy: KeyboardLayoutPolicy,
+    pub audio_mode: AudioMode,
     pub resolution_fixed: bool,
     pub output: Option<String>,
 }
@@ -207,6 +214,7 @@ impl RuntimeConfig {
             args.keyboard_layout_policy,
             config.keyboard_layout_policy,
         )?;
+        let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
@@ -237,6 +245,7 @@ impl RuntimeConfig {
             max_frames_in_flight,
             egfx_codec,
             keyboard_layout_policy,
+            audio_mode,
             resolution_fixed,
             output,
         })
@@ -282,6 +291,18 @@ fn parse_keyboard_layout_policy(s: &str) -> anyhow::Result<KeyboardLayoutPolicy>
     }
 }
 
+fn parse_audio_mode(s: &str) -> anyhow::Result<AudioMode> {
+    match s {
+        "mirror" => Ok(AudioMode::Mirror),
+        "redirect" => Ok(AudioMode::Redirect),
+        "off" => Ok(AudioMode::Off),
+        other => anyhow::bail!(
+            "unknown audio mode '{}', expected 'mirror', 'redirect', or 'off'",
+            other
+        ),
+    }
+}
+
 fn default_egfx_codec_policy_name() -> String {
     "avc420".into()
 }
@@ -300,6 +321,10 @@ fn default_keyboard_layout_policy_name() -> String {
     "client".into()
 }
 
+fn default_audio_mode_name() -> String {
+    "redirect".into()
+}
+
 fn resolve_keyboard_layout_policy(
     cli_value: Option<String>,
     config_value: Option<String>,
@@ -308,6 +333,16 @@ fn resolve_keyboard_layout_policy(
         .or(config_value)
         .unwrap_or_else(default_keyboard_layout_policy_name);
     parse_keyboard_layout_policy(&value)
+}
+
+fn resolve_audio_mode(
+    cli_value: Option<String>,
+    config_value: Option<String>,
+) -> anyhow::Result<AudioMode> {
+    let value = cli_value
+        .or(config_value)
+        .unwrap_or_else(default_audio_mode_name);
+    parse_audio_mode(&value)
 }
 
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
@@ -415,6 +450,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_audio_mode_values() {
+        assert_eq!(parse_audio_mode("mirror").unwrap(), AudioMode::Mirror);
+        assert_eq!(parse_audio_mode("redirect").unwrap(), AudioMode::Redirect);
+        assert_eq!(parse_audio_mode("off").unwrap(), AudioMode::Off);
+        assert!(parse_audio_mode("local").is_err());
+    }
+
+    #[test]
     fn default_egfx_codec_policy_is_avc420() {
         let policy = resolve_egfx_codec_policy(None, None).unwrap();
 
@@ -426,6 +469,13 @@ mod tests {
         let policy = resolve_keyboard_layout_policy(None, None).unwrap();
 
         assert_eq!(policy, KeyboardLayoutPolicy::Client);
+    }
+
+    #[test]
+    fn default_audio_mode_is_redirect() {
+        let mode = resolve_audio_mode(None, None).unwrap();
+
+        assert_eq!(mode, AudioMode::Redirect);
     }
 
     #[test]
@@ -454,6 +504,18 @@ mod tests {
     }
 
     #[test]
+    fn explicit_audio_mode_overrides_default_and_config() {
+        assert_eq!(
+            resolve_audio_mode(None, Some("redirect".into())).unwrap(),
+            AudioMode::Redirect
+        );
+        assert_eq!(
+            resolve_audio_mode(Some("off".into()), Some("redirect".into())).unwrap(),
+            AudioMode::Off
+        );
+    }
+
+    #[test]
     fn parses_capture_mode_values() {
         assert_eq!(parse_capture_mode("wlr").unwrap(), CaptureMode::Wlr);
         assert_eq!(parse_capture_mode("ext").unwrap(), CaptureMode::Ext);
@@ -478,6 +540,13 @@ mod tests {
             compositor.keyboard_layout_policy.as_deref(),
             Some("compositor")
         );
+    }
+
+    #[test]
+    fn cli_accepts_audio_mode_values() {
+        let redirect = Args::try_parse_from(["hypr-rdp", "--audio-mode", "redirect"]).unwrap();
+
+        assert_eq!(redirect.audio_mode.as_deref(), Some("redirect"));
     }
 
     proptest! {
@@ -547,6 +616,15 @@ mod tests {
                 }
                 _ => {
                     prop_assert!(parse_keyboard_layout_policy(&token).is_err());
+                }
+            }
+
+            match token.as_str() {
+                "mirror" | "redirect" | "off" => {
+                    prop_assert!(parse_audio_mode(&token).is_ok());
+                }
+                _ => {
+                    prop_assert!(parse_audio_mode(&token).is_err());
                 }
             }
         }
