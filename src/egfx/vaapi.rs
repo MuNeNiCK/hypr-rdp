@@ -253,6 +253,9 @@ pub struct VaapiEncoder {
     force_idr: bool,
     nv12_format: VAImageFormat,
     profile: VAProfile,
+    /// Mesa radeonsi (AMD) needs encoder parameters aligned with what its
+    /// hardware actually emits; other drivers keep the legacy values.
+    radeonsi_quirks: bool,
 }
 
 impl VaapiEncoder {
@@ -303,7 +306,8 @@ impl VaapiEncoder {
         let driver = display
             .query_vendor_string()
             .unwrap_or_else(|_| "unknown".into());
-        tracing::info!("VA-API vendor: {}", driver);
+        let radeonsi_quirks = driver.contains("radeonsi");
+        tracing::info!("VA-API vendor: {} (radeonsi quirks: {})", driver, radeonsi_quirks);
 
         let profiles = display
             .query_config_profiles()
@@ -418,6 +422,7 @@ impl VaapiEncoder {
             force_idr: true,
             nv12_format,
             profile: h264_profile,
+            radeonsi_quirks,
         })
     }
 
@@ -550,6 +555,10 @@ impl VaapiEncoder {
 
         // Read encoded bitstream
         let mut data = self.coded_buffers[coded_idx].read_coded()?;
+
+        // This encoder marks every frame as a reference (see
+        // h264_pic_fields_value: reference_pic_flag = 1).
+        repair_slice_nal_headers(&mut data, is_idr, true);
 
         // SPS/PPS handling: extract from IDR output or generate if missing
         if is_idr {
@@ -715,6 +724,10 @@ impl VaapiEncoder {
 
         let mut data = self.coded_buffers[coded_idx].read_coded()?;
 
+        // This encoder marks every frame as a reference (see
+        // h264_pic_fields_value: reference_pic_flag = 1).
+        repair_slice_nal_headers(&mut data, is_idr, true);
+
         // SPS/PPS handling (same as encode())
         if is_idr {
             if let Some(sps_pps) = super::extract_sps_pps(&data) {
@@ -844,7 +857,7 @@ impl VaapiEncoder {
         params.picture_width_in_mbs = mb_width;
         params.picture_height_in_mbs = mb_height;
         params.seq_fields = va::_VAEncSequenceParameterBufferH264__bindgen_ty_1 {
-            value: h264_seq_fields_value(),
+            value: h264_seq_fields_value(self.radeonsi_quirks),
         };
         params.bit_depth_luma_minus8 = 0;
         params.bit_depth_chroma_minus8 = 0;
@@ -901,7 +914,10 @@ impl VaapiEncoder {
             );
         }
 
-        let transform_8x8 = if self.profile == sys::VA_PROFILE_H264_HIGH {
+        // radeonsi: VCN hardware before 5.0 cannot emit per-MB
+        // transform_size_8x8_flag syntax (Mesa forces it off), so declaring it
+        // in the PPS breaks CABAC parsing. Other drivers keep legacy behavior.
+        let transform_8x8 = if !self.radeonsi_quirks && self.profile == sys::VA_PROFILE_H264_HIGH {
             1
         } else {
             0
@@ -922,7 +938,7 @@ impl VaapiEncoder {
         params.chroma_qp_index_offset = 0;
         params.second_chroma_qp_index_offset = 0;
         params.pic_fields = va::_VAEncPictureParameterBufferH264__bindgen_ty_1 {
-            value: h264_pic_fields_value(is_idr, transform_8x8),
+            value: h264_pic_fields_value(is_idr, transform_8x8, self.radeonsi_quirks),
         };
         params
     }
@@ -1098,8 +1114,14 @@ impl VaapiEncoder {
         }
 
         bs.write_ue(4); // log2_max_frame_num_minus4
-        bs.write_ue(0); // pic_order_cnt_type
-        bs.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        // Must mirror h264_seq_fields_value; the log2_max_pic_order_cnt_lsb
+        // field only exists for POC type 0.
+        if self.radeonsi_quirks {
+            bs.write_ue(2); // pic_order_cnt_type
+        } else {
+            bs.write_ue(0); // pic_order_cnt_type
+            bs.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        }
         let max_num_ref_frames = self.reference_mode.max_num_ref_frames();
         bs.write_ue(max_num_ref_frames); // max_num_ref_frames
         bs.write_bits(0, 1); // gaps_in_frame_num_value_allowed_flag
@@ -1168,12 +1190,14 @@ impl VaapiEncoder {
         bs.write_se(pic_init_qp - 26); // pic_init_qp_minus26
         bs.write_se(0); // pic_init_qs_minus26
         bs.write_se(0); // chroma_qp_index_offset
-        bs.write_bits(1, 1); // deblocking_filter_control_present_flag
+        // Must mirror h264_pic_fields_value.
+        bs.write_bits(u32::from(!self.radeonsi_quirks), 1); // deblocking_filter_control_present_flag
         bs.write_bits(0, 1); // constrained_intra_pred_flag
         bs.write_bits(0, 1); // redundant_pic_cnt_present_flag
 
         if is_high_profile {
-            bs.write_bits(1, 1); // transform_8x8_mode_flag
+            // Must mirror the submitted transform_8x8 value (see build_pic_params).
+            bs.write_bits(u32::from(!self.radeonsi_quirks), 1); // transform_8x8_mode_flag
             bs.write_bits(0, 1); // pic_scaling_matrix_present_flag
             bs.write_se(0); // second_chroma_qp_index_offset
         } else {
@@ -1205,12 +1229,55 @@ fn picture_h264(
     picture
 }
 
-fn h264_seq_fields_value() -> u32 {
+/// Repair slice NAL unit header bytes left zeroed by the VA-API driver.
+///
+/// Mesa's radeonsi encoder advertises `VAConfigAttribEncPackedHeaders =
+/// SEQUENCE | PICTURE | SLICE | MISC | RAW_DATA`, i.e. it expects the
+/// application to submit packed headers. When none are submitted (as here),
+/// its fallback path emits an intact start code, slice header and slice data
+/// — but leaves the NAL unit header byte as 0x00. `nal_unit_type` 0 is
+/// invalid in H.264 (Rec. ITU-T H.264, Table 7-1), so decoders reject the
+/// entire stream: black screen in the macOS Windows App, white in Remmina,
+/// while non-video channels keep working (issue #21). Intel iHD fills the
+/// byte itself, which is why the bug does not reproduce there.
+///
+/// Rewrite any NAL whose type field is 0 with a header derived from the
+/// frame state. A valid stream never contains type-0 NALs, so this is a
+/// strict no-op on drivers that fill the byte correctly.
+///
+/// Longer term this encoder should submit packed headers per the driver's
+/// declared contract, which would also remove the synthesized-SPS/PPS
+/// prepending fallback.
+fn repair_slice_nal_headers(data: &mut [u8], is_idr: bool, is_reference: bool) {
+    let nal_unit_type: u8 = if is_idr { 5 } else { 1 };
+    let nal_ref_idc: u8 = match (is_idr, is_reference) {
+        (true, _) => 3,
+        (false, true) => 1,
+        (false, false) => 0,
+    };
+    let repaired = (nal_ref_idc << 5) | nal_unit_type;
+
+    let mut i = 0usize;
+    while i + 3 < data.len() {
+        if data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1 {
+            if data[i + 3] & 0x1f == 0 {
+                data[i + 3] = repaired;
+            }
+            i += 3;
+        }
+        i += 1;
+    }
+}
+
+fn h264_seq_fields_value(radeonsi_quirks: bool) -> u32 {
     let chroma_format_idc = 1; // 4:2:0
     let frame_mbs_only_flag = 1;
     let direct_8x8_inference_flag = 1;
     let log2_max_frame_num_minus4 = 4;
-    let pic_order_cnt_type = 0;
+    // radeonsi: POC type 2 matches what the driver actually encodes for
+    // B-frame-free streams without packed headers (pic_order_cnt_lsb would
+    // always be written as 0). Other drivers keep the legacy type 0.
+    let pic_order_cnt_type = if radeonsi_quirks { 2 } else { 0 };
     let log2_max_pic_order_cnt_lsb_minus4 = 4;
 
     chroma_format_idc
@@ -1235,11 +1302,13 @@ fn h264_vui_fields_value() -> u32 {
         | (motion_vectors_over_pic_boundaries_flag << 15)
 }
 
-fn h264_pic_fields_value(is_idr: bool, transform_8x8_mode_flag: u32) -> u32 {
+fn h264_pic_fields_value(is_idr: bool, transform_8x8_mode_flag: u32, radeonsi_quirks: bool) -> u32 {
     let idr_pic_flag = u32::from(is_idr);
     let reference_pic_flag = 1;
     let entropy_coding_mode_flag = 1;
-    let deblocking_filter_control_present_flag = 1;
+    // radeonsi: omit per-slice deblocking fields (deblocking stays enabled
+    // via the H.264 defaults). Other drivers keep the legacy flag.
+    let deblocking_filter_control_present_flag = if radeonsi_quirks { 0 } else { 1 };
 
     idr_pic_flag
         | (reference_pic_flag << 1)
