@@ -120,43 +120,19 @@ fn clamp_to_h264_software_limits(width: u32, height: u32) -> (u32, u32) {
     (scaled_width, scaled_height)
 }
 
-fn normalize_to_source_aspect_bounds(
-    requested_size: (u32, u32),
-    source_size: (u32, u32),
-) -> (u32, u32) {
-    let (requested_w, requested_h) =
-        clamp_to_h264_software_limits(requested_size.0, requested_size.1);
+/// Clamp a requested presentation size to the H.264 policy limits and even
+/// dimensions. Aspect mismatches are letterboxed by the presentation scaler,
+/// so the requested size is otherwise kept as-is: reshaping it here announces
+/// a size the client did not ask for, which clients answer with another
+/// resize request — the negotiation then walks a shrinking staircase
+/// (728x408 → 724x408 → 724x406 → …) instead of converging.
+fn normalize_presentation_size(requested_size: (u32, u32), source_size: (u32, u32)) -> (u32, u32) {
+    let (width, height) = clamp_to_h264_software_limits(requested_size.0, requested_size.1);
     let (source_w, source_h) = source_size;
-    if requested_w == 0 || requested_h == 0 || source_w == 0 || source_h == 0 {
+    if width == 0 || height == 0 || source_w == 0 || source_h == 0 {
         return (0, 0);
     }
-
-    let requested_w_u64 = u64::from(requested_w);
-    let requested_h_u64 = u64::from(requested_h);
-    let source_w_u64 = u64::from(source_w);
-    let source_h_u64 = u64::from(source_h);
-
-    let (width, height) = if requested_w_u64.saturating_mul(source_h_u64)
-        <= requested_h_u64.saturating_mul(source_w_u64)
-    {
-        (
-            requested_w,
-            ((requested_w_u64 * source_h_u64) / source_w_u64) as u32,
-        )
-    } else {
-        (
-            ((requested_h_u64 * source_w_u64) / source_h_u64) as u32,
-            requested_h,
-        )
-    };
-
-    let width = width & !1;
-    let height = height & !1;
-    if width == 0 || height == 0 {
-        (0, 0)
-    } else {
-        (width, height)
-    }
+    (width, height)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,7 +160,7 @@ fn startup_presentation_size(
         configured_resolution
     };
     if physical_output {
-        normalize_to_source_aspect_bounds(requested, source_size)
+        normalize_presentation_size(requested, source_size)
     } else {
         requested
     }
@@ -202,7 +178,7 @@ fn initial_size_resize_decision(
     }
 
     let (width, height) = if physical_output {
-        normalize_to_source_aspect_bounds(requested_size, source_size?)
+        normalize_presentation_size(requested_size, source_size?)
     } else {
         requested_size
     };
@@ -238,7 +214,7 @@ fn display_control_resize_decision(
         headless_display_control_size(layout)?
     };
     let (width, height) = if physical_output {
-        normalize_to_source_aspect_bounds((requested_w, requested_h), source_size?)
+        normalize_presentation_size((requested_w, requested_h), source_size?)
     } else {
         clamp_to_h264_software_limits(requested_w, requested_h)
     };
@@ -441,7 +417,7 @@ impl HyprDisplay {
                 source_h = capture_info.height,
                 applied_w = presentation_resolution.0,
                 applied_h = presentation_resolution.1,
-                "Physical output presentation bounds normalized to source aspect"
+                "Physical output presentation bounds clamped to encoder limits"
             );
         }
         output_layout
@@ -645,7 +621,7 @@ impl HyprDisplay {
                         requested_h,
                         applied_w = decision.width,
                         applied_h = decision.height,
-                        "DisplayControl presentation bounds normalized to physical output aspect"
+                        "DisplayControl presentation bounds clamped to encoder limits"
                     );
                 }
                 ResizeTarget::ManagedHeadlessOutput => {
@@ -912,10 +888,10 @@ mod output_downscaling {
     }
 
     #[test]
-    fn physical_output_startup_normalizes_explicit_resolution_bounds_to_source_aspect() {
+    fn physical_output_startup_keeps_explicit_resolution_for_letterboxing() {
         assert_eq!(
             startup_presentation_size(true, true, (1920, 1200), (3840, 1080)),
-            (1920, 540)
+            (1920, 1200)
         );
         assert_eq!(
             startup_presentation_size(true, true, (1600, 900), (3840, 2160)),
@@ -955,7 +931,7 @@ mod output_downscaling {
     }
 
     #[test]
-    fn physical_output_initial_size_uses_client_size_as_source_aspect_bounds() {
+    fn physical_output_initial_size_keeps_client_size_for_letterboxing() {
         let decision = initial_size_resize_decision(
             true,
             false,
@@ -966,7 +942,29 @@ mod output_downscaling {
         .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
-        assert_eq!((decision.width, decision.height), (1920, 540));
+        assert_eq!((decision.width, decision.height), (1920, 1200));
+    }
+
+    #[test]
+    fn physical_output_size_negotiation_reaches_fixed_point_immediately() {
+        // Regression: reshaping the requested size to the source aspect made
+        // the client re-request every applied size, walking a shrinking
+        // staircase (728x408 → 724x408 → 724x406 → … → 704x396) with a full
+        // capture and encoder restart on every step.
+        let source = Some((3840, 2160));
+        let decision =
+            initial_size_resize_decision(true, false, (3840, 2160), (728, 408), source).unwrap();
+        assert_eq!((decision.width, decision.height), (728, 408));
+
+        // The client echoes the applied size back; the negotiation must stop.
+        let echo = initial_size_resize_decision(
+            true,
+            false,
+            (decision.width, decision.height),
+            (decision.width, decision.height),
+            source,
+        );
+        assert_eq!(echo, None);
     }
 
     #[tokio::test]
@@ -989,18 +987,18 @@ mod output_downscaling {
             size,
             DesktopSize {
                 width: 1920,
-                height: 540
+                height: 1200
             }
         );
-        assert_eq!(shared.get_surface_size(), (1920, 540));
+        assert_eq!(shared.get_surface_size(), (1920, 1200));
 
         let inner = display.inner.lock().await;
-        assert_eq!(inner.resolution, (1920, 540));
+        assert_eq!(inner.resolution, (1920, 1200));
         assert_eq!(
             inner.pending_initial_resize,
             Some(DesktopSize {
                 width: 1920,
-                height: 540
+                height: 1200
             })
         );
     }
@@ -1041,7 +1039,7 @@ mod output_downscaling {
                 .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
-        assert_eq!((decision.width, decision.height), (100, 56));
+        assert_eq!((decision.width, decision.height), (100, 100));
     }
 
     #[test]
@@ -1058,7 +1056,7 @@ mod output_downscaling {
             initial_size_resize_decision(
                 true,
                 false,
-                (1920, 540),
+                (1920, 1200),
                 (1920, 1200),
                 Some((3840, 1080))
             ),
@@ -1082,7 +1080,7 @@ mod output_downscaling {
     }
 
     #[test]
-    fn physical_output_displaycontrol_uses_monitor_size_as_source_aspect_bounds() {
+    fn physical_output_displaycontrol_keeps_monitor_size_for_letterboxing() {
         let decision = display_control_resize_decision(
             &single_primary(1920, 1200),
             true,
@@ -1093,7 +1091,7 @@ mod output_downscaling {
         .unwrap();
 
         assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
-        assert_eq!((decision.width, decision.height), (1920, 540));
+        assert_eq!((decision.width, decision.height), (1920, 1200));
     }
 
     #[test]
