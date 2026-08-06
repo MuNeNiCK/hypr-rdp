@@ -1021,18 +1021,23 @@ impl VaapiEncoder {
                 .context("Failed to create rate control buffer")?,
         );
 
-        let mut hrd: va::VAEncMiscParameterHRD = unsafe { mem::zeroed() };
-        hrd.initial_buffer_fullness = policy.bits_per_second / 2;
-        hrd.buffer_size = policy.bits_per_second;
-        buffers.push(
-            self.context
-                .create_misc_buffer(
-                    va::VAEncMiscParameterType_VAEncMiscParameterTypeHRD,
-                    hrd,
-                    "vaCreateBuffer (HRD)",
-                )
-                .context("Failed to create HRD buffer")?,
-        );
+        // HRD parameters are meaningless without a target bitrate, and Mesa
+        // radeonsi segfaults in vaEndPicture when it receives an HRD buffer
+        // with buffer_size = 0 (CQP mode has bits_per_second = 0).
+        if policy.bits_per_second > 0 {
+            let mut hrd: va::VAEncMiscParameterHRD = unsafe { mem::zeroed() };
+            hrd.initial_buffer_fullness = policy.bits_per_second / 2;
+            hrd.buffer_size = policy.bits_per_second;
+            buffers.push(
+                self.context
+                    .create_misc_buffer(
+                        va::VAEncMiscParameterType_VAEncMiscParameterTypeHRD,
+                        hrd,
+                        "vaCreateBuffer (HRD)",
+                    )
+                    .context("Failed to create HRD buffer")?,
+            );
+        }
 
         let mut fr: va::VAEncMiscParameterFrameRate = unsafe { mem::zeroed() };
         fr.framerate = self.fps;
@@ -1339,6 +1344,35 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline probe guarding the radeonsi segfault in vaEndPicture when
+    /// rate-control buffers carry a zero bitrate (CQP). Requires VA-API
+    /// hardware; writes the Annex-B stream for external analysis.
+    #[test]
+    #[ignore = "requires VA-API hardware; writes a stream for offline analysis"]
+    fn vaapi_encode_probe_cqp_writes_stream_to_disk() {
+        let (width, height) = (704u32, 396u32);
+        let mut encoder = VaapiEncoder::new(width, height, 0, 30, 20, H264RateControl::Cqp)
+            .expect("VA-API encoder initializes");
+
+        let stride = (width * 4) as usize;
+        let mut frame = vec![0u8; stride * height as usize];
+        for px in frame.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 255;
+            px[3] = 255;
+        }
+
+        let mut stream = Vec::new();
+        for _ in 0..30 {
+            stream.extend_from_slice(&encoder.encode(&frame, stride).expect("frame encodes"));
+        }
+
+        let path = std::env::temp_dir().join("hypr-rdp-vaapi-probe-cqp.h264");
+        std::fs::write(&path, &stream).expect("probe stream written");
+        eprintln!("probe: {} bytes -> {}", stream.len(), path.display());
+    }
 
     fn dpb(surface_id: u32, frame_num: u16, poc: i32) -> DpbEntry {
         DpbEntry {
