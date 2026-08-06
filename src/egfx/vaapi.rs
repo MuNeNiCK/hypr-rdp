@@ -243,6 +243,9 @@ pub struct VaapiEncoder {
     references: VaapiReferenceState,
     reference_mode: VaapiReferenceMode,
     cached_sps_pps: Option<Vec<u8>>,
+    packed_sequence_required: bool,
+    packed_slice_required: bool,
+    idr_pic_id: u32,
     width: u32,
     height: u32,
     bitrate: u32,
@@ -340,6 +343,22 @@ impl VaapiEncoder {
             .create_config(h264_profile, sys::VA_ENTRYPOINT_ENC_SLICE, &config_attribs)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
+        // Drivers advertising VA_ENC_PACKED_HEADER_SEQUENCE (e.g. Mesa
+        // radeonsi) expect the application to submit SPS/PPS as a packed
+        // header; without it the emitted slices are unusable (#21).
+        let packed_headers = display
+            .get_config_attrib(
+                h264_profile,
+                sys::VA_ENTRYPOINT_ENC_SLICE,
+                va::VAConfigAttribType_VAConfigAttribEncPackedHeaders,
+            )
+            .unwrap_or(va::VA_ATTRIB_NOT_SUPPORTED);
+        let packed_headers_known = packed_headers != va::VA_ATTRIB_NOT_SUPPORTED;
+        let packed_sequence_required =
+            packed_headers_known && (packed_headers & va::VA_ENC_PACKED_HEADER_SEQUENCE) != 0;
+        let packed_slice_required =
+            packed_headers_known && (packed_headers & va::VA_ENC_PACKED_HEADER_SLICE) != 0;
+
         let input_surfaces = display
             .create_surfaces(
                 VA_RT_FORMAT_YUV420,
@@ -390,6 +409,8 @@ impl VaapiEncoder {
             profile = ?h264_profile,
             rate_control = ?rate_control,
             quality = quality,
+            packed_sequence_required,
+            packed_slice_required,
             "VA-API encoder ready: {}x{}, {}kbps, IDR every {} frames",
             width, height, bitrate / 1000, IDR_INTERVAL,
         );
@@ -408,6 +429,9 @@ impl VaapiEncoder {
             references: VaapiReferenceState::default(),
             reference_mode,
             cached_sps_pps: None,
+            packed_sequence_required,
+            packed_slice_required,
+            idr_pic_id: 0,
             width,
             height,
             bitrate,
@@ -424,6 +448,128 @@ impl VaapiEncoder {
     /// Force the next encoded frame to be an IDR (used after error recovery).
     pub fn force_idr(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Packed SPS/PPS submission for drivers that require it (see
+    /// `packed_sequence_required`). Returns the param+data buffer pair to
+    /// append to the IDR picture, or None when the driver composes headers
+    /// itself.
+    fn create_packed_sequence_buffers(&mut self) -> Result<Option<[VaBuffer; 2]>> {
+        if !self.packed_sequence_required {
+            return Ok(None);
+        }
+
+        let sps_pps = self.generate_sps_pps();
+        let param = va::VAEncPackedHeaderParameterBuffer {
+            type_: va::VAEncPackedHeaderType_VAEncPackedHeaderSequence,
+            bit_length: (sps_pps.len() * 8) as u32,
+            has_emulation_bytes: 1,
+            va_reserved: [0; 4],
+        };
+        let param_buffer = self
+            .context
+            .create_buffer(
+                va::VABufferType_VAEncPackedHeaderParameterBufferType,
+                param,
+                "vaCreateBuffer (packed sequence param)",
+            )
+            .context("Failed to create packed sequence param buffer")?;
+        let data_buffer = self
+            .context
+            .create_data_buffer(
+                va::VABufferType_VAEncPackedHeaderDataBufferType,
+                &sps_pps,
+                "vaCreateBuffer (packed sequence data)",
+            )
+            .context("Failed to create packed sequence data buffer")?;
+        self.cached_sps_pps = Some(sps_pps);
+        Ok(Some([param_buffer, data_buffer]))
+    }
+
+    /// Packed slice header for drivers that require it. Mesa radeonsi parses
+    /// this header for nal_ref_idc/nal_unit_type and the slice fields the
+    /// firmware writes into the final slice NAL; without it the emitted
+    /// slice carries a zeroed NAL header byte and never decodes (#21).
+    fn create_packed_slice_buffers(
+        &mut self,
+        is_idr: bool,
+        frame_num: u16,
+        poc: i32,
+    ) -> Result<Option<[VaBuffer; 2]>> {
+        if !self.packed_slice_required {
+            return Ok(None);
+        }
+
+        if is_idr {
+            self.idr_pic_id = self.idr_pic_id.wrapping_add(1);
+        }
+        let header = self.generate_slice_header(is_idr, frame_num, poc);
+        let param = va::VAEncPackedHeaderParameterBuffer {
+            type_: va::VAEncPackedHeaderType_VAEncPackedHeaderSlice,
+            bit_length: (header.len() * 8) as u32,
+            has_emulation_bytes: 1,
+            va_reserved: [0; 4],
+        };
+        let param_buffer = self
+            .context
+            .create_buffer(
+                va::VABufferType_VAEncPackedHeaderParameterBufferType,
+                param,
+                "vaCreateBuffer (packed slice param)",
+            )
+            .context("Failed to create packed slice param buffer")?;
+        let data_buffer = self
+            .context
+            .create_data_buffer(
+                va::VABufferType_VAEncPackedHeaderDataBufferType,
+                &header,
+                "vaCreateBuffer (packed slice data)",
+            )
+            .context("Failed to create packed slice data buffer")?;
+        Ok(Some([param_buffer, data_buffer]))
+    }
+
+    /// Slice header matching `generate_sps_pps` (log2_max_frame_num = 8,
+    /// pic_order_cnt_type = 0 with 8-bit lsb, CABAC, deblocking control
+    /// present) and `build_slice_params`.
+    fn generate_slice_header(&self, is_idr: bool, frame_num: u16, poc: i32) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+
+        let mut bs = BitWriter::new();
+        bs.write_bits(0, 1); // forbidden_zero_bit
+        bs.write_bits(3, 2); // nal_ref_idc: reference picture
+        bs.write_bits(if is_idr { 5 } else { 1 }, 5); // nal_unit_type
+
+        bs.write_ue(0); // first_mb_in_slice
+        bs.write_ue(if is_idr { 7 } else { 5 }); // slice_type: all-I / all-P
+        bs.write_ue(0); // pic_parameter_set_id
+        bs.write_bits(u32::from(frame_num), 8); // frame_num
+        if is_idr {
+            bs.write_ue(self.idr_pic_id & 0xffff); // idr_pic_id
+        }
+        bs.write_bits((poc as u32) & 0xff, 8); // pic_order_cnt_lsb
+        if !is_idr {
+            bs.write_bits(0, 1); // num_ref_idx_active_override_flag
+            bs.write_bits(0, 1); // ref_pic_list_modification_flag_l0
+        }
+        // dec_ref_pic_marking (nal_ref_idc != 0)
+        if is_idr {
+            bs.write_bits(0, 1); // no_output_of_prior_pics_flag
+            bs.write_bits(0, 1); // long_term_reference_flag
+        } else {
+            bs.write_bits(0, 1); // adaptive_ref_pic_marking_mode_flag
+        }
+        if !is_idr {
+            bs.write_ue(0); // cabac_init_idc
+        }
+        bs.write_se(0); // slice_qp_delta
+        bs.write_ue(0); // disable_deblocking_filter_idc
+        bs.write_se(0); // slice_alpha_c0_offset_div2
+        bs.write_se(0); // slice_beta_offset_div2
+
+        buf.extend_from_slice(&bs.finish_with_emulation_prevention());
+        buf
     }
 
     fn is_idr_frame(&self) -> bool {
@@ -504,6 +650,9 @@ impl VaapiEncoder {
             picture_buffers.push(seq_buffer);
 
             picture_buffers.extend(self.create_rate_control_buffers()?);
+            if let Some(packed) = self.create_packed_sequence_buffers()? {
+                picture_buffers.extend(packed);
+            }
         }
 
         let pic_param = self.build_picture_params(
@@ -534,6 +683,9 @@ impl VaapiEncoder {
             )
             .context("Failed to create slice buffer")?;
         picture_buffers.push(slice_buffer);
+        if let Some(packed) = self.create_packed_slice_buffers(is_idr, frame_num, poc)? {
+            picture_buffers.extend(packed);
+        }
 
         self.context
             .render_picture(self.input_surfaces[input_idx].id(), &picture_buffers)?;
@@ -669,6 +821,9 @@ impl VaapiEncoder {
             picture_buffers.push(seq_buffer);
 
             picture_buffers.extend(self.create_rate_control_buffers()?);
+            if let Some(packed) = self.create_packed_sequence_buffers()? {
+                picture_buffers.extend(packed);
+            }
         }
 
         let pic_param = self.build_picture_params(
@@ -699,6 +854,9 @@ impl VaapiEncoder {
             )
             .context("Failed to create slice buffer")?;
         picture_buffers.push(slice_buffer);
+        if let Some(packed) = self.create_packed_slice_buffers(is_idr, frame_num, poc)? {
+            picture_buffers.extend(packed);
+        }
 
         self.context
             .render_picture(dmabuf_surface_id, &picture_buffers)
@@ -1339,6 +1497,35 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline probe for the white-screen report (#21): encode solid red
+    /// frames and dump the Annex-B stream for external analysis
+    /// (`ffmpeg -i <file> …`). Requires VA-API hardware.
+    #[test]
+    #[ignore = "requires VA-API hardware; writes a stream for offline analysis"]
+    fn vaapi_encode_probe_writes_stream_to_disk() {
+        let (width, height) = (704u32, 396u32);
+        let mut encoder = VaapiEncoder::new(width, height, 5_000_000, 30, 23, H264RateControl::Vbr)
+            .expect("VA-API encoder initializes");
+
+        let stride = (width * 4) as usize;
+        let mut frame = vec![0u8; stride * height as usize];
+        for px in frame.chunks_exact_mut(4) {
+            px[0] = 0; // B
+            px[1] = 0; // G
+            px[2] = 255; // R
+            px[3] = 255;
+        }
+
+        let mut stream = Vec::new();
+        for _ in 0..30 {
+            stream.extend_from_slice(&encoder.encode(&frame, stride).expect("frame encodes"));
+        }
+
+        let path = std::env::temp_dir().join("hypr-rdp-vaapi-probe.h264");
+        std::fs::write(&path, &stream).expect("probe stream written");
+        eprintln!("probe: {} bytes -> {}", stream.len(), path.display());
+    }
 
     fn dpb(surface_id: u32, frame_num: u16, poc: i32) -> DpbEntry {
         DpbEntry {
