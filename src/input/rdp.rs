@@ -33,8 +33,6 @@ impl RdpServerInputHandler for HyprInputHandler {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state.refresh_keyboard_group(self.keyboard_layout_policy);
-
         let t = state.timestamp();
         match event {
             KeyboardEvent::Pressed { code, extended } => {
