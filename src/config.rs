@@ -5,7 +5,7 @@ use serde::Deserialize;
 
 use crate::audio::AudioMode;
 use crate::capture::CaptureMode;
-use crate::egfx::{EgfxCodecPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+use crate::egfx::{EgfxCodecPolicy, EncoderPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 use crate::input::KeyboardLayoutPolicy;
 
 #[derive(Parser, Debug)]
@@ -71,6 +71,10 @@ struct Args {
     #[arg(long)]
     audio_mode: Option<String>,
 
+    /// H.264 encoder backend: "auto" (default), "software", or "vaapi"
+    #[arg(long)]
+    encoder: Option<String>,
+
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
     output: Option<String>,
@@ -97,6 +101,7 @@ struct ConfigFile {
     egfx_codec: Option<String>,
     keyboard_layout_policy: Option<String>,
     audio_mode: Option<String>,
+    encoder: Option<String>,
     output: Option<String>,
 }
 
@@ -161,6 +166,7 @@ pub struct RuntimeConfig {
     pub egfx_codec: EgfxCodecPolicy,
     pub keyboard_layout_policy: KeyboardLayoutPolicy,
     pub audio_mode: AudioMode,
+    pub encoder: EncoderPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
 }
@@ -215,6 +221,7 @@ impl RuntimeConfig {
             config.keyboard_layout_policy,
         )?;
         let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
+        let encoder = resolve_encoder_policy(args.encoder, config.encoder)?;
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
@@ -246,9 +253,32 @@ impl RuntimeConfig {
             egfx_codec,
             keyboard_layout_policy,
             audio_mode,
+            encoder,
             resolution_fixed,
             output,
         })
+    }
+}
+
+fn parse_encoder_policy(s: &str) -> anyhow::Result<EncoderPolicy> {
+    match s {
+        "auto" => Ok(EncoderPolicy::Auto),
+        "software" => Ok(EncoderPolicy::Software),
+        "vaapi" => Ok(EncoderPolicy::Vaapi),
+        other => anyhow::bail!(
+            "unknown encoder '{}', expected 'auto', 'software', or 'vaapi'",
+            other
+        ),
+    }
+}
+
+fn resolve_encoder_policy(
+    cli_value: Option<String>,
+    config_value: Option<String>,
+) -> anyhow::Result<EncoderPolicy> {
+    match cli_value.or(config_value) {
+        Some(value) => parse_encoder_policy(&value),
+        None => Ok(EncoderPolicy::Auto),
     }
 }
 
