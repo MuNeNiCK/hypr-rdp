@@ -75,13 +75,22 @@ pub(super) struct UnicodeKeyMapping {
     pub(super) needs_shift: bool,
 }
 
+/// `xkb::State` holds a raw pointer without thread affinity; libxkbcommon
+/// objects may move between threads as long as access is externally
+/// synchronized, which the `InputState` mutex guarantees.
+struct SendXkbState(xkb::State);
+
+unsafe impl Send for SendXkbState {}
+
 pub(super) struct KeyboardStateTracker {
     modifier_masks_by_key: HashMap<u32, u32>,
     unicode_to_keycode: HashMap<u16, UnicodeKeyMapping>,
+    layout_names: Vec<String>,
     pressed_keys: HashSet<u32>,
     depressed_mods: u32,
     locked_mods: u32,
     group: u32,
+    xkb_state: SendXkbState,
     caps_lock_mask: u32,
     num_lock_mask: u32,
     scroll_lock_mask: u32,
@@ -103,10 +112,12 @@ impl KeyboardStateTracker {
         Ok(Self {
             modifier_masks_by_key: build_modifier_masks_by_key(&keymap),
             unicode_to_keycode: build_unicode_to_keycode(&keymap),
+            layout_names: build_layout_names(&keymap),
             pressed_keys: HashSet::new(),
             depressed_mods: 0,
             locked_mods: 0,
             group: 0,
+            xkb_state: SendXkbState(xkb::State::new(&keymap)),
             caps_lock_mask: locked_mask_for_key(&keymap, KEY_CAPSLOCK),
             num_lock_mask: locked_mask_for_key(&keymap, KEY_NUMLOCK),
             scroll_lock_mask: locked_mask_for_key(&keymap, KEY_SCROLLLOCK),
@@ -130,6 +141,22 @@ impl KeyboardStateTracker {
             self.pressed_keys.remove(&evdev_key);
         }
 
+        // Replicate the compositor's per-key XKB processing so group toggle
+        // options (e.g. grp:alt_shift_toggle) keep the tracked group in sync
+        // with the group the compositor switches to on the same key stream.
+        let direction = if pressed {
+            xkb::KeyDirection::Down
+        } else {
+            xkb::KeyDirection::Up
+        };
+        self.xkb_state
+            .0
+            .update_key(xkb::Keycode::new(evdev_key + XKB_KEYCODE_OFFSET), direction);
+        self.group = self
+            .xkb_state
+            .0
+            .serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE);
+
         self.depressed_mods = self
             .pressed_keys
             .iter()
@@ -144,7 +171,26 @@ impl KeyboardStateTracker {
     }
 
     pub(super) fn set_group(&mut self, group: u32) {
+        if self.group == group {
+            return;
+        }
+        // Force the locked layout while preserving the current modifier view,
+        // so later update_key calls keep toggling relative to the new group.
+        let depressed = self.xkb_state.0.serialize_mods(xkb::STATE_MODS_DEPRESSED);
+        let latched = self.xkb_state.0.serialize_mods(xkb::STATE_MODS_LATCHED);
+        let locked = self.xkb_state.0.serialize_mods(xkb::STATE_MODS_LOCKED);
+        self.xkb_state
+            .0
+            .update_mask(depressed, latched, locked, 0, 0, group);
         self.group = group;
+    }
+
+    /// Resolve an XKB layout display name (e.g. "Ukrainian") to its group index.
+    pub(super) fn layout_index_by_name(&self, name: &str) -> Option<u32> {
+        self.layout_names
+            .iter()
+            .position(|layout| layout == name)
+            .map(|index| index as u32)
     }
 
     pub(super) fn send_modifiers(&self, vk: &ZwpVirtualKeyboardV1) {
@@ -161,7 +207,6 @@ impl KeyboardStateTracker {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn group(&self) -> u32 {
         self.group
     }
@@ -194,6 +239,12 @@ impl KeyboardStateTracker {
             _ => 0,
         }
     }
+}
+
+fn build_layout_names(keymap: &xkb::Keymap) -> Vec<String> {
+    (0..keymap.num_layouts())
+        .map(|layout| keymap.layout_get_name(layout).to_owned())
+        .collect()
 }
 
 fn compile_xkb_keymap(keymap_data: &[u8]) -> Result<xkb::Keymap> {
@@ -395,6 +446,64 @@ mod tests {
         tracker.set_group(1);
 
         assert_eq!(tracker.modifier_state().group, 1);
+    }
+
+    #[test]
+    fn layout_index_by_name_resolves_group_indices() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("us,ua".into()),
+            ..Default::default()
+        })
+        .expect("multi-layout keymap compiles");
+        let tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        assert_eq!(tracker.layout_index_by_name("English (US)"), Some(0));
+        assert_eq!(tracker.layout_index_by_name("Ukrainian"), Some(1));
+        assert_eq!(tracker.layout_index_by_name("German"), None);
+    }
+
+    #[test]
+    fn alt_shift_toggles_layout_group() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("us,ua".into()),
+            options: Some("grp:alt_shift_toggle".into()),
+            ..Default::default()
+        })
+        .expect("multi-layout keymap compiles");
+        let mut tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        // 56 = KEY_LEFTALT, 42 = KEY_LEFTSHIFT
+        tracker.key(56, true);
+        tracker.key(42, true);
+        tracker.key(42, false);
+        tracker.key(56, false);
+        assert_eq!(tracker.group(), 1);
+
+        tracker.key(56, true);
+        tracker.key(42, true);
+        tracker.key(42, false);
+        tracker.key(56, false);
+        assert_eq!(tracker.group(), 0);
+    }
+
+    #[test]
+    fn external_group_switch_composes_with_alt_shift_toggle() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("us,ua".into()),
+            options: Some("grp:alt_shift_toggle".into()),
+            ..Default::default()
+        })
+        .expect("multi-layout keymap compiles");
+        let mut tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+
+        tracker.set_group(1);
+        assert_eq!(tracker.group(), 1);
+
+        tracker.key(56, true);
+        tracker.key(42, true);
+        tracker.key(42, false);
+        tracker.key(56, false);
+        assert_eq!(tracker.group(), 0);
     }
 
     #[test]
