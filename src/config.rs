@@ -75,6 +75,14 @@ struct Args {
     #[arg(long)]
     output: Option<String>,
 
+    /// Shell command to run when the first client connects
+    #[arg(long)]
+    on_client_connect: Option<String>,
+
+    /// Shell command to run when the last client disconnects
+    #[arg(long)]
+    on_client_disconnect: Option<String>,
+
     /// Path to config file [default: ~/.config/hypr-rdp/config.toml]
     #[arg(long)]
     config: Option<String>,
@@ -98,6 +106,8 @@ struct ConfigFile {
     keyboard_layout_policy: Option<String>,
     audio_mode: Option<String>,
     output: Option<String>,
+    on_client_connect: Option<String>,
+    on_client_disconnect: Option<String>,
 }
 
 impl ConfigFile {
@@ -163,6 +173,8 @@ pub struct RuntimeConfig {
     pub audio_mode: AudioMode,
     pub resolution_fixed: bool,
     pub output: Option<String>,
+    pub on_client_connect: Option<String>,
+    pub on_client_disconnect: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -216,6 +228,8 @@ impl RuntimeConfig {
         )?;
         let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
         let output = args.output.or(config.output);
+        let on_client_connect = args.on_client_connect.or(config.on_client_connect);
+        let on_client_disconnect = args.on_client_disconnect.or(config.on_client_disconnect);
 
         let resolution = parse_resolution(&resolution_str)?;
         let capture_mode = parse_capture_mode(&capture_mode_str)?;
@@ -248,6 +262,8 @@ impl RuntimeConfig {
             audio_mode,
             resolution_fixed,
             output,
+            on_client_connect,
+            on_client_disconnect,
         })
     }
 }
