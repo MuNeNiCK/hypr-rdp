@@ -222,7 +222,13 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClipState {
         {
             match interface.as_str() {
                 "zwlr_data_control_manager_v1" => {
-                    state.manager = Some(registry.bind(name, version.min(2), qh, ()));
+                    // v1 is all this backend uses (set_selection/selection).
+                    // Binding v2 subscribes us to primary_selection events,
+                    // each of which introduces a data_offer the protocol
+                    // requires the client to destroy; ignoring them leaks an
+                    // offer object plus its mime bookkeeping on every
+                    // primary-selection change (any text drag-select).
+                    state.manager = Some(registry.bind(name, version.min(1), qh, ()));
                 }
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, version.min(1), qh, ()));
@@ -380,7 +386,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 tracing::warn!("Clipboard: data control device finished");
                 state.device = None;
             }
-            zwlr_data_control_device_v1::Event::PrimarySelection { .. } => {}
             _ => {}
         }
     }
