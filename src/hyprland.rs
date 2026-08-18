@@ -51,6 +51,12 @@ pub fn monitors() -> Result<serde_json::Value> {
     serde_json::from_str(&response).context("failed to parse Hyprland monitors JSON")
 }
 
+/// Query input devices as JSON value (object with a "keyboards" array).
+pub fn devices() -> Result<serde_json::Value> {
+    let response = send_command("j/devices")?;
+    serde_json::from_str(&response).context("failed to parse Hyprland devices JSON")
+}
+
 /// Query a Hyprland option string value.
 pub fn option_string(option: &str) -> Result<Option<String>> {
     let response = send_command(&format!("j/getoption {}", option))?;
@@ -160,7 +166,7 @@ pub fn output_remove(name: &str) -> Result<()> {
 /// has accepted the connection before emitting events.
 pub struct EventStream {
     sock: UnixStream,
-    buf: String,
+    buf: Vec<u8>,
 }
 
 impl EventStream {
@@ -171,7 +177,7 @@ impl EventStream {
         sock.set_read_timeout(Some(Duration::from_millis(500)))?;
         Ok(Self {
             sock,
-            buf: String::new(),
+            buf: Vec::new(),
         })
     }
 
@@ -180,6 +186,46 @@ impl EventStream {
     pub fn ensure_registered(&self) -> Result<()> {
         let _ = monitors()?;
         Ok(())
+    }
+
+    /// Return the next `EVENT>>DATA` pair, or `None` when `timeout` elapses
+    /// without one. Errors only when the socket itself fails, so callers can
+    /// tell an idle stream from a dead one.
+    pub fn next_event(&mut self, timeout: Duration) -> Result<Option<(String, String)>> {
+        let start = Instant::now();
+        let mut raw = [0u8; 4096];
+
+        loop {
+            if let Some(newline_pos) = self.buf.iter().position(|&byte| byte == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=newline_pos).collect();
+                // Decode only after framing: a multi-byte character can
+                // straddle two socket reads.
+                let line = String::from_utf8_lossy(&line[..newline_pos]);
+                let line = line.trim();
+                if let Some((event, data)) = line.split_once(">>") {
+                    return Ok(Some((event.to_string(), data.to_string())));
+                }
+                continue;
+            }
+
+            if start.elapsed() >= timeout {
+                return Ok(None);
+            }
+
+            match self.sock.read(&mut raw) {
+                Ok(0) => bail!("Hyprland event socket closed"),
+                Ok(n) => {
+                    self.buf.extend_from_slice(&raw[..n]);
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(e) => return Err(e).context("failed to read Hyprland event"),
+            }
+        }
     }
 
     /// Wait for an event matching `event_name` (e.g. "monitoradded").
@@ -198,9 +244,10 @@ impl EventStream {
             }
 
             // Check buffered lines first
-            while let Some(newline_pos) = self.buf.find('\n') {
-                let line = self.buf[..newline_pos].trim().to_string();
-                self.buf = self.buf[newline_pos + 1..].to_string();
+            while let Some(newline_pos) = self.buf.iter().position(|&byte| byte == b'\n') {
+                let line: Vec<u8> = self.buf.drain(..=newline_pos).collect();
+                let line = String::from_utf8_lossy(&line[..newline_pos]);
+                let line = line.trim();
                 if let Some((event, data)) = line.split_once(">>") {
                     if event == event_name {
                         return Ok(data.to_string());
@@ -212,7 +259,7 @@ impl EventStream {
             match self.sock.read(&mut raw) {
                 Ok(0) => bail!("Hyprland event socket closed"),
                 Ok(n) => {
-                    self.buf.push_str(&String::from_utf8_lossy(&raw[..n]));
+                    self.buf.extend_from_slice(&raw[..n]);
                 }
                 Err(e)
                     if e.kind() == std::io::ErrorKind::WouldBlock

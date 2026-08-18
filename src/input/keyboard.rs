@@ -1,11 +1,46 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 use anyhow::{bail, Context, Result};
 use ironrdp_pdu::input::fast_path::SynchronizeFlags;
 use xkbcommon::xkb;
 
-use super::virtual_keyboard::ZwpVirtualKeyboardV1;
+/// `xkb_state_update_latched_locked`: the server-side path for out-of-band
+/// latched/locked changes to a state otherwise driven by
+/// `xkb_state_update_key` (mixing `xkb_state_update_mask` into such a state
+/// is explicitly unsupported). The symbol appeared in libxkbcommon 1.10 and
+/// the xkbcommon crate does not bind it yet, so it is resolved at runtime to
+/// keep the binary linking against older releases. The type below mirrors
+/// the documented C declaration in xkbcommon/xkbcommon.h (stable public
+/// API): xkb_mod_mask_t is uint32_t, layouts are int32_t, and Rust bool is
+/// ABI-compatible with C bool.
+type UpdateLatchedLockedFn = unsafe extern "C" fn(
+    state: *mut xkb::ffi::xkb_state,
+    affect_latched_mods: u32,
+    latched_mods: u32,
+    affect_latched_layout: bool,
+    latched_layout: i32,
+    affect_locked_mods: u32,
+    locked_mods: u32,
+    affect_locked_layout: bool,
+    locked_layout: i32,
+) -> u32;
+
+fn lookup_update_latched_locked() -> Option<UpdateLatchedLockedFn> {
+    let ptr = unsafe {
+        libc::dlsym(
+            libc::RTLD_DEFAULT,
+            c"xkb_state_update_latched_locked".as_ptr(),
+        )
+    };
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: the symbol comes from the linked libxkbcommon and has the
+        // documented signature above.
+        Some(unsafe { std::mem::transmute::<*mut libc::c_void, UpdateLatchedLockedFn>(ptr) })
+    }
+}
 
 const XKB_KEYCODE_OFFSET: u32 = 8;
 const KEY_CAPSLOCK: u32 = 58;
@@ -75,25 +110,33 @@ pub(super) struct UnicodeKeyMapping {
     pub(super) needs_shift: bool,
 }
 
+/// Modifier and layout snapshot in the shape of
+/// `zwp_virtual_keyboard_v1.modifiers`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct KeyboardModifierState {
+    pub(super) depressed: u32,
+    pub(super) latched: u32,
+    pub(super) locked: u32,
+    pub(super) group: u32,
+}
+
+/// Replica of the compositor's XKB state for the virtual keyboard.
+///
+/// A single `xkb_state` is the source of truth. Raw keys go through the
+/// server-side `xkb_state_update_key` path — group toggle options such as
+/// `grp:alt_shift_toggle` therefore switch the replica in lockstep with the
+/// compositor processing the same key stream. Out-of-band changes (RDP lock
+/// synchronization, external layout switches) go through the server-side
+/// `xkb_state_update_latched_locked` path against that same state.
 pub(super) struct KeyboardStateTracker {
-    modifier_masks_by_key: HashMap<u32, u32>,
     unicode_to_keycode: HashMap<u16, UnicodeKeyMapping>,
-    pressed_keys: HashSet<u32>,
-    depressed_mods: u32,
-    locked_mods: u32,
-    group: u32,
+    layout_names: Vec<String>,
+    xkb_state: xkb::State,
+    update_latched_locked: Option<UpdateLatchedLockedFn>,
     caps_lock_mask: u32,
     num_lock_mask: u32,
     scroll_lock_mask: u32,
     kana_lock_mask: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct KeyboardModifierState {
-    depressed: u32,
-    latched: u32,
-    locked: u32,
-    group: u32,
 }
 
 impl KeyboardStateTracker {
@@ -101,12 +144,10 @@ impl KeyboardStateTracker {
         let keymap = compile_xkb_keymap(keymap_data)?;
 
         Ok(Self {
-            modifier_masks_by_key: build_modifier_masks_by_key(&keymap),
             unicode_to_keycode: build_unicode_to_keycode(&keymap),
-            pressed_keys: HashSet::new(),
-            depressed_mods: 0,
-            locked_mods: 0,
-            group: 0,
+            layout_names: build_layout_names(&keymap),
+            xkb_state: xkb::State::new(&keymap),
+            update_latched_locked: lookup_update_latched_locked(),
             caps_lock_mask: locked_mask_for_key(&keymap, KEY_CAPSLOCK),
             num_lock_mask: locked_mask_for_key(&keymap, KEY_NUMLOCK),
             scroll_lock_mask: locked_mask_for_key(&keymap, KEY_SCROLLLOCK),
@@ -118,52 +159,112 @@ impl KeyboardStateTracker {
         self.unicode_to_keycode.get(&code_point).copied()
     }
 
+    /// Resolve an XKB layout display name (e.g. "Ukrainian") to its group
+    /// index in this keymap.
+    pub(super) fn layout_index_by_name(&self, name: &str) -> Option<u32> {
+        self.layout_names
+            .iter()
+            .position(|layout| layout == name)
+            .map(|index| index as u32)
+    }
+
+    /// Feed a key event through the replica. Returns true when the modifier
+    /// or group state visible to the compositor changed.
     pub(super) fn key(&mut self, evdev_key: u32, pressed: bool) -> bool {
         let before = self.modifier_state();
-        if pressed {
-            self.pressed_keys.insert(evdev_key);
-            let lock_mask = self.lock_mask_for_key(evdev_key);
-            if lock_mask != 0 {
-                self.locked_mods ^= lock_mask;
-            }
+        let direction = if pressed {
+            xkb::KeyDirection::Down
         } else {
-            self.pressed_keys.remove(&evdev_key);
-        }
-
-        self.depressed_mods = self
-            .pressed_keys
-            .iter()
-            .filter_map(|key| self.modifier_masks_by_key.get(key))
-            .fold(0, |mods, mask| mods | *mask);
-
+            xkb::KeyDirection::Up
+        };
+        self.xkb_state
+            .update_key(xkb::Keycode::new(evdev_key + XKB_KEYCODE_OFFSET), direction);
         self.modifier_state() != before
     }
 
-    pub(super) fn synchronize_locks(&mut self, flags: SynchronizeFlags) {
-        self.locked_mods = self.locked_mods_from_flags(flags);
+    /// Force lock modifiers to the client's view (RDP `Synchronize`).
+    /// Returns true when the state changed.
+    pub(super) fn synchronize_locks(&mut self, flags: SynchronizeFlags) -> bool {
+        let target = self.locked_mods_from_flags(flags);
+
+        if self.update_latched_locked.is_some() {
+            let affect = self.caps_lock_mask
+                | self.num_lock_mask
+                | self.scroll_lock_mask
+                | self.kana_lock_mask;
+            return self.apply_latched_locked(affect, target, false, 0);
+        }
+
+        // Fallback for libxkbcommon < 1.10: locks are key toggles, so drive
+        // them through the server-side key path of the same state.
+        let before = self.modifier_state();
+        for (mask, key) in [
+            (self.caps_lock_mask, KEY_CAPSLOCK),
+            (self.num_lock_mask, KEY_NUMLOCK),
+            (self.scroll_lock_mask, KEY_SCROLLLOCK),
+            (self.kana_lock_mask, KEY_KATAKANAHIRAGANA),
+        ] {
+            if mask != 0 && (before.locked ^ target) & mask != 0 {
+                self.key(key, true);
+                self.key(key, false);
+            }
+        }
+        self.modifier_state() != before
     }
 
-    pub(super) fn set_group(&mut self, group: u32) {
-        self.group = group;
+    /// Whether external layout switches can be applied. Requires the
+    /// libxkbcommon >= 1.10 server-side latched/locked update path.
+    pub(super) fn supports_locked_layout(&self) -> bool {
+        self.update_latched_locked.is_some()
     }
 
-    pub(super) fn send_modifiers(&self, vk: &ZwpVirtualKeyboardV1) {
-        let state = self.modifier_state();
-        vk.modifiers(state.depressed, state.latched, state.locked, state.group);
+    /// Lock a layout group (external layout switch). Group toggles processed
+    /// by `key` continue relative to the new group. Returns true when the
+    /// state changed.
+    pub(super) fn set_locked_group(&mut self, group: u32) -> bool {
+        self.apply_latched_locked(0, 0, true, group as i32)
     }
 
-    fn modifier_state(&self) -> KeyboardModifierState {
+    pub(super) fn modifier_state(&self) -> KeyboardModifierState {
         KeyboardModifierState {
-            depressed: self.depressed_mods,
-            latched: 0,
-            locked: self.locked_mods,
-            group: self.group,
+            depressed: self.xkb_state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            latched: self.xkb_state.serialize_mods(xkb::STATE_MODS_LATCHED),
+            locked: self.xkb_state.serialize_mods(xkb::STATE_MODS_LOCKED),
+            group: self.xkb_state.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
         }
     }
 
+    fn apply_latched_locked(
+        &mut self,
+        affect_locked_mods: u32,
+        locked_mods: u32,
+        affect_locked_layout: bool,
+        locked_layout: i32,
+    ) -> bool {
+        let Some(update) = self.update_latched_locked else {
+            return false;
+        };
+        let before = self.modifier_state();
+        unsafe {
+            update(
+                self.xkb_state.get_raw_ptr(),
+                0,
+                0,
+                false,
+                0,
+                affect_locked_mods,
+                locked_mods,
+                affect_locked_layout,
+                locked_layout,
+            );
+        }
+        self.modifier_state() != before
+    }
+
     #[cfg(test)]
-    pub(super) fn group(&self) -> u32 {
-        self.group
+    pub(super) fn without_locked_layout_support(mut self) -> Self {
+        self.update_latched_locked = None;
+        self
     }
 
     fn locked_mods_from_flags(&self, flags: SynchronizeFlags) -> u32 {
@@ -183,16 +284,6 @@ impl KeyboardStateTracker {
         }
 
         locked_mods
-    }
-
-    fn lock_mask_for_key(&self, evdev_key: u32) -> u32 {
-        match evdev_key {
-            KEY_CAPSLOCK => self.caps_lock_mask,
-            KEY_NUMLOCK => self.num_lock_mask,
-            KEY_SCROLLLOCK => self.scroll_lock_mask,
-            KEY_KATAKANAHIRAGANA => self.kana_lock_mask,
-            _ => 0,
-        }
     }
 }
 
@@ -237,24 +328,10 @@ fn build_unicode_to_keycode(keymap: &xkb::Keymap) -> HashMap<u16, UnicodeKeyMapp
     map
 }
 
-fn build_modifier_masks_by_key(keymap: &xkb::Keymap) -> HashMap<u32, u32> {
-    let mut masks = HashMap::new();
-
-    for evdev_key in [29, 42, 54, 56, 97, 100, 125, 126] {
-        let mask = depressed_mask_for_key(keymap, evdev_key);
-        if mask != 0 {
-            masks.insert(evdev_key, mask);
-        }
-    }
-
-    masks
-}
-
-fn depressed_mask_for_key(keymap: &xkb::Keymap, evdev_key: u32) -> u32 {
-    let mut state = xkb::State::new(keymap);
-    let keycode = xkb::Keycode::new(evdev_key + XKB_KEYCODE_OFFSET);
-    state.update_key(keycode, xkb::KeyDirection::Down);
-    state.serialize_mods(xkb::STATE_MODS_DEPRESSED)
+fn build_layout_names(keymap: &xkb::Keymap) -> Vec<String> {
+    (0..keymap.num_layouts())
+        .map(|layout| keymap.layout_get_name(layout).to_owned())
+        .collect()
 }
 
 fn locked_mask_for_key(keymap: &xkb::Keymap, evdev_key: u32) -> u32 {
@@ -320,7 +397,7 @@ pub(super) fn create_keymap_fd(keymap: &[u8]) -> Result<OwnedFd> {
 mod tests {
     use super::{
         generate_xkb_keymap, generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout,
-        KeyboardStateTracker, XkbKeymapNames,
+        KeyboardStateTracker, SynchronizeFlags, XkbKeymapNames,
     };
 
     #[test]
@@ -382,6 +459,23 @@ mod tests {
         assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 44);
     }
 
+    fn toggle_keymap() -> Vec<u8> {
+        generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("us,ua".into()),
+            options: Some("grp:alt_shift_toggle".into()),
+            ..Default::default()
+        })
+        .expect("multi-layout keymap compiles")
+    }
+
+    // 56 = KEY_LEFTALT, 42 = KEY_LEFTSHIFT
+    fn press_alt_shift(tracker: &mut KeyboardStateTracker) {
+        tracker.key(56, true);
+        tracker.key(42, true);
+        tracker.key(42, false);
+        tracker.key(56, false);
+    }
+
     #[test]
     fn modifier_state_preserves_active_keyboard_group() {
         let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames {
@@ -391,10 +485,110 @@ mod tests {
         })
         .expect("multi-layout keymap compiles");
         let mut tracker = KeyboardStateTracker::new(&keymap).expect("generated keymap loads");
+        if !tracker.supports_locked_layout() {
+            eprintln!("skipping: libxkbcommon lacks xkb_state_update_latched_locked");
+            return;
+        }
 
-        tracker.set_group(1);
+        assert!(tracker.set_locked_group(1));
 
         assert_eq!(tracker.modifier_state().group, 1);
+    }
+
+    #[test]
+    fn layout_index_by_name_resolves_group_indices() {
+        let tracker = KeyboardStateTracker::new(&toggle_keymap()).expect("keymap loads");
+
+        assert_eq!(tracker.layout_index_by_name("English (US)"), Some(0));
+        assert_eq!(tracker.layout_index_by_name("Ukrainian"), Some(1));
+        assert_eq!(tracker.layout_index_by_name("German"), None);
+    }
+
+    #[test]
+    fn alt_shift_toggles_layout_group() {
+        let mut tracker = KeyboardStateTracker::new(&toggle_keymap()).expect("keymap loads");
+
+        press_alt_shift(&mut tracker);
+        assert_eq!(tracker.modifier_state().group, 1);
+
+        press_alt_shift(&mut tracker);
+        assert_eq!(tracker.modifier_state().group, 0);
+    }
+
+    #[test]
+    fn external_group_switch_composes_with_alt_shift_toggle() {
+        let mut tracker = KeyboardStateTracker::new(&toggle_keymap()).expect("keymap loads");
+        if !tracker.supports_locked_layout() {
+            eprintln!("skipping: libxkbcommon lacks xkb_state_update_latched_locked");
+            return;
+        }
+
+        assert!(tracker.set_locked_group(1));
+        assert_eq!(tracker.modifier_state().group, 1);
+
+        press_alt_shift(&mut tracker);
+        assert_eq!(tracker.modifier_state().group, 0);
+    }
+
+    #[test]
+    fn synchronize_locks_preserves_locked_group() {
+        let mut tracker = KeyboardStateTracker::new(&toggle_keymap()).expect("keymap loads");
+        if !tracker.supports_locked_layout() {
+            eprintln!("skipping: libxkbcommon lacks xkb_state_update_latched_locked");
+            return;
+        }
+        tracker.set_locked_group(1);
+
+        assert!(tracker.synchronize_locks(SynchronizeFlags::CAPS_LOCK));
+
+        let state = tracker.modifier_state();
+        assert_eq!(state.group, 1);
+        assert_ne!(state.locked & tracker.caps_lock_mask, 0);
+
+        assert!(tracker.synchronize_locks(SynchronizeFlags::empty()));
+        let state = tracker.modifier_state();
+        assert_eq!(state.group, 1);
+        assert_eq!(state.locked & tracker.caps_lock_mask, 0);
+    }
+
+    #[test]
+    fn synchronize_locks_falls_back_to_lock_key_toggles() {
+        let mut tracker = KeyboardStateTracker::new(&toggle_keymap())
+            .expect("keymap loads")
+            .without_locked_layout_support();
+        tracker.key(56, true); // hold Alt across the sync to prove state survives
+
+        assert!(tracker.synchronize_locks(SynchronizeFlags::CAPS_LOCK));
+        let state = tracker.modifier_state();
+        assert_ne!(state.locked & tracker.caps_lock_mask, 0);
+        assert_ne!(state.depressed, 0);
+
+        assert!(tracker.synchronize_locks(SynchronizeFlags::empty()));
+        assert_eq!(tracker.modifier_state().locked & tracker.caps_lock_mask, 0);
+    }
+
+    #[test]
+    fn set_locked_group_degrades_without_latched_locked_support() {
+        let mut tracker = KeyboardStateTracker::new(&toggle_keymap())
+            .expect("keymap loads")
+            .without_locked_layout_support();
+
+        assert!(!tracker.set_locked_group(1));
+        assert_eq!(tracker.modifier_state().group, 0);
+    }
+
+    #[test]
+    fn caps_lock_key_and_synchronize_share_one_state() {
+        let mut tracker = KeyboardStateTracker::new(&toggle_keymap()).expect("keymap loads");
+
+        // 58 = KEY_CAPSLOCK: the key path locks caps inside the XKB state...
+        tracker.key(58, true);
+        tracker.key(58, false);
+        assert_ne!(tracker.modifier_state().locked & tracker.caps_lock_mask, 0);
+
+        // ...and the RDP Synchronize path clears it on the same state.
+        tracker.synchronize_locks(SynchronizeFlags::empty());
+        assert_eq!(tracker.modifier_state().locked & tracker.caps_lock_mask, 0);
     }
 
     #[test]
