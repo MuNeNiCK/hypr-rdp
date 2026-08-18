@@ -28,6 +28,41 @@ use state::AppState;
 
 const CAPTURE_SESSION_RESTART_LIMIT: u32 = 5;
 
+/// A session that ran healthily this long since its last restart has paid
+/// off its restart debt. External geometry changes are legitimate and
+/// unbounded over a long session; the budget only guards against restart
+/// loops, not lifetime totals.
+const CAPTURE_RESTART_BUDGET_RESET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Pause after a failed frame: the compositor fails at round-trip speed
+/// when the source is gone or resizing, and retrying instantly burns a
+/// core on both sides.
+pub(super) const CAPTURE_FAILED_FRAME_BACKOFF: std::time::Duration =
+    std::time::Duration::from_millis(100);
+/// Consecutive failed frames before escalating to a session restart.
+pub(super) const CAPTURE_FAILED_FRAME_LIMIT: u32 = 50;
+
+/// The compositor kept failing frames past the in-loop retry budget; a
+/// session restart is the next escalation step.
+#[derive(Debug)]
+pub(super) struct FramesRepeatedlyFailed;
+
+impl std::fmt::Display for FramesRepeatedlyFailed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "compositor kept failing capture frames")
+    }
+}
+
+impl std::error::Error for FramesRepeatedlyFailed {}
+
+fn replenished_restarts(restarts: u32, since_last_restart: std::time::Duration) -> u32 {
+    if since_last_restart >= CAPTURE_RESTART_BUDGET_RESET {
+        0
+    } else {
+        restarts
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureRestartDecision {
     Restart { restarts: u32 },
@@ -112,6 +147,7 @@ fn refresh_output_layout_for_capture(
 #[allow(clippy::too_many_arguments)]
 pub async fn start_capture(
     tx: mpsc::Sender<DisplayUpdate>,
+    capture_dead: std::sync::Arc<tokio::sync::Notify>,
     capture_mode: CaptureMode,
     egfx_shared: Option<Arc<EgfxShared>>,
     output_layout: Arc<SharedOutputLayout>,
@@ -126,6 +162,8 @@ pub async fn start_capture(
 ) -> Result<(CaptureInfo, std::thread::JoinHandle<()>)> {
     let (info_tx, info_rx) = tokio::sync::oneshot::channel();
 
+    let stop_flag_at_exit = std::sync::Arc::clone(&stop_flag);
+    let update_rx_probe = tx.clone();
     let handle = std::thread::Builder::new()
         .name("wayland-capture".into())
         .spawn(move || {
@@ -145,6 +183,20 @@ pub async fn start_capture(
                 stop_flag,
             ) {
                 tracing::error!("Capture thread error: {:#}", e);
+            }
+            // An exit nobody requested must surface as a disconnect: the
+            // display half keeps a live update sender, so the channel never
+            // closes on its own and the session would freeze instead.
+            // An exit because the update receiver is already gone is not a
+            // death: reactivation and disconnect drop the receiver first and
+            // a fresh capture follows.
+            if !stop_flag_at_exit.load(std::sync::atomic::Ordering::Acquire) {
+                if update_rx_probe.is_closed() {
+                    tracing::debug!("Capture thread exited after its update receiver closed");
+                } else {
+                    tracing::error!("Capture thread died with a live session; disconnecting it");
+                    capture_dead.notify_one();
+                }
             }
         })?;
 
@@ -170,6 +222,7 @@ fn capture_thread(
 ) -> Result<()> {
     let mut info_tx = Some(info_tx);
     let mut restarts = 0u32;
+    let mut last_restart: Option<std::time::Instant> = None;
 
     loop {
         let result = capture_thread_inner(
@@ -190,37 +243,43 @@ fn capture_thread(
 
         match result {
             Ok(()) => return Ok(()),
-            Err(err) => match capture_session_restart_decision(
-                &err,
-                stop_flag.load(std::sync::atomic::Ordering::Acquire),
-                restarts,
-            ) {
-                CaptureRestartDecision::Restart {
-                    restarts: next_restarts,
-                } => {
-                    restarts = next_restarts;
-                    tracing::warn!(
-                        restarts,
-                        "Capture session parameters changed; restarting capture thread"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(100));
+            Err(err) => {
+                if let Some(at) = last_restart {
+                    restarts = replenished_restarts(restarts, at.elapsed());
                 }
-                CaptureRestartDecision::GiveUp {
-                    restarts: next_restarts,
-                } => {
-                    restarts = next_restarts;
-                    tracing::warn!(
-                        restarts,
-                        "Capture session parameters changed; restart limit reached"
-                    );
-                    send_capture_start_error(&mut info_tx, &err);
-                    return Err(err);
+                match capture_session_restart_decision(
+                    &err,
+                    stop_flag.load(std::sync::atomic::Ordering::Acquire),
+                    restarts,
+                ) {
+                    CaptureRestartDecision::Restart {
+                        restarts: next_restarts,
+                    } => {
+                        restarts = next_restarts;
+                        last_restart = Some(std::time::Instant::now());
+                        tracing::warn!(
+                            restarts,
+                            "Capture session parameters changed; restarting capture thread"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    CaptureRestartDecision::GiveUp {
+                        restarts: next_restarts,
+                    } => {
+                        restarts = next_restarts;
+                        tracing::warn!(
+                            restarts,
+                            "Capture session parameters changed; restart limit reached"
+                        );
+                        send_capture_start_error(&mut info_tx, &err);
+                        return Err(err);
+                    }
+                    CaptureRestartDecision::Propagate => {
+                        send_capture_start_error(&mut info_tx, &err);
+                        return Err(err);
+                    }
                 }
-                CaptureRestartDecision::Propagate => {
-                    send_capture_start_error(&mut info_tx, &err);
-                    return Err(err);
-                }
-            },
+            }
         }
     }
 }
@@ -245,7 +304,8 @@ fn capture_session_restart_decision(
     stop_flag_set: bool,
     restarts: u32,
 ) -> CaptureRestartDecision {
-    if stop_flag_set || !capture_session_geometry_changed(err) {
+    let restartable = capture_session_geometry_changed(err) || err.is::<FramesRepeatedlyFailed>();
+    if stop_flag_set || !restartable {
         return CaptureRestartDecision::Propagate;
     }
 
@@ -444,8 +504,8 @@ fn is_wayland_would_block(err: &wayland_client::backend::WaylandError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_session_restart_decision, refresh_output_layout_for_capture, wlr,
-        CaptureRestartDecision,
+        capture_session_restart_decision, refresh_output_layout_for_capture, replenished_restarts,
+        wlr, CaptureRestartDecision, FramesRepeatedlyFailed, CAPTURE_RESTART_BUDGET_RESET,
     };
     use crate::input::SharedOutputLayout;
 
@@ -503,6 +563,29 @@ mod tests {
         assert_eq!(
             capture_session_restart_decision(&err, false, 4),
             CaptureRestartDecision::GiveUp { restarts: 5 }
+        );
+    }
+
+    #[test]
+    fn restart_budget_replenishes_after_a_healthy_period() {
+        use std::time::Duration;
+
+        assert_eq!(replenished_restarts(4, Duration::from_secs(5)), 4);
+        assert_eq!(replenished_restarts(4, CAPTURE_RESTART_BUDGET_RESET), 0);
+        assert_eq!(replenished_restarts(0, Duration::from_secs(0)), 0);
+    }
+
+    #[test]
+    fn repeated_frame_failures_are_a_restartable_error() {
+        let err = anyhow::Error::new(FramesRepeatedlyFailed);
+
+        assert_eq!(
+            capture_session_restart_decision(&err, false, 0),
+            CaptureRestartDecision::Restart { restarts: 1 }
+        );
+        assert_eq!(
+            capture_session_restart_decision(&err, true, 0),
+            CaptureRestartDecision::Propagate
         );
     }
 

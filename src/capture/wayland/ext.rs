@@ -254,6 +254,13 @@ pub(super) fn capture_loop_ext(
     frame.capture();
     conn.flush().context("Wayland flush failed")?;
 
+    let mut failed_streak = 0u32;
+    // A frame the pacer skipped, retained so its damage still reaches the
+    // client if the screen then goes quiet (the buffer stays valid for the
+    // whole wait: the next capture writes into the other buffer).
+    let mut deferred: Option<crate::capture::scale::PreparedPresentationFrame<'_>> = None;
+    let mut tx_closed = false;
+
     loop {
         if state.should_stop() {
             break;
@@ -265,8 +272,27 @@ pub(super) fn capture_loop_ext(
             if state.should_stop() {
                 break;
             }
+            // Flush a pacer-skipped frame once the pacing window opens; on a
+            // static screen no further capture completes to deliver it.
+            if let Some(pending) = deferred.as_ref() {
+                if frame_pacer.should_send(
+                    Instant::now(),
+                    proc.sent_first_frame,
+                    proc.has_pending_damage(),
+                    proc.pacing_fps(),
+                ) {
+                    if !proc.process(pending.data.as_ref(), &state.tx) {
+                        tx_closed = true;
+                        break;
+                    }
+                    deferred = None;
+                }
+            }
         }
         frame.destroy();
+        if tx_closed {
+            break;
+        }
 
         // Shutdown interrupted the wait — exit cleanly
         if !state.frame_ready && !state.frame_failed {
@@ -293,8 +319,27 @@ pub(super) fn capture_loop_ext(
 
         // Process the completed frame while next capture is pending
         if completed_failed {
+            if state.buffer_width > 0
+                && (state.buffer_width != width || state.buffer_height != height)
+            {
+                // The compositor re-sent constraints; the protocol requires
+                // re-allocating buffers and retrying. Restart the session to
+                // rebuild them at the new size instead of re-attaching stale
+                // buffers at failure speed.
+                frame.destroy();
+                return Err(super::wlr::BufferParametersChanged.into());
+            }
+            failed_streak += 1;
+            if failed_streak >= super::CAPTURE_FAILED_FRAME_LIMIT {
+                frame.destroy();
+                return Err(super::FramesRepeatedlyFailed.into());
+            }
+            std::thread::sleep(super::CAPTURE_FAILED_FRAME_BACKOFF);
             continue;
         }
+        failed_streak = 0;
+        // A fresh frame supersedes anything the pacer previously skipped.
+        deferred = None;
         let data = mmaps[completed_idx].as_slice();
         let snapshot = output_layout
             .snapshot()
@@ -352,6 +397,7 @@ pub(super) fn capture_loop_ext(
         } else {
             proc.stats
                 .record_pacer_skip(prepared.width, prepared.height);
+            deferred = Some(prepared);
         }
     }
 
