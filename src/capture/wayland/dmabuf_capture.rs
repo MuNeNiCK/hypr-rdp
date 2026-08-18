@@ -15,7 +15,8 @@ use super::{poll_dispatch, POLL_TIMEOUT_MS};
 use crate::capture::frame::FramePacer;
 use crate::capture::scale::dmabuf_zero_copy_allowed;
 use crate::egfx::{
-    EgfxFrameSession, EgfxShared, EncodedEgfxFrame, EncodedFrameState, H264RateControl,
+    EgfxFrameSession, EgfxShared, EncodedEgfxFrame, EncodedFrameState, H264BackendPolicy,
+    H264RateControl,
 };
 use crate::input::{OutputLayoutSnapshot, SharedOutputLayout};
 
@@ -351,6 +352,7 @@ pub(super) fn capture_loop_ext_dmabuf(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    h264_backend: H264BackendPolicy,
     pending_initial_resize: Option<DesktopSize>,
     output_layout: Arc<SharedOutputLayout>,
 ) -> Result<()> {
@@ -473,6 +475,7 @@ pub(super) fn capture_loop_ext_dmabuf(
                 {
                     encode_failures.reset_window();
                     match crate::egfx::FrameEncoder::new(
+                        h264_backend,
                         width,
                         height,
                         bitrate,

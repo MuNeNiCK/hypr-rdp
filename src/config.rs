@@ -5,7 +5,9 @@ use serde::Deserialize;
 
 use crate::audio::AudioMode;
 use crate::capture::CaptureMode;
-use crate::egfx::{EgfxCodecPolicy, EncoderPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+use crate::egfx::{
+    EgfxCodecPolicy, H264BackendPolicy, H264RateControl, DEFAULT_MAX_FRAMES_IN_FLIGHT,
+};
 use crate::input::KeyboardLayoutPolicy;
 
 #[derive(Parser, Debug)]
@@ -73,7 +75,7 @@ struct Args {
 
     /// H.264 encoder backend: "auto" (default), "software", or "vaapi"
     #[arg(long)]
-    encoder: Option<String>,
+    h264_backend: Option<String>,
 
     /// Capture a specific output instead of creating a headless one
     #[arg(long)]
@@ -101,7 +103,7 @@ struct ConfigFile {
     egfx_codec: Option<String>,
     keyboard_layout_policy: Option<String>,
     audio_mode: Option<String>,
-    encoder: Option<String>,
+    h264_backend: Option<String>,
     output: Option<String>,
 }
 
@@ -166,7 +168,7 @@ pub struct RuntimeConfig {
     pub egfx_codec: EgfxCodecPolicy,
     pub keyboard_layout_policy: KeyboardLayoutPolicy,
     pub audio_mode: AudioMode,
-    pub encoder: EncoderPolicy,
+    pub h264_backend: H264BackendPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
 }
@@ -221,7 +223,7 @@ impl RuntimeConfig {
             config.keyboard_layout_policy,
         )?;
         let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
-        let encoder = resolve_encoder_policy(args.encoder, config.encoder)?;
+        let h264_backend = resolve_h264_backend_policy(args.h264_backend, config.h264_backend)?;
         let output = args.output.or(config.output);
 
         let resolution = parse_resolution(&resolution_str)?;
@@ -253,32 +255,32 @@ impl RuntimeConfig {
             egfx_codec,
             keyboard_layout_policy,
             audio_mode,
-            encoder,
+            h264_backend,
             resolution_fixed,
             output,
         })
     }
 }
 
-fn parse_encoder_policy(s: &str) -> anyhow::Result<EncoderPolicy> {
+fn parse_h264_backend_policy(s: &str) -> anyhow::Result<H264BackendPolicy> {
     match s {
-        "auto" => Ok(EncoderPolicy::Auto),
-        "software" => Ok(EncoderPolicy::Software),
-        "vaapi" => Ok(EncoderPolicy::Vaapi),
+        "auto" => Ok(H264BackendPolicy::Auto),
+        "software" => Ok(H264BackendPolicy::Software),
+        "vaapi" => Ok(H264BackendPolicy::Vaapi),
         other => anyhow::bail!(
-            "unknown encoder '{}', expected 'auto', 'software', or 'vaapi'",
+            "unknown H.264 backend '{}', expected 'auto', 'software', or 'vaapi'",
             other
         ),
     }
 }
 
-fn resolve_encoder_policy(
+fn resolve_h264_backend_policy(
     cli_value: Option<String>,
     config_value: Option<String>,
-) -> anyhow::Result<EncoderPolicy> {
+) -> anyhow::Result<H264BackendPolicy> {
     match cli_value.or(config_value) {
-        Some(value) => parse_encoder_policy(&value),
-        None => Ok(EncoderPolicy::Auto),
+        Some(value) => parse_h264_backend_policy(&value),
+        None => Ok(H264BackendPolicy::Auto),
     }
 }
 
@@ -439,13 +441,17 @@ mod tests {
     #[test]
     fn explicit_valid_config_loads_values() {
         let path = temp_config_path("valid");
-        fs::write(&path, "bind = '127.0.0.1:3390'\nusername = 'alice'\n")
-            .expect("write valid config");
+        fs::write(
+            &path,
+            "bind = '127.0.0.1:3390'\nusername = 'alice'\nh264_backend = 'software'\n",
+        )
+        .expect("write valid config");
 
         let config = ConfigFile::load(Some(path.to_str().unwrap())).expect("config loads");
 
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:3390"));
         assert_eq!(config.username.as_deref(), Some("alice"));
+        assert_eq!(config.h264_backend.as_deref(), Some("software"));
         fs::remove_file(&path).expect("remove valid config");
     }
 
@@ -488,6 +494,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_h264_backend_policy_values() {
+        assert_eq!(
+            parse_h264_backend_policy("auto").unwrap(),
+            H264BackendPolicy::Auto
+        );
+        assert_eq!(
+            parse_h264_backend_policy("software").unwrap(),
+            H264BackendPolicy::Software
+        );
+        assert_eq!(
+            parse_h264_backend_policy("vaapi").unwrap(),
+            H264BackendPolicy::Vaapi
+        );
+        assert!(parse_h264_backend_policy("hardware").is_err());
+    }
+
+    #[test]
     fn default_egfx_codec_policy_is_avc420() {
         let policy = resolve_egfx_codec_policy(None, None).unwrap();
 
@@ -506,6 +529,14 @@ mod tests {
         let mode = resolve_audio_mode(None, None).unwrap();
 
         assert_eq!(mode, AudioMode::Redirect);
+    }
+
+    #[test]
+    fn default_h264_backend_policy_is_auto() {
+        assert_eq!(
+            resolve_h264_backend_policy(None, None).unwrap(),
+            H264BackendPolicy::Auto
+        );
     }
 
     #[test]
@@ -546,6 +577,18 @@ mod tests {
     }
 
     #[test]
+    fn explicit_h264_backend_policy_overrides_config() {
+        assert_eq!(
+            resolve_h264_backend_policy(None, Some("software".into())).unwrap(),
+            H264BackendPolicy::Software
+        );
+        assert_eq!(
+            resolve_h264_backend_policy(Some("vaapi".into()), Some("software".into())).unwrap(),
+            H264BackendPolicy::Vaapi
+        );
+    }
+
+    #[test]
     fn parses_capture_mode_values() {
         assert_eq!(parse_capture_mode("wlr").unwrap(), CaptureMode::Wlr);
         assert_eq!(parse_capture_mode("ext").unwrap(), CaptureMode::Ext);
@@ -577,6 +620,13 @@ mod tests {
         let redirect = Args::try_parse_from(["hypr-rdp", "--audio-mode", "redirect"]).unwrap();
 
         assert_eq!(redirect.audio_mode.as_deref(), Some("redirect"));
+    }
+
+    #[test]
+    fn cli_accepts_h264_backend_option() {
+        let args = Args::try_parse_from(["hypr-rdp", "--h264-backend", "software"]).unwrap();
+
+        assert_eq!(args.h264_backend.as_deref(), Some("software"));
     }
 
     proptest! {
@@ -655,6 +705,15 @@ mod tests {
                 }
                 _ => {
                     prop_assert!(parse_audio_mode(&token).is_err());
+                }
+            }
+
+            match token.as_str() {
+                "auto" | "software" | "vaapi" => {
+                    prop_assert!(parse_h264_backend_policy(&token).is_ok());
+                }
+                _ => {
+                    prop_assert!(parse_h264_backend_policy(&token).is_err());
                 }
             }
         }

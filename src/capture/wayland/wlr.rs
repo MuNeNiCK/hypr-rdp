@@ -17,7 +17,7 @@ use crate::capture::frame::{FramePacer, FrameProcessor};
 use crate::capture::scale::{
     output_downscaling_generation_action, prepare_presentation_frame, presentation_frame_shape,
 };
-use crate::egfx::{EgfxShared, H264RateControl};
+use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
 use crate::input::SharedOutputLayout;
 
 const WLR_FRAME_STALL_TIMEOUT: Duration = Duration::from_secs(2);
@@ -104,6 +104,7 @@ pub(super) fn capture_loop_wlr(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    h264_backend: H264BackendPolicy,
     pending_initial_resize: Option<DesktopSize>,
 ) -> Result<()> {
     // First capture to get buffer dimensions
@@ -196,7 +197,7 @@ pub(super) fn capture_loop_wlr(
         presentation_frame_shape(width, height, stride, &snapshot)?;
     let mut processor_generation = snapshot.geometry_generation;
 
-    let mut proc = FrameProcessor::new(
+    let mut proc = FrameProcessor::new_with_h264_backend(
         egfx_shared.clone(),
         presentation_width,
         presentation_height,
@@ -206,6 +207,7 @@ pub(super) fn capture_loop_wlr(
         quality,
         rate_control,
         fps,
+        h264_backend,
     );
     proc.set_pending_initial_resize(pending_initial_resize);
     let mut frame_pacer = FramePacer::new(fps, Instant::now());
@@ -297,7 +299,7 @@ pub(super) fn capture_loop_wlr(
             let action = output_downscaling_generation_action(processor_generation, &prepared);
             if action.refresh_processor {
                 processor_generation = action.next_generation;
-                proc = FrameProcessor::new(
+                proc = FrameProcessor::new_with_h264_backend(
                     egfx_shared.clone(),
                     prepared.width,
                     prepared.height,
@@ -307,6 +309,7 @@ pub(super) fn capture_loop_wlr(
                     quality,
                     rate_control,
                     fps,
+                    h264_backend,
                 );
             }
             proc.queue_damage(&action.damage_regions);
