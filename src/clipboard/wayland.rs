@@ -1,8 +1,8 @@
 use std::collections::HashMap;
-use std::io::Write;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use ironrdp_cliprdr::pdu::{ClipboardFormat, ClipboardFormatId};
 use ironrdp_server::ServerEvent;
@@ -17,8 +17,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
 
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::formats::{
-    read_bounded_clipboard_data, PendingWrite, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME,
-    TEXT_PLAIN_MIME, UTF8_MIME,
+    PendingWrite, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
 };
 
 pub(super) fn clipboard_thread(
@@ -386,6 +385,146 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
     }
 }
 
+/// No-progress and overall deadlines for clipboard pipe transfers. The
+/// watcher thread services these transfers inline, and the backend joins
+/// that thread on drop — an unbounded read or write here therefore wedges
+/// the whole server, so both directions must always terminate.
+const PIPE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+const PIPE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn poll_fd(fd: std::os::fd::RawFd, events: libc::c_short) -> std::io::Result<bool> {
+    let mut pollfd = libc::pollfd {
+        fd,
+        events,
+        revents: 0,
+    };
+    match unsafe { libc::poll(&mut pollfd, 1, 100) } {
+        0 => Ok(false),
+        n if n > 0 => Ok(true),
+        _ => {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+
+fn transfer_timed_out(
+    started: std::time::Instant,
+    last_progress: std::time::Instant,
+    stall: Duration,
+    total: Duration,
+) -> bool {
+    started.elapsed() >= total || last_progress.elapsed() >= stall
+}
+
+/// Read up to `max_size` bytes from a pipe without unbounded blocking: the
+/// fd is switched to non-blocking and the loop aborts when no byte arrives
+/// within `stall` or the transfer exceeds `total`. Returns Ok(None) when
+/// the payload exceeds `max_size`.
+fn read_pipe_bounded(
+    fd: &OwnedFd,
+    max_size: usize,
+    stall: Duration,
+    total: Duration,
+) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+
+    set_nonblocking(fd.as_raw_fd())?;
+    let started = std::time::Instant::now();
+    let mut last_progress = started;
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 65536];
+    let mut file = std::fs::File::from(fd.try_clone()?);
+    loop {
+        if transfer_timed_out(started, last_progress, stall, total) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "clipboard transfer stalled",
+            ));
+        }
+        if !poll_fd(fd.as_raw_fd(), libc::POLLIN)? {
+            continue;
+        }
+        match file.read(&mut chunk) {
+            Ok(0) => return Ok(Some(data)),
+            Ok(n) => {
+                if data.len().saturating_add(n) > max_size {
+                    return Ok(None);
+                }
+                data.extend_from_slice(&chunk[..n]);
+                last_progress = std::time::Instant::now();
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Write all of `data` into a pipe without unbounded blocking, with the
+/// same deadline discipline as [`read_pipe_bounded`].
+fn write_pipe_bounded(
+    fd: &OwnedFd,
+    data: &[u8],
+    stall: Duration,
+    total: Duration,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    set_nonblocking(fd.as_raw_fd())?;
+    let started = std::time::Instant::now();
+    let mut last_progress = started;
+    let mut written = 0;
+    let mut file = std::fs::File::from(fd.try_clone()?);
+    while written < data.len() {
+        if transfer_timed_out(started, last_progress, stall, total) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "clipboard transfer stalled",
+            ));
+        }
+        if !poll_fd(fd.as_raw_fd(), libc::POLLOUT)? {
+            continue;
+        }
+        match file.write(&data[written..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "clipboard peer stopped reading",
+                ))
+            }
+            Ok(n) => {
+                written += n;
+                last_progress = std::time::Instant::now();
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::Interrupted =>
+            {
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 /// Read data from a clipboard offer via pipe.
 fn read_offer_data(
     offer: &zwlr_data_control_offer_v1::ZwlrDataControlOfferV1,
@@ -393,8 +532,11 @@ fn read_offer_data(
     conn: &Connection,
 ) -> Option<Vec<u8>> {
     let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        tracing::warn!("Clipboard: pipe() failed");
+    // O_CLOEXEC: without it the write end leaks into children spawned
+    // elsewhere in the process (session hooks), and the read side never
+    // sees EOF while such a child lives.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        tracing::warn!("Clipboard: pipe2() failed");
         return None;
     }
     let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
@@ -404,20 +546,12 @@ fn read_offer_data(
     let _ = conn.flush();
     drop(write_fd);
 
-    // Poll with timeout to avoid blocking the event loop indefinitely
-    let mut pollfd = libc::pollfd {
-        fd: read_fd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    let poll_ret = unsafe { libc::poll(&mut pollfd, 1, 2000) };
-    if poll_ret <= 0 {
-        tracing::warn!("Clipboard: timeout waiting for offer data (mime={})", mime);
-        return None;
-    }
-
-    let mut file = std::fs::File::from(read_fd);
-    match read_bounded_clipboard_data(&mut file, MAX_CLIPBOARD_SIZE) {
+    match read_pipe_bounded(
+        &read_fd,
+        MAX_CLIPBOARD_SIZE,
+        PIPE_STALL_TIMEOUT,
+        PIPE_TOTAL_TIMEOUT,
+    ) {
         Ok(Some(data)) => Some(data),
         Ok(None) => {
             tracing::warn!(
@@ -427,7 +561,11 @@ fn read_offer_data(
             None
         }
         Err(e) => {
-            tracing::warn!("Clipboard: failed to read offer data: {}", e);
+            tracing::warn!(
+                "Clipboard: failed to read offer data (mime={}): {}",
+                mime,
+                e
+            );
             None
         }
     }
@@ -476,8 +614,7 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
 
                 if should_send {
                     if let Some(data) = state.source_data.lock().ok().and_then(|g| g.clone()) {
-                        let file = std::fs::File::from(fd);
-                        write_source_data(file, &data);
+                        write_source_data(&fd, &data);
                     }
                 }
             }
@@ -500,8 +637,8 @@ impl Dispatch<zwlr_data_control_source_v1::ZwlrDataControlSourceV1, ()> for Clip
 delegate_noop!(ClipState: ignore wl_seat::WlSeat);
 delegate_noop!(ClipState: ignore zwlr_data_control_manager_v1::ZwlrDataControlManagerV1);
 
-fn write_source_data<W: Write>(mut writer: W, data: &[u8]) -> bool {
-    match writer.write_all(data) {
+fn write_source_data(fd: &OwnedFd, data: &[u8]) -> bool {
+    match write_pipe_bounded(fd, data, PIPE_STALL_TIMEOUT, PIPE_TOTAL_TIMEOUT) {
         Ok(()) => true,
         Err(e) => {
             tracing::warn!("Clipboard: failed to write source data: {}", e);
@@ -512,32 +649,137 @@ fn write_source_data<W: Write>(mut writer: W, data: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::io;
+    use std::io::{Read, Write};
 
     use super::*;
 
-    struct FailingWriter;
+    const FAST_STALL: Duration = Duration::from_millis(300);
+    const FAST_TOTAL: Duration = Duration::from_secs(3);
 
-    impl Write for FailingWriter {
-        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
-            Err(io::Error::other("write failed"))
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
+    fn pipe_pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        (unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
+            OwnedFd::from_raw_fd(fds[1])
+        })
     }
 
     #[test]
-    fn source_data_writer_reports_successful_write() {
-        let mut out = Vec::new();
+    fn pipe_read_returns_data_when_the_writer_closes() {
+        let (read_fd, write_fd) = pipe_pair();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(write_fd);
+            file.write_all(b"clipboard payload").unwrap();
+        });
 
-        assert!(write_source_data(&mut out, b"clipboard"));
-        assert_eq!(out, b"clipboard");
+        let data = read_pipe_bounded(&read_fd, 1024, FAST_STALL, FAST_TOTAL)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(data, b"clipboard payload");
+        writer.join().unwrap();
     }
 
     #[test]
-    fn source_data_writer_reports_failed_write() {
-        assert!(!write_source_data(FailingWriter, b"clipboard"));
+    fn pipe_read_times_out_when_the_writer_stalls_mid_transfer() {
+        // A source that writes part of the payload and never closes used to
+        // block read_to_end forever and wedge the watcher thread.
+        let (read_fd, write_fd) = pipe_pair();
+        let mut file = std::fs::File::from(write_fd.try_clone().unwrap());
+        file.write_all(b"partial").unwrap();
+
+        let error = read_pipe_bounded(&read_fd, 1024, FAST_STALL, FAST_TOTAL).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(write_fd);
+    }
+
+    #[test]
+    fn pipe_read_rejects_oversized_payloads() {
+        let (read_fd, write_fd) = pipe_pair();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(write_fd);
+            file.write_all(&[0u8; 2048]).unwrap();
+        });
+
+        assert!(read_pipe_bounded(&read_fd, 1024, FAST_STALL, FAST_TOTAL)
+            .unwrap()
+            .is_none());
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn pipe_read_survives_a_slow_but_progressing_writer() {
+        let (read_fd, write_fd) = pipe_pair();
+        let writer = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(write_fd);
+            for chunk in [b"slow".as_slice(), b"-", b"drip"] {
+                file.write_all(chunk).unwrap();
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+
+        let data = read_pipe_bounded(&read_fd, 1024, FAST_STALL, FAST_TOTAL)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(data, b"slow-drip");
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn pipe_write_completes_when_the_reader_drains() {
+        let (read_fd, write_fd) = pipe_pair();
+        let payload = vec![7u8; 256 * 1024]; // larger than the default pipe buffer
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(read_fd);
+            let mut out = Vec::new();
+            file.read_to_end(&mut out).unwrap();
+            out
+        });
+
+        write_pipe_bounded(&write_fd, &payload, FAST_STALL, FAST_TOTAL).unwrap();
+        drop(write_fd);
+
+        assert_eq!(reader.join().unwrap(), payload);
+    }
+
+    #[test]
+    fn pipe_write_times_out_when_the_reader_stops_reading() {
+        // A paste target that stops draining its pipe used to block
+        // write_all forever once the payload exceeded the pipe buffer.
+        let (read_fd, write_fd) = pipe_pair();
+        let payload = vec![7u8; 256 * 1024];
+
+        let error = write_pipe_bounded(&write_fd, &payload, FAST_STALL, FAST_TOTAL).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        drop(read_fd);
+    }
+
+    #[test]
+    fn pipe_write_fails_fast_when_the_reader_is_gone() {
+        let (read_fd, write_fd) = pipe_pair();
+        drop(read_fd);
+
+        assert!(write_pipe_bounded(&write_fd, b"clipboard", FAST_STALL, FAST_TOTAL).is_err());
+    }
+
+    #[test]
+    fn source_data_writer_reports_both_outcomes() {
+        let (read_fd, write_fd) = pipe_pair();
+        let reader = std::thread::spawn(move || {
+            let mut file = std::fs::File::from(read_fd);
+            let mut out = Vec::new();
+            file.read_to_end(&mut out).unwrap();
+            out
+        });
+        assert!(write_source_data(&write_fd, b"clipboard"));
+        drop(write_fd);
+        assert_eq!(reader.join().unwrap(), b"clipboard");
+
+        let (read_fd, write_fd) = pipe_pair();
+        drop(read_fd);
+        assert!(!write_source_data(&write_fd, b"clipboard"));
     }
 }
