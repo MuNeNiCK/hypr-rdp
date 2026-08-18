@@ -39,15 +39,16 @@ impl AudioCaptureRunner for PipeWireCaptureRunner {
         thread::Builder::new()
             .name("pipewire-audio".into())
             .spawn(move || {
+                // pipewire::init() self-guards with a process-wide
+                // OnceCell, but deinit() is documented as at most once per
+                // process, after all PipeWire threads are done. Calling it
+                // per session tore the library down with the init guard
+                // still set, so every session after the first failed to
+                // create a MainLoop. Never deinit.
                 pipewire::init();
 
                 if let Err(e) = run_capture(sender, Arc::clone(&stop_signal), Some(startup_tx)) {
                     tracing::error!("Audio: PipeWire capture error: {:#}", e);
-                }
-
-                // SAFETY: Called once per init(), after all PipeWire resources are dropped
-                unsafe {
-                    pipewire::deinit();
                 }
             })
     }
