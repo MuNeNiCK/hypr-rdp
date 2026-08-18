@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.1.4] - 2026-08-18
+
+### Added
+
+- Added explicit `auto`, `software`, and `vaapi` H.264 backend selection through `--h264-backend` and `h264_backend`.
+
+### Changed
+
+- Improved presentation downscaling quality with area filtering.
+- Updated the FFmpeg binding for FFmpeg 9 compatibility.
+
+### Fixed
+
+- Fixed physical-output size negotiation so the presentation size converges instead of repeatedly requesting the same layout.
+- Fixed VA-API packed-header submission for drivers that require sequence, picture, and slice headers.
+- Fixed VA-API rate control so zero-bitrate configurations do not emit invalid HRD parameters.
+- Fixed clipboard echo suppression so only the matching remote copy is suppressed without dropping later local updates.
+
 ## [0.1.3] - 2026-06-25
 
 ### Added
@@ -48,6 +66,7 @@
 
 - Initial public release.
 
+[0.1.4]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.0...v0.1.1
