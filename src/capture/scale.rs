@@ -170,7 +170,11 @@ fn copy_scaled_visible_rect(
             source_required
         );
     }
-    if source_stride < source.width as usize * 4 {
+    let source_row_bytes = usize::try_from(source.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .context("source row size overflow")?;
+    if source_stride < source_row_bytes {
         bail!(
             "source stride {} too small for width {}",
             source_stride,
@@ -333,6 +337,91 @@ mod tests {
         .expect("scaled frame prepares");
 
         assert_eq!(&prepared.data[0..4], &[128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn capture_scale_downscale_partitions_non_integer_ratio_without_dropping_pixels() {
+        let mut source = vec![0u8; 12];
+        source[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        source[4..8].copy_from_slice(&[100, 100, 100, 255]);
+        source[8..12].copy_from_slice(&[200, 200, 200, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            3,
+            1,
+            12,
+            PixelFormat::BgrA32,
+            &[(0, 0, 3, 1)],
+            &snapshot((3, 1), (2, 1)),
+        )
+        .expect("scaled frame prepares");
+
+        assert_eq!(&prepared.data[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&prepared.data[4..8], &[150, 150, 150, 255]);
+    }
+
+    #[test]
+    fn capture_scale_downscale_averages_both_axes_without_reading_stride_padding() {
+        let mut source = vec![0xee; 24];
+        source[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        source[4..8].copy_from_slice(&[64, 64, 64, 255]);
+        source[12..16].copy_from_slice(&[128, 128, 128, 255]);
+        source[16..20].copy_from_slice(&[255, 255, 255, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            2,
+            2,
+            12,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 2)],
+            &snapshot((2, 2), (1, 1)),
+        )
+        .expect("scaled frame prepares");
+
+        assert_eq!(&prepared.data[0..4], &[112, 112, 112, 255]);
+    }
+
+    #[test]
+    fn capture_scale_upscale_keeps_nearest_sampled_pixels() {
+        let mut source = vec![0u8; 8];
+        source[0..4].copy_from_slice(&[10, 20, 30, 255]);
+        source[4..8].copy_from_slice(&[110, 120, 130, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            2,
+            1,
+            8,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 1)],
+            &snapshot((2, 1), (4, 2)),
+        )
+        .expect("scaled frame prepares");
+
+        let expected_row = [
+            10, 20, 30, 255, 10, 20, 30, 255, 110, 120, 130, 255, 110, 120, 130, 255,
+        ];
+        assert_eq!(&prepared.data[0..16], &expected_row);
+        assert_eq!(&prepared.data[16..32], &expected_row);
+    }
+
+    #[test]
+    fn capture_scale_rejects_stride_shorter_than_source_row() {
+        let error = prepare_presentation_frame(
+            &[0; 8],
+            2,
+            1,
+            4,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 1)],
+            &snapshot((2, 1), (1, 1)),
+        )
+        .err()
+        .expect("short source stride must fail");
+
+        assert_eq!(error.to_string(), "source stride 4 too small for width 2");
     }
 
     #[test]
