@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use crate::egfx::{
     avc444_dimensions_supported, EgfxFrameCodec as EgfxCodec, EgfxFrameFlowSnapshot,
-    EgfxFrameReadiness, EgfxShared, EncodedFrameState, H264RateControl,
+    EgfxFrameReadiness, EgfxShared, EncodedFrameState, H264BackendPolicy, H264RateControl,
 };
 
 use super::damage::{
@@ -41,6 +41,7 @@ pub(super) struct FrameProcessor {
     bitrate: u32,
     quality: u8,
     rate_control: H264RateControl,
+    h264_backend: H264BackendPolicy,
     fps: u32,
     /// Whether we've sent at least one frame (first frame always sent)
     pub(super) sent_first_frame: bool,
@@ -384,6 +385,7 @@ impl FramePacer {
 }
 
 impl FrameProcessor {
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         egfx_shared: Option<Arc<EgfxShared>>,
@@ -395,6 +397,33 @@ impl FrameProcessor {
         quality: u8,
         rate_control: H264RateControl,
         fps: u32,
+    ) -> Self {
+        Self::new_with_h264_backend(
+            egfx_shared,
+            width,
+            height,
+            pixel_format,
+            stride,
+            bitrate,
+            quality,
+            rate_control,
+            fps,
+            H264BackendPolicy::Auto,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn new_with_h264_backend(
+        egfx_shared: Option<Arc<EgfxShared>>,
+        width: u32,
+        height: u32,
+        pixel_format: PixelFormat,
+        stride: u32,
+        bitrate: u32,
+        quality: u8,
+        rate_control: H264RateControl,
+        fps: u32,
+        h264_backend: H264BackendPolicy,
     ) -> Self {
         Self {
             egfx_shared,
@@ -413,6 +442,7 @@ impl FrameProcessor {
             bitrate,
             quality,
             rate_control,
+            h264_backend,
             fps,
             sent_first_frame: false,
             encode_failures: 0,
@@ -538,6 +568,7 @@ impl FrameProcessor {
                 if ready {
                     let selected_codec = codec.unwrap_or(EgfxCodec::Avc420);
                     let encoder_result = crate::egfx::FrameEncoder::new_for_egfx_codec(
+                        self.h264_backend,
                         selected_codec,
                         self.width,
                         self.height,
@@ -776,35 +807,46 @@ impl FrameProcessor {
                         shared.request_full_frame();
                     }
 
-                    // Dynamic fallback: VAAPI -> software after repeated failures
+                    // In auto mode, recover from repeated VA-API failures by
+                    // switching to software. Forced VA-API mode must never
+                    // silently substitute a software H.264 encoder.
                     if self.encode_failures >= MAX_ENCODE_FAILURES
                         && self.h264_encoder.as_ref().is_some_and(|e| e.is_vaapi())
                     {
-                        tracing::warn!(
-                            "VA-API encode failed {} consecutive times, switching to software encoder",
-                            self.encode_failures
-                        );
-                        let fallback_result =
-                            crate::egfx::FrameEncoder::new_software_only_for_egfx_codec(
-                                self.egfx_codec.unwrap_or(EgfxCodec::Avc420),
-                                self.width,
-                                self.height,
-                                self.bitrate,
-                                self.fps,
-                                self.quality,
-                                self.rate_control,
+                        if self.h264_backend.allows_runtime_software_fallback() {
+                            tracing::warn!(
+                                "VA-API encode failed {} consecutive times, switching to software encoder",
+                                self.encode_failures
                             );
-                        match fallback_result {
-                            Ok(enc) => {
-                                self.h264_encoder = Some(enc);
-                                self.encode_failures = 0;
-                                self.egfx_surface_id = None; // Force surface re-init
+                            let fallback_result =
+                                crate::egfx::FrameEncoder::new_software_only_for_egfx_codec(
+                                    self.egfx_codec.unwrap_or(EgfxCodec::Avc420),
+                                    self.width,
+                                    self.height,
+                                    self.bitrate,
+                                    self.fps,
+                                    self.quality,
+                                    self.rate_control,
+                                );
+                            match fallback_result {
+                                Ok(enc) => {
+                                    self.h264_encoder = Some(enc);
+                                    self.encode_failures = 0;
+                                    self.egfx_surface_id = None; // Force surface re-init
+                                }
+                                Err(e) => {
+                                    tracing::error!("Software encoder fallback failed: {:#}", e);
+                                    self.h264_encoder = None;
+                                    self.egfx_active = false;
+                                }
                             }
-                            Err(e) => {
-                                tracing::error!("Software encoder fallback failed: {:#}", e);
-                                self.h264_encoder = None;
-                                self.egfx_active = false;
-                            }
+                        } else {
+                            tracing::error!(
+                                failures = self.encode_failures,
+                                "Forced VA-API encoder failed repeatedly; disabling H.264 instead of switching backends"
+                            );
+                            self.h264_encoder = None;
+                            self.egfx_active = false;
                         }
                     }
                 }
@@ -1527,7 +1569,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_processor_vaapi_failures_switch_to_bitmap_fallback_after_retries() {
+    fn frame_processor_auto_policy_switches_repeated_vaapi_failures_to_software() {
         let width = 64;
         let height = 64;
         let stride = width * 4;
@@ -1587,6 +1629,63 @@ mod tests {
         assert!(processor.sent_first_frame);
         assert!(!processor.has_pending_damage());
         assert!(processor.egfx_surface_id.is_none());
+        assert_bitmap_update(
+            &mut display_rx,
+            width,
+            height,
+            stride,
+            PixelFormat::BgrA32,
+            &frame,
+        );
+    }
+
+    #[test]
+    fn frame_processor_forced_vaapi_never_switches_to_software() {
+        let width = 64;
+        let height = 64;
+        let stride = width * 4;
+        let (shared, mut event_rx) =
+            negotiated_egfx_with_policy(width as u16, height as u16, EgfxCodecPolicy::Avc420);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new_with_h264_backend(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+            H264BackendPolicy::Vaapi,
+        );
+        processor.egfx_ready = true;
+        processor.egfx_generation = shared.generation();
+        processor.egfx_codec = Some(EgfxCodec::Avc420);
+        processor.egfx_handle = shared.get_handle();
+        processor.egfx_sender = shared.get_event_sender();
+        processor.egfx_surface_id = shared.init_or_reuse_surface(
+            processor.egfx_handle.as_ref().expect("EGFX handle"),
+            processor.egfx_sender.as_ref().expect("EGFX sender"),
+            width as u16,
+            height as u16,
+        );
+        processor.egfx_active = true;
+        processor.h264_encoder = Some(crate::egfx::FrameEncoder::failing_vaapi_for_test());
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        let setup_pdus = drain_gfx_pdus(&mut event_rx);
+        setup_pdus.assert_no_encoded_frame();
+
+        for _ in 0..MAX_ENCODE_FAILURES {
+            assert!(processor.process(&frame, &display_tx));
+        }
+
+        assert!(processor.h264_encoder.is_none());
+        assert!(!processor.egfx_active);
+        assert_eq!(processor.encode_failures, MAX_ENCODE_FAILURES);
+        assert!(processor.sent_first_frame);
+        assert!(!processor.has_pending_damage());
         assert_bitmap_update(
             &mut display_rx,
             width,

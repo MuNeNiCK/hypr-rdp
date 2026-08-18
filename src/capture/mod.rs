@@ -15,7 +15,7 @@ use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorOrientatio
 use ironrdp_server::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::egfx::{EgfxShared, H264RateControl};
+use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
 use crate::input::SharedOutputLayout;
 
 pub(crate) use wayland::HeadlessOutputGuard;
@@ -47,6 +47,7 @@ struct HyprDisplayInner {
     bitrate: u32,
     quality: u8,
     rate_control: H264RateControl,
+    h264_backend: H264BackendPolicy,
     fps: u32,
     output: Option<String>,
     resolution_fixed: bool,
@@ -367,6 +368,7 @@ impl HyprDisplay {
         quality: u8,
         rate_control: H264RateControl,
         fps: u32,
+        h264_backend: H264BackendPolicy,
         resolution_fixed: bool,
         output: Option<String>,
     ) -> Result<(Self, HyprDisplayHandle, (u16, u16))> {
@@ -476,6 +478,7 @@ impl HyprDisplay {
             bitrate,
             quality,
             rate_control,
+            h264_backend,
             fps,
             output,
             resolution_fixed,
@@ -757,6 +760,7 @@ impl RdpServerDisplay for HyprDisplay {
             inner.quality,
             inner.rate_control,
             inner.fps,
+            inner.h264_backend,
             inner.output_name.clone(),
             pending_initial_resize,
             Arc::clone(&inner.stop_flag),
@@ -874,6 +878,7 @@ mod output_downscaling {
             bitrate: 1_000_000,
             quality: 23,
             rate_control: H264RateControl::Vbr,
+            h264_backend: H264BackendPolicy::Auto,
             fps: 30,
             output: Some("DP-1".into()),
             resolution_fixed: false,
@@ -1283,6 +1288,7 @@ mod managed_headless_resize {
             bitrate: 1_000_000,
             quality: 23,
             rate_control: H264RateControl::Vbr,
+            h264_backend: H264BackendPolicy::Auto,
             fps: 30,
             output: None,
             resolution_fixed: false,

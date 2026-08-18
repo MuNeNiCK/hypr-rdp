@@ -36,12 +36,12 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         egfx_codec,
         keyboard_layout_policy,
         audio_mode,
+        h264_backend,
         resolution_fixed,
         output,
     } = config;
 
     let addr = parse_bind_addr(&bind)?;
-
     let egfx_shared = Arc::new(EgfxShared::with_codec_policy(
         max_frames_in_flight,
         egfx_codec,
@@ -57,6 +57,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         quality,
         rate_control,
         fps,
+        h264_backend,
         resolution_fixed,
         output,
     )

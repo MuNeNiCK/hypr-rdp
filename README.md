@@ -103,6 +103,7 @@ bitrate = 10000000
 quality = 23
 fps = 30
 egfx_codec = "avc420"
+# h264_backend = "auto" # auto, software, or vaapi
 # audio_mode = "redirect"
 # keyboard_layout_policy = "client"
 # output = "DP-1"
@@ -127,6 +128,7 @@ CLI arguments override config file values.
 | `--fps` | Max framerate | `30` |
 | `--max-frames-in-flight` | Max unacknowledged EGFX frames | `3` |
 | `--egfx-codec` | EGFX codec policy: `avc420`, experimental `avc444`, or `auto` | `avc420` |
+| `--h264-backend` | H.264 backend: `auto` tries VA-API then software, `software` avoids VA-API, `vaapi` never substitutes software H.264 | `auto` |
 | `--audio-mode` | Audio policy: `redirect` routes playback to a temporary RDP sink while connected, `mirror` captures the current sink audio, `off` disables RDPSND | `redirect` |
 | `--keyboard-layout-policy` | Keyboard layout policy: `client` applies the RDP client layout; `compositor` keeps the compositor/Hyprland keymap | `client` |
 | `--output` | Specific output name | _(headless)_ |
