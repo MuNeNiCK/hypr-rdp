@@ -1,6 +1,8 @@
-use std::process::Command;
+use std::io::BufRead;
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 
@@ -24,6 +26,7 @@ pub(super) trait AudioRoutingRunner: Send + Sync {
 pub(super) struct PipeWireRoutingRunner {
     command_runner: Arc<dyn RouteCommandRunner>,
     sink_name: String,
+    stream_watcher: Arc<dyn SinkInputWatcher>,
 }
 
 impl PipeWireRoutingRunner {
@@ -31,14 +34,26 @@ impl PipeWireRoutingRunner {
         Self {
             command_runner: Arc::new(SystemCommandRunner),
             sink_name: next_remote_sink_name(),
+            stream_watcher: Arc::new(PactlSubscribeWatcher),
         }
     }
 
     #[cfg(test)]
     pub(super) fn with_runner(command_runner: Arc<dyn RouteCommandRunner>) -> Self {
+        struct NoWatchWatcher;
+        impl SinkInputWatcher for NoWatchWatcher {
+            fn start(
+                &self,
+                _command_runner: Arc<dyn RouteCommandRunner>,
+                _sink_name: &str,
+            ) -> Option<StreamWatch> {
+                None
+            }
+        }
         Self {
             command_runner,
             sink_name: DEFAULT_REMOTE_SINK_NAME.to_owned(),
+            stream_watcher: Arc::new(NoWatchWatcher),
         }
     }
 
@@ -51,6 +66,7 @@ impl PipeWireRoutingRunner {
             previous_default_sink,
             moved_sink_inputs: Vec::new(),
             module_id: Some(module_id),
+            stream_watch: None,
             restored: false,
         };
 
@@ -59,8 +75,119 @@ impl PipeWireRoutingRunner {
             return Err(error);
         }
 
+        // Streams that start after activation follow WirePlumber's
+        // remembered per-application targets, not the changed default sink,
+        // so they would play on the physical output. Follow their creation
+        // and move them over; losing the watch degrades to the previous
+        // behavior, so it is not fatal.
+        guard.stream_watch = self
+            .stream_watcher
+            .start(Arc::clone(&self.command_runner), &self.sink_name);
+
         Ok(guard)
     }
+}
+
+/// Moves sink-inputs that appear while the redirect is active onto the
+/// remote sink. Only `new` events are followed: a stream the user manually
+/// re-routes mid-session afterwards stays where it was put.
+pub(super) trait SinkInputWatcher: Send + Sync {
+    fn start(
+        &self,
+        command_runner: Arc<dyn RouteCommandRunner>,
+        sink_name: &str,
+    ) -> Option<StreamWatch>;
+}
+
+struct PactlSubscribeWatcher;
+
+impl SinkInputWatcher for PactlSubscribeWatcher {
+    fn start(
+        &self,
+        command_runner: Arc<dyn RouteCommandRunner>,
+        sink_name: &str,
+    ) -> Option<StreamWatch> {
+        let mut child = match Command::new("pactl")
+            .arg("subscribe")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(error) => {
+                tracing::warn!("Audio: failed to start pactl subscribe: {}", error);
+                return None;
+            }
+        };
+        let stdout = child.stdout.take()?;
+        let sink_name = sink_name.to_owned();
+        let thread = thread::Builder::new()
+            .name("hypr-rdp-audio-route".into())
+            .spawn(move || {
+                let lines = std::io::BufReader::new(stdout)
+                    .lines()
+                    .map_while(Result::ok);
+                follow_new_sink_inputs(lines, command_runner.as_ref(), &sink_name);
+            })
+            .ok()?;
+        Some(StreamWatch {
+            child: Some(child),
+            thread: Some(thread),
+        })
+    }
+}
+
+/// Owns the `pactl subscribe` child and its reader thread; killing the
+/// child ends the reader's stream, so stop() is bounded.
+pub(super) struct StreamWatch {
+    child: Option<Child>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl StreamWatch {
+    fn stop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for StreamWatch {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn follow_new_sink_inputs(
+    lines: impl Iterator<Item = String>,
+    command_runner: &dyn RouteCommandRunner,
+    sink_name: &str,
+) {
+    for line in lines {
+        let Some(input_id) = parse_new_sink_input_event(&line) else {
+            continue;
+        };
+        // Short-lived streams can vanish before the move lands; that is
+        // not worth a warning.
+        if let Err(error) = move_sink_input(command_runner, input_id, sink_name) {
+            tracing::debug!(
+                input_id,
+                "Audio: failed to move new sink input: {:#}",
+                error
+            );
+        } else {
+            tracing::debug!(input_id, sink_name, "Audio: moved new sink input");
+        }
+    }
+}
+
+fn parse_new_sink_input_event(line: &str) -> Option<&str> {
+    let id = line.trim().strip_prefix("Event 'new' on sink-input #")?;
+    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
 }
 
 fn next_remote_sink_name() -> String {
@@ -114,6 +241,7 @@ struct RedirectRouteGuard {
     previous_default_sink: Option<String>,
     moved_sink_inputs: Vec<SinkInputRoute>,
     module_id: Option<String>,
+    stream_watch: Option<StreamWatch>,
     restored: bool,
 }
 
@@ -139,6 +267,12 @@ impl RedirectRouteGuard {
             return;
         }
         self.restored = true;
+
+        // Stop following new streams before moving anything back, so the
+        // watcher cannot re-route an input the restore just moved.
+        if let Some(mut watch) = self.stream_watch.take() {
+            watch.stop();
+        }
 
         let current_default_sink = match default_sink(self.command_runner.as_ref()) {
             Ok(current_default_sink) => current_default_sink,
@@ -431,6 +565,59 @@ mod tests {
 
             output.map_err(anyhow::Error::msg)
         }
+    }
+
+    #[test]
+    fn new_sink_input_events_are_parsed_and_others_ignored() {
+        assert_eq!(
+            parse_new_sink_input_event("Event 'new' on sink-input #123"),
+            Some("123")
+        );
+        assert_eq!(
+            parse_new_sink_input_event("Event 'change' on sink-input #123"),
+            None
+        );
+        assert_eq!(parse_new_sink_input_event("Event 'new' on sink #4"), None);
+        assert_eq!(
+            parse_new_sink_input_event("Event 'new' on sink-input #"),
+            None
+        );
+        assert_eq!(
+            parse_new_sink_input_event("Event 'new' on sink-input #12x"),
+            None
+        );
+    }
+
+    #[test]
+    fn follow_moves_each_new_sink_input_and_survives_move_failures() {
+        let runner = ScriptedRunner::with_outputs(vec![Err("gone already"), Ok("")]);
+        let lines = vec![
+            "Event 'new' on sink-input #9".to_owned(),
+            "Event 'change' on sink-input #9".to_owned(),
+            "Event 'new' on source-output #4".to_owned(),
+            "Event 'new' on sink-input #10".to_owned(),
+        ];
+
+        follow_new_sink_inputs(lines.into_iter(), runner.as_ref(), DEFAULT_REMOTE_SINK_NAME);
+
+        let calls = runner.calls();
+        assert_eq!(
+            calls,
+            vec![
+                vec![
+                    "pactl".to_owned(),
+                    "move-sink-input".to_owned(),
+                    "9".to_owned(),
+                    DEFAULT_REMOTE_SINK_NAME.to_owned()
+                ],
+                vec![
+                    "pactl".to_owned(),
+                    "move-sink-input".to_owned(),
+                    "10".to_owned(),
+                    DEFAULT_REMOTE_SINK_NAME.to_owned()
+                ],
+            ]
+        );
     }
 
     #[test]
