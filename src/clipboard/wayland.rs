@@ -4,7 +4,6 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use ironrdp_cliprdr::backend::ClipboardMessage;
 use ironrdp_cliprdr::pdu::{ClipboardFormat, ClipboardFormatId};
 use ironrdp_server::ServerEvent;
 use tokio::sync::mpsc;
@@ -16,6 +15,7 @@ use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_source_v1,
 };
 
+use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::formats::{
     read_bounded_clipboard_data, PendingWrite, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME,
     TEXT_PLAIN_MIME, UTF8_MIME,
@@ -27,6 +27,7 @@ pub(super) fn clipboard_thread(
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
+    echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     running: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()
@@ -43,6 +44,7 @@ pub(super) fn clipboard_thread(
         clipboard_data,
         clipboard_image,
         pending_write,
+        echo_candidate,
     );
 
     event_queue
@@ -165,6 +167,7 @@ struct ClipState {
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
+    echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     manager: Option<zwlr_data_control_manager_v1::ZwlrDataControlManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     device: Option<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1>,
@@ -182,6 +185,7 @@ impl ClipState {
         clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
         clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
         pending_write: Arc<Mutex<Option<PendingWrite>>>,
+        echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     ) -> Self {
         Self {
             event_sender,
@@ -189,6 +193,7 @@ impl ClipState {
             clipboard_data,
             clipboard_image,
             pending_write,
+            echo_candidate,
             manager: None,
             seat: None,
             device: None,
@@ -252,6 +257,10 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                         offer.destroy();
                     }
                     return;
+                }
+
+                if let Ok(mut candidate) = state.echo_candidate.lock() {
+                    *candidate = None;
                 }
 
                 let offer = match id {
@@ -358,9 +367,13 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 offer.destroy();
 
                 if !formats.is_empty() {
-                    let _ = state.event_sender.send(ServerEvent::Clipboard(
-                        ClipboardMessage::SendInitiateCopy(formats),
-                    ));
+                    announce_local_formats(
+                        &state.event_sender,
+                        &state.echo_candidate,
+                        &state.clipboard_data,
+                        &state.clipboard_image,
+                        formats,
+                    );
                 }
             }
             zwlr_data_control_device_v1::Event::Finished => {

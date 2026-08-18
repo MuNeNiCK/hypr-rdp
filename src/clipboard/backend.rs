@@ -16,6 +16,57 @@ use tokio::sync::mpsc;
 use super::formats::{fix_bitfields_dib, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE};
 use super::wayland::clipboard_thread;
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct ClipboardEchoCandidate {
+    text: Option<Vec<u8>>,
+    cf_dib: Option<Vec<u8>>,
+}
+
+/// Sends one locally originated format list and snapshots the exact data it
+/// advertised. The snapshot is eligible for only the next remote copy, which
+/// keeps content-based echo detection from overriding later ownership changes.
+pub(super) fn announce_local_formats(
+    event_sender: &mpsc::UnboundedSender<ServerEvent>,
+    echo_candidate: &Arc<Mutex<Option<ClipboardEchoCandidate>>>,
+    clipboard_data: &Arc<Mutex<Option<Vec<u8>>>>,
+    clipboard_image: &Arc<Mutex<Option<Vec<u8>>>>,
+    formats: Vec<ClipboardFormat>,
+) {
+    if formats.is_empty() {
+        return;
+    }
+
+    let has_text = formats
+        .iter()
+        .any(|format| format.id == ClipboardFormatId::CF_UNICODETEXT);
+    let has_cf_dib = formats
+        .iter()
+        .any(|format| format.id == ClipboardFormatId::CF_DIB);
+    let candidate = ClipboardEchoCandidate {
+        text: has_text
+            .then(|| clipboard_data.lock().ok().and_then(|data| data.clone()))
+            .flatten(),
+        cf_dib: has_cf_dib
+            .then(|| clipboard_image.lock().ok().and_then(|data| data.clone()))
+            .flatten(),
+    };
+
+    if let Ok(mut current) = echo_candidate.lock() {
+        *current = Some(candidate);
+    }
+
+    if event_sender
+        .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+            formats,
+        )))
+        .is_err()
+    {
+        if let Ok(mut current) = echo_candidate.lock() {
+            *current = None;
+        }
+    }
+}
+
 pub struct HyprCliprdrFactory {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
 }
@@ -37,6 +88,7 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let clipboard_data = Arc::new(Mutex::new(None::<Vec<u8>>));
         let clipboard_image = Arc::new(Mutex::new(None::<Vec<u8>>));
         let pending_write = Arc::new(Mutex::new(None::<PendingWrite>));
+        let echo_candidate = Arc::new(Mutex::new(None::<ClipboardEchoCandidate>));
         let suppress = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
@@ -48,8 +100,10 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
             clipboard_data,
             clipboard_image,
             pending_write,
+            echo_candidate,
             running,
             last_requested_format: None,
+            pending_echo_candidate: None,
         })
     }
 }
@@ -64,8 +118,10 @@ struct HyprCliprdrBackend {
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>, // CF_DIB bytes
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
+    echo_candidate: Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     running: Arc<AtomicBool>,
     last_requested_format: Option<ClipboardFormatId>,
+    pending_echo_candidate: Option<ClipboardEchoCandidate>,
 }
 
 impl_as_any!(HyprCliprdrBackend);
@@ -127,9 +183,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
 
         if !formats.is_empty() {
             if let Some(ref sender) = self.event_sender {
-                let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
+                announce_local_formats(
+                    sender,
+                    &self.echo_candidate,
+                    &self.clipboard_data,
+                    &self.clipboard_image,
                     formats,
-                )));
+                );
             }
         }
     }
@@ -146,6 +206,11 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
+        self.pending_echo_candidate = self
+            .echo_candidate
+            .lock()
+            .ok()
+            .and_then(|mut candidate| candidate.take());
 
         let has_unicode = available_formats
             .iter()
@@ -228,6 +293,7 @@ impl HyprCliprdrBackend {
         max_clipboard_size: usize,
     ) {
         let requested_format = self.last_requested_format.take();
+        let echo_candidate = self.pending_echo_candidate.take();
 
         if response.is_error() {
             return;
@@ -263,6 +329,14 @@ impl HyprCliprdrBackend {
                 }
             }
             Some(ClipboardFormatId::CF_DIB) => {
+                if echo_candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.cf_dib.as_deref())
+                    .is_some_and(|announced| announced == data)
+                {
+                    tracing::debug!("Clipboard: client image echoes our own copy, ignoring");
+                    return;
+                }
                 let png_result = ironrdp_cliprdr_format::bitmap::dib_to_png(data).or_else(|_| {
                     let fixed = fix_bitfields_dib(data).ok_or_else(|| {
                         ironrdp_cliprdr_format::bitmap::BitmapError::Unsupported(
@@ -290,10 +364,27 @@ impl HyprCliprdrBackend {
                     return;
                 }
 
-                tracing::trace!(len = utf8.len(), "Clipboard: received text from RDP client");
+                // Windows rewrites line endings to CRLF; normalize both for
+                // the echo check and for what Wayland applications paste.
+                let normalized = utf8.replace("\r\n", "\n");
+                if echo_candidate
+                    .as_ref()
+                    .and_then(|candidate| candidate.text.as_deref())
+                    .is_some_and(|announced| {
+                        String::from_utf8_lossy(announced).replace("\r\n", "\n") == normalized
+                    })
+                {
+                    tracing::debug!("Clipboard: client text echoes our own copy, ignoring");
+                    return;
+                }
+
+                tracing::trace!(
+                    len = normalized.len(),
+                    "Clipboard: received text from RDP client"
+                );
                 self.suppress_watcher.store(true, Ordering::SeqCst);
                 if let Ok(mut guard) = self.pending_write.lock() {
-                    *guard = Some(PendingWrite::Text(utf8.into_bytes()));
+                    *guard = Some(PendingWrite::Text(normalized.into_bytes()));
                 }
             }
             Some(format) => {
@@ -315,6 +406,7 @@ impl HyprCliprdrBackend {
         let clipboard_data = Arc::clone(&self.clipboard_data);
         let clipboard_image = Arc::clone(&self.clipboard_image);
         let pending_write = Arc::clone(&self.pending_write);
+        let echo_candidate = Arc::clone(&self.echo_candidate);
         let running = Arc::clone(&self.running);
 
         match thread::Builder::new()
@@ -326,6 +418,7 @@ impl HyprCliprdrBackend {
                     clipboard_data,
                     clipboard_image,
                     pending_write,
+                    echo_candidate,
                     running,
                 ) {
                     tracing::error!("Clipboard thread error: {:#}", e);
@@ -367,11 +460,140 @@ mod tests {
                 clipboard_data: Arc::new(Mutex::new(None)),
                 clipboard_image: Arc::new(Mutex::new(None)),
                 pending_write: Arc::new(Mutex::new(None)),
+                echo_candidate: Arc::new(Mutex::new(None)),
                 running: Arc::new(AtomicBool::new(true)),
                 last_requested_format: None,
+                pending_echo_candidate: None,
             },
             event_rx,
         )
+    }
+
+    fn utf16le(text: &str) -> Vec<u8> {
+        let mut bytes: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        bytes.extend_from_slice(&[0, 0]);
+        bytes
+    }
+
+    #[test]
+    fn client_text_echo_of_our_copy_keeps_wayland_selection() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        let payload = utf16le("hello\r\nworld");
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(backend.pending_write.lock().unwrap().is_none());
+        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn client_text_copy_is_written_with_normalized_line_endings() {
+        let (mut backend, _rx) = backend_with_events();
+        backend.last_requested_format = Some(ClipboardFormatId::CF_UNICODETEXT);
+
+        let payload = utf16le("from\r\nclient");
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        let pending = backend.pending_write.lock().unwrap();
+        let Some(PendingWrite::Text(text)) = pending.as_ref() else {
+            panic!("expected text pending write");
+        };
+        assert_eq!(text.as_slice(), b"from\nclient");
+    }
+
+    #[test]
+    fn client_image_echo_of_our_copy_keeps_wayland_selection() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        let dib = ironrdp_cliprdr_format::bitmap::png_to_cf_dib(ONE_BY_ONE_RGBA_PNG)
+            .expect("test PNG converts to DIB");
+        *backend.clipboard_image.lock().unwrap() = Some(dib.clone());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIB)]);
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(dib.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(backend.pending_write.lock().unwrap().is_none());
+        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn later_client_text_copy_with_same_content_is_not_treated_as_an_echo() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"same\ntext".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        let payload = utf16le("same\r\ntext");
+        backend.on_remote_copy(&formats);
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_format_data_response(FormatDataResponse::new_data(&payload));
+        assert!(backend.pending_write.lock().unwrap().is_none());
+
+        backend.on_remote_copy(&formats);
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_format_data_response(FormatDataResponse::new_data(&payload));
+
+        let pending = backend.pending_write.lock().unwrap();
+        let Some(PendingWrite::Text(text)) = pending.as_ref() else {
+            panic!("expected later client copy to replace the Wayland selection");
+        };
+        assert_eq!(text, b"same\ntext");
+    }
+
+    #[test]
+    fn failed_echo_response_consumes_the_candidate() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"same".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        backend.on_remote_copy(&formats);
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_format_data_response(FormatDataResponse::new_error());
+
+        backend.on_remote_copy(&formats);
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_format_data_response(FormatDataResponse::new_data(utf16le("same")));
+
+        assert!(matches!(
+            backend.pending_write.lock().unwrap().as_ref(),
+            Some(PendingWrite::Text(text)) if text == b"same"
+        ));
+    }
+
+    #[test]
+    fn cf_dibv5_response_is_not_compared_with_cf_dib_echo_candidate() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        let dibv5 = ironrdp_cliprdr_format::bitmap::png_to_cf_dibv5(ONE_BY_ONE_RGBA_PNG)
+            .expect("test PNG converts to DIBV5");
+        *backend.clipboard_image.lock().unwrap() = Some(dibv5.clone());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_DIBV5)]);
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
+
+        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
+        assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[255, 0, 0, 255]);
     }
 
     fn recv_clipboard_event(
@@ -453,6 +675,21 @@ mod tests {
             ids,
             vec![ClipboardFormatId::CF_UNICODETEXT, ClipboardFormatId::CF_DIB]
         );
+        let candidate = backend.echo_candidate.lock().unwrap();
+        let candidate = candidate.as_ref().expect("echo candidate armed");
+        assert_eq!(candidate.text.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(candidate.cf_dib.as_deref(), Some([1, 2, 3, 4].as_slice()));
+    }
+
+    #[test]
+    fn failed_local_format_announcement_does_not_leave_an_echo_candidate() {
+        let (mut backend, event_rx) = backend_with_events();
+        drop(event_rx);
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello".to_vec());
+
+        backend.on_request_format_list();
+
+        assert!(backend.echo_candidate.lock().unwrap().is_none());
     }
 
     #[test]
