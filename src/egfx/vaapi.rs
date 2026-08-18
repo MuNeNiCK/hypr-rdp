@@ -229,6 +229,47 @@ fn vaapi_rate_control_policy(
     }
 }
 
+struct VaapiRateControlParameters {
+    rate_control: va::VAEncMiscParameterRateControl,
+    hrd: Option<va::VAEncMiscParameterHRD>,
+    frame_rate: va::VAEncMiscParameterFrameRate,
+}
+
+fn vaapi_rate_control_parameters(
+    policy: VaapiRateControlPolicy,
+    fps: u32,
+) -> VaapiRateControlParameters {
+    let mut rate_control: va::VAEncMiscParameterRateControl = unsafe { mem::zeroed() };
+    rate_control.bits_per_second = policy.bits_per_second;
+    rate_control.target_percentage = policy.target_percentage;
+    rate_control.window_size = 1000;
+    rate_control.initial_qp = policy.initial_qp;
+    rate_control.min_qp = policy.min_qp;
+    rate_control.rc_flags = va::_VAEncMiscParameterRateControl__bindgen_ty_1 {
+        value: policy.rc_flags,
+    };
+    rate_control.max_qp = policy.max_qp;
+
+    // libva defines HRD/VBV parameters for modes with a bitrate target.
+    // CQP has no target, so submitting a zero-sized HRD buffer is invalid
+    // policy and crashes some radeonsi versions in vaEndPicture.
+    let hrd = (policy.bits_per_second > 0).then(|| {
+        let mut hrd: va::VAEncMiscParameterHRD = unsafe { mem::zeroed() };
+        hrd.initial_buffer_fullness = policy.bits_per_second / 2;
+        hrd.buffer_size = policy.bits_per_second;
+        hrd
+    });
+
+    let mut frame_rate: va::VAEncMiscParameterFrameRate = unsafe { mem::zeroed() };
+    frame_rate.framerate = fps;
+
+    VaapiRateControlParameters {
+        rate_control,
+        hrd,
+        frame_rate,
+    }
+}
+
 pub struct VaapiEncoder {
     input_surfaces: Vec<VaSurface>,
     recon_surfaces: Vec<VaSurface>,
@@ -996,52 +1037,34 @@ impl VaapiEncoder {
         let mut buffers = Vec::with_capacity(3);
 
         let policy = vaapi_rate_control_policy(self.bitrate, self.quality, self.rate_control);
-
-        let mut rc: va::VAEncMiscParameterRateControl = unsafe { mem::zeroed() };
-        rc.bits_per_second = policy.bits_per_second;
-        rc.target_percentage = policy.target_percentage;
-        rc.window_size = 1000;
-        rc.initial_qp = policy.initial_qp;
-        rc.min_qp = policy.min_qp;
-        rc.basic_unit_size = 0;
-        rc.rc_flags = va::_VAEncMiscParameterRateControl__bindgen_ty_1 {
-            value: policy.rc_flags,
-        };
-        rc.ICQ_quality_factor = 0;
-        rc.max_qp = policy.max_qp;
-        rc.quality_factor = 0;
-        rc.target_frame_size = 0;
+        let parameters = vaapi_rate_control_parameters(policy, self.fps);
         buffers.push(
             self.context
                 .create_misc_buffer(
                     va::VAEncMiscParameterType_VAEncMiscParameterTypeRateControl,
-                    rc,
+                    parameters.rate_control,
                     "vaCreateBuffer (rate control)",
                 )
                 .context("Failed to create rate control buffer")?,
         );
 
-        let mut hrd: va::VAEncMiscParameterHRD = unsafe { mem::zeroed() };
-        hrd.initial_buffer_fullness = policy.bits_per_second / 2;
-        hrd.buffer_size = policy.bits_per_second;
-        buffers.push(
-            self.context
-                .create_misc_buffer(
-                    va::VAEncMiscParameterType_VAEncMiscParameterTypeHRD,
-                    hrd,
-                    "vaCreateBuffer (HRD)",
-                )
-                .context("Failed to create HRD buffer")?,
-        );
+        if let Some(hrd) = parameters.hrd {
+            buffers.push(
+                self.context
+                    .create_misc_buffer(
+                        va::VAEncMiscParameterType_VAEncMiscParameterTypeHRD,
+                        hrd,
+                        "vaCreateBuffer (HRD)",
+                    )
+                    .context("Failed to create HRD buffer")?,
+            );
+        }
 
-        let mut fr: va::VAEncMiscParameterFrameRate = unsafe { mem::zeroed() };
-        fr.framerate = self.fps;
-        fr.framerate_flags = va::_VAEncMiscParameterFrameRate__bindgen_ty_1 { value: 0 };
         buffers.push(
             self.context
                 .create_misc_buffer(
                     va::VAEncMiscParameterType_VAEncMiscParameterTypeFrameRate,
-                    fr,
+                    parameters.frame_rate,
                     "vaCreateBuffer (frame rate)",
                 )
                 .context("Failed to create frame rate buffer")?,
@@ -1425,6 +1448,12 @@ mod tests {
         assert_eq!(policy.target_percentage, 100);
         assert_eq!(policy.rc_flags, 0);
         assert_eq!(policy.max_qp, 0);
+
+        let parameters = vaapi_rate_control_parameters(policy, 30);
+        let hrd = parameters.hrd.expect("VBR bitrate target requires HRD");
+        assert_eq!(hrd.initial_buffer_fullness, 5_000_000);
+        assert_eq!(hrd.buffer_size, 10_000_000);
+        assert_eq!(parameters.frame_rate.framerate, 30);
     }
 
     #[test]
@@ -1438,6 +1467,14 @@ mod tests {
         assert_eq!(policy.min_qp, 32);
         assert_eq!(policy.rc_flags, 1 << 1);
         assert_eq!(policy.max_qp, 32);
+
+        let parameters = vaapi_rate_control_parameters(policy, 30);
+        assert!(
+            parameters.hrd.is_none(),
+            "CQP must not submit an HRD buffer"
+        );
+        assert_eq!(parameters.rate_control.bits_per_second, 0);
+        assert_eq!(parameters.frame_rate.framerate, 30);
     }
 
     #[test]
