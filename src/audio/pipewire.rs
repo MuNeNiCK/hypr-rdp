@@ -17,7 +17,7 @@ struct CaptureData {
     format: pipewire::spa::param::audio::AudioInfoRaw,
     sender: mpsc::UnboundedSender<ServerEvent>,
     stop_signal: Arc<AtomicBool>,
-    timestamp: u32,
+    frames_sent: u64,
 }
 
 /// Run PipeWire audio capture on the current thread (blocking).
@@ -76,7 +76,7 @@ fn run_capture_inner(
         format: spa::param::audio::AudioInfoRaw::default(),
         sender,
         stop_signal: Arc::clone(&stop_signal),
-        timestamp: 0,
+        frames_sent: 0,
     };
 
     let stop_for_state = Arc::clone(&stop_signal);
@@ -162,7 +162,7 @@ fn run_capture_inner(
                 return;
             };
 
-            emit_wave_chunk(&data.sender, &mut data.timestamp, pcm_bytes);
+            emit_wave_chunk(&data.sender, &mut data.frames_sent, pcm_bytes);
         })
         .register()
         .map_err(|_| anyhow::anyhow!("Failed to register stream listener"))?;
@@ -263,9 +263,16 @@ fn convert_to_s16le(format: SpaAudioFormat, input: &[u8], byte_count: usize) -> 
     (!pcm_bytes.is_empty()).then_some(pcm_bytes)
 }
 
+/// The Wave2 audio timestamp (MS-RDPEA dwAudioTimeStamp) is a millisecond
+/// clock: milliseconds elapsed at the moment the server grabbed the audio,
+/// intended for A/V sync. Sending a frame counter runs that clock 44.1x
+/// too fast, and clients that pace playback against it time-stretch
+/// audibly. Derive milliseconds from the total frames sent — millisecond
+/// rate, drift-free across chunk sizes, based at stream start (there is no
+/// video timestamp channel here to anchor an uptime base against).
 fn emit_wave_chunk(
     sender: &mpsc::UnboundedSender<ServerEvent>,
-    timestamp: &mut u32,
+    frames_sent: &mut u64,
     pcm_bytes: Vec<u8>,
 ) {
     if pcm_bytes.is_empty() {
@@ -273,10 +280,12 @@ fn emit_wave_chunk(
     }
 
     let samples = pcm_bytes.len() / (BLOCK_ALIGN as usize);
+    let timestamp_ms = ((*frames_sent * 1000) / u64::from(SAMPLE_RATE)) as u32;
     let _ = sender.send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
-        pcm_bytes, *timestamp,
+        pcm_bytes,
+        timestamp_ms,
     )));
-    *timestamp = timestamp.wrapping_add(samples as u32);
+    *frames_sent += samples as u64;
 }
 
 #[cfg(test)]
@@ -382,44 +391,66 @@ mod tests {
     }
 
     #[test]
-    fn emit_wave_chunk_sends_timestamped_audio_and_advances_by_frames() {
+    fn emit_wave_chunk_timestamps_in_milliseconds_of_sent_frames() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut timestamp = 7;
+        // One second of audio already sent: the next chunk starts at 1000 ms.
+        let mut frames_sent = u64::from(SAMPLE_RATE);
 
-        emit_wave_chunk(&sender, &mut timestamp, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        emit_wave_chunk(&sender, &mut frames_sent, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         match receiver.try_recv().unwrap() {
             ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, ts)) => {
                 assert_eq!(data, vec![1, 2, 3, 4, 5, 6, 7, 8]);
-                assert_eq!(ts, 7);
+                assert_eq!(ts, 1000);
             }
             other => panic!("unexpected server event: {other:?}"),
         }
-        assert_eq!(timestamp, 9);
+        assert_eq!(frames_sent, u64::from(SAMPLE_RATE) + 2);
     }
 
     #[test]
-    fn emit_wave_chunk_drops_empty_input_and_wraps_timestamp() {
+    fn emit_wave_chunk_millisecond_clock_does_not_drift_across_chunks() {
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let mut timestamp = u32::MAX;
+        let mut frames_sent = 0u64;
 
-        emit_wave_chunk(&sender, &mut timestamp, Vec::new());
+        // 100 chunks of 441 frames = 1 second in total.
+        for _ in 0..100 {
+            emit_wave_chunk(
+                &sender,
+                &mut frames_sent,
+                vec![0; 441 * BLOCK_ALIGN as usize],
+            );
+        }
+        emit_wave_chunk(&sender, &mut frames_sent, vec![0; BLOCK_ALIGN as usize]);
+
+        let mut last_ts = 0;
+        while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(_, ts))) = receiver.try_recv() {
+            last_ts = ts;
+        }
+        // The 101st chunk starts exactly at the 1000 ms mark: no accumulated
+        // rounding drift.
+        assert_eq!(last_ts, 1000);
+    }
+
+    #[test]
+    fn emit_wave_chunk_drops_empty_input() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut frames_sent = 7;
+
+        emit_wave_chunk(&sender, &mut frames_sent, Vec::new());
+
         assert!(receiver.try_recv().is_err());
-        assert_eq!(timestamp, u32::MAX);
-
-        emit_wave_chunk(&sender, &mut timestamp, vec![1, 2, 3, 4]);
-        assert!(receiver.try_recv().is_ok());
-        assert_eq!(timestamp, 0);
+        assert_eq!(frames_sent, 7);
     }
 
     #[test]
     fn emit_wave_chunk_advances_even_when_receiver_is_closed() {
         let (sender, receiver) = mpsc::unbounded_channel();
         drop(receiver);
-        let mut timestamp = 41;
+        let mut frames_sent = 41;
 
-        emit_wave_chunk(&sender, &mut timestamp, vec![1, 2, 3, 4]);
+        emit_wave_chunk(&sender, &mut frames_sent, vec![1, 2, 3, 4]);
 
-        assert_eq!(timestamp, 42);
+        assert_eq!(frames_sent, 42);
     }
 }
