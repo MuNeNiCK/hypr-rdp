@@ -57,14 +57,62 @@ fn packed_header_plan(selected: u32, is_idr: bool) -> PackedHeaderPlan {
     }
 }
 
-fn h264_idr_pic_id(frame_num: u16) -> u16 {
-    frame_num
+/// idr_pic_id for the packed slice header and the VA slice parameters.
+/// H.264 requires consecutive IDR pictures to carry different idr_pic_id
+/// values; deriving it from the IDR sequence number satisfies that while
+/// keeping the ue(v) encoding short. (frame_num cannot serve here anymore:
+/// it is 0 for every IDR.)
+fn h264_idr_pic_id(idr_sequence: u64) -> u16 {
+    (idr_sequence % 16) as u16
+}
+
+/// Pick the lowest level whose MaxMBPS *and* MaxFS admit this stream
+/// (Rec. ITU-T H.264 Table A-1). Selecting by MaxMBPS alone signals
+/// non-conformant levels for large frames: 3840x2160 is 32400 macroblocks,
+/// past level 5.0's MaxFS of 22080 even at low frame rates. Macroblock
+/// counts round up for non-multiple-of-16 sizes.
+fn h264_level(width: u32, height: u32, fps: u32) -> u8 {
+    const LEVELS: &[(u8, u32, u32)] = &[
+        // (level_idc, MaxMBPS, MaxFS)
+        (30, 40_500, 1_620),
+        (31, 108_000, 3_600),
+        (32, 216_000, 5_120),
+        (40, 245_760, 8_192),
+        (42, 522_240, 8_704),
+        (50, 589_824, 22_080),
+        (51, 983_040, 36_864),
+        (52, 2_073_600, 36_864),
+    ];
+
+    let frame_mbs = width.div_ceil(16) * height.div_ceil(16);
+    let mbs_per_sec = frame_mbs.saturating_mul(fps);
+    LEVELS
+        .iter()
+        .find(|(_, max_mbps, max_fs)| mbs_per_sec <= *max_mbps && frame_mbs <= *max_fs)
+        .map(|(level, _, _)| *level)
+        .unwrap_or(52)
+}
+
+/// frame_num and pic_order_cnt_lsb for a picture, counted from the last
+/// IDR: §7.4.3 requires an IDR picture to carry frame_num 0, so the
+/// counter rebases at every IDR.
+fn slice_numbering(frames_since_idr: u64) -> (u16, i32) {
+    // max_frame_num = 256, max_pic_order_cnt_lsb = 256 (both minus4 = 4).
+    (
+        (frames_since_idr % 256) as u16,
+        ((frames_since_idr * 2) % 256) as i32,
+    )
 }
 
 /// Build a packed slice header matching the SPS/PPS and VA slice parameters:
 /// 8-bit frame number/POC, CABAC, one reference, and deblocking enabled.
 /// The returned bit length excludes byte-padding after the final syntax bit.
-fn generate_packed_slice_header(is_idr: bool, frame_num: u16, poc: i32) -> (Vec<u8>, u32) {
+fn generate_packed_slice_header(
+    is_idr: bool,
+    frame_num: u16,
+    idr_pic_id: u16,
+    poc: i32,
+) -> (Vec<u8>, u32) {
     let mut data = Vec::with_capacity(16);
     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
 
@@ -78,7 +126,7 @@ fn generate_packed_slice_header(is_idr: bool, frame_num: u16, poc: i32) -> (Vec<
     bits.write_ue(0); // pic_parameter_set_id
     bits.write_bits(u32::from(frame_num) & 0xff, 8); // frame_num
     if is_idr {
-        bits.write_ue(u32::from(h264_idr_pic_id(frame_num)));
+        bits.write_ue(u32::from(idr_pic_id));
     }
     bits.write_bits((poc as u32) & 0xff, 8); // pic_order_cnt_lsb
     if !is_idr {
@@ -364,6 +412,10 @@ pub struct VaapiEncoder {
     rate_control: H264RateControl,
     fps: u32,
     frame_count: u64,
+    /// frame_count value at the most recent IDR; frame_num counts from it.
+    idr_base: u64,
+    /// Number of IDR pictures emitted, for idr_pic_id derivation.
+    idr_count: u64,
     force_idr: bool,
     nv12_format: VAImageFormat,
     profile: VAProfile,
@@ -544,6 +596,8 @@ impl VaapiEncoder {
             rate_control,
             fps,
             frame_count: 0,
+            idr_base: 0,
+            idr_count: 0,
             force_idr: true,
             nv12_format,
             profile: h264_profile,
@@ -592,9 +646,10 @@ impl VaapiEncoder {
         &mut self,
         is_idr: bool,
         frame_num: u16,
+        idr_pic_id: u16,
         poc: i32,
     ) -> Result<[VaBuffer; 2]> {
-        let (header, bit_length) = generate_packed_slice_header(is_idr, frame_num, poc);
+        let (header, bit_length) = generate_packed_slice_header(is_idr, frame_num, idr_pic_id, poc);
         let param = va::VAEncPackedHeaderParameterBuffer {
             type_: va::VAEncPackedHeaderType_VAEncPackedHeaderSlice,
             bit_length,
@@ -676,10 +731,14 @@ impl VaapiEncoder {
         let mb_width = self.width.div_ceil(16);
         let mb_height = self.height.div_ceil(16);
         let num_macroblocks = mb_width * mb_height;
-        // max_frame_num = 2^(log2_max_frame_num_minus4+4) = 256
-        let frame_num = (self.frame_count % 256) as u16;
-        // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
-        let poc = ((self.frame_count * 2) % 256) as i32;
+        if is_idr {
+            self.idr_base = self.frame_count;
+        }
+        let (frame_num, poc) = slice_numbering(self.frame_count - self.idr_base);
+        let idr_pic_id = h264_idr_pic_id(self.idr_count);
+        if is_idr {
+            self.idr_count += 1;
+        }
         let packed_header_plan = packed_header_plan(self.packed_headers, is_idr);
 
         let mut picture_buffers = Vec::new();
@@ -722,7 +781,7 @@ impl VaapiEncoder {
             .context("Failed to create pic buffer")?;
         picture_buffers.push(pic_buffer);
 
-        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc, role);
+        let slice_param = self.build_slice_params(num_macroblocks, is_idr, idr_pic_id, poc, role);
         let slice_buffer = self
             .context
             .create_buffer(
@@ -733,7 +792,8 @@ impl VaapiEncoder {
             .context("Failed to create slice buffer")?;
         picture_buffers.push(slice_buffer);
         if packed_header_plan.slice {
-            picture_buffers.extend(self.create_packed_slice_buffers(is_idr, frame_num, poc)?);
+            picture_buffers
+                .extend(self.create_packed_slice_buffers(is_idr, frame_num, idr_pic_id, poc)?);
         }
 
         self.context
@@ -849,10 +909,14 @@ impl VaapiEncoder {
         let mb_width = self.width.div_ceil(16);
         let mb_height = self.height.div_ceil(16);
         let num_macroblocks = mb_width * mb_height;
-        // max_frame_num = 2^(log2_max_frame_num_minus4+4) = 256
-        let frame_num = (self.frame_count % 256) as u16;
-        // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
-        let poc = ((self.frame_count * 2) % 256) as i32;
+        if is_idr {
+            self.idr_base = self.frame_count;
+        }
+        let (frame_num, poc) = slice_numbering(self.frame_count - self.idr_base);
+        let idr_pic_id = h264_idr_pic_id(self.idr_count);
+        if is_idr {
+            self.idr_count += 1;
+        }
         let packed_header_plan = packed_header_plan(self.packed_headers, is_idr);
 
         let mut picture_buffers = Vec::new();
@@ -894,7 +958,7 @@ impl VaapiEncoder {
             .context("Failed to create pic buffer")?;
         picture_buffers.push(pic_buffer);
 
-        let slice_param = self.build_slice_params(num_macroblocks, is_idr, frame_num, poc, role);
+        let slice_param = self.build_slice_params(num_macroblocks, is_idr, idr_pic_id, poc, role);
         let slice_buffer = self
             .context
             .create_buffer(
@@ -905,7 +969,8 @@ impl VaapiEncoder {
             .context("Failed to create slice buffer")?;
         picture_buffers.push(slice_buffer);
         if packed_header_plan.slice {
-            picture_buffers.extend(self.create_packed_slice_buffers(is_idr, frame_num, poc)?);
+            picture_buffers
+                .extend(self.create_packed_slice_buffers(is_idr, frame_num, idr_pic_id, poc)?);
         }
 
         self.context
@@ -1020,20 +1085,7 @@ impl VaapiEncoder {
     }
 
     fn get_h264_level(&self) -> u8 {
-        let macroblocks_per_sec = (self.width / 16) * (self.height / 16) * self.fps;
-        if macroblocks_per_sec <= 40500 {
-            30
-        } else if macroblocks_per_sec <= 108000 {
-            31
-        } else if macroblocks_per_sec <= 245760 {
-            40
-        } else if macroblocks_per_sec <= 589824 {
-            41
-        } else if macroblocks_per_sec <= 983040 {
-            50
-        } else {
-            51
-        }
+        h264_level(self.width, self.height, self.fps)
     }
 
     fn build_sequence_params(
@@ -1139,7 +1191,7 @@ impl VaapiEncoder {
         &self,
         num_macroblocks: u32,
         is_idr: bool,
-        frame_num: u16,
+        idr_pic_id: u16,
         poc: i32,
         role: VaapiEncodeRole,
     ) -> va::VAEncSliceParameterBufferH264 {
@@ -1176,7 +1228,7 @@ impl VaapiEncoder {
         params.macroblock_info = VA_INVALID_ID;
         params.slice_type = slice_type;
         params.pic_parameter_set_id = 0;
-        params.idr_pic_id = h264_idr_pic_id(frame_num);
+        params.idr_pic_id = idr_pic_id;
         params.pic_order_cnt_lsb = poc as u16;
         params.delta_pic_order_cnt_bottom = 0;
         params.delta_pic_order_cnt = [0, 0];
@@ -1653,10 +1705,38 @@ mod tests {
     }
 
     #[test]
+    fn h264_level_respects_both_throughput_and_frame_size_limits() {
+        assert_eq!(h264_level(1280, 720, 30), 31);
+        assert_eq!(h264_level(1920, 1080, 30), 40);
+        // 3840x2160 is 32400 macroblocks: past level 5.0's MaxFS of 22080
+        // regardless of frame rate.
+        assert_eq!(h264_level(3840, 2160, 30), 51);
+        assert_eq!(h264_level(3840, 2160, 60), 52);
+        // Non-multiple-of-16 sizes round the macroblock count up.
+        assert_eq!(h264_level(1366, 768, 30), 32);
+    }
+
+    #[test]
+    fn slice_numbering_rebases_at_idr_and_wraps() {
+        assert_eq!(slice_numbering(0), (0, 0));
+        assert_eq!(slice_numbering(1), (1, 2));
+        assert_eq!(slice_numbering(255), (255, 254));
+        assert_eq!(slice_numbering(256), (0, 0));
+    }
+
+    #[test]
+    fn consecutive_idr_pictures_carry_distinct_idr_pic_ids() {
+        assert_ne!(h264_idr_pic_id(0), h264_idr_pic_id(1));
+        assert_eq!(h264_idr_pic_id(0), h264_idr_pic_id(16));
+    }
+
+    #[test]
     fn vaapi_packed_idr_slice_header_matches_va_slice_fields() {
-        let frame_num = 30;
-        let poc = 60;
-        let (header, bit_length) = generate_packed_slice_header(true, frame_num, poc);
+        // An IDR picture carries frame_num 0 (H.264 7.4.3).
+        let frame_num = 0;
+        let idr_pic_id = h264_idr_pic_id(3);
+        let poc = 0;
+        let (header, bit_length) = generate_packed_slice_header(true, frame_num, idr_pic_id, poc);
         assert_eq!(&header[..5], &[0, 0, 0, 1, 0x65]);
 
         let mut bits = TestBitReader::from_escaped(&header[5..]);
@@ -1664,7 +1744,7 @@ mod tests {
         assert_eq!(bits.read_ue() % 5, u32::from(SLICE_TYPE_I));
         assert_eq!(bits.read_ue(), 0); // pic_parameter_set_id
         assert_eq!(bits.read_bits(8), u32::from(frame_num));
-        assert_eq!(bits.read_ue(), u32::from(h264_idr_pic_id(frame_num)));
+        assert_eq!(bits.read_ue(), u32::from(idr_pic_id));
         assert_eq!(bits.read_bits(8), poc as u32);
         assert_eq!(bits.read_bits(1), 0); // no_output_of_prior_pics_flag
         assert_eq!(bits.read_bits(1), 0); // long_term_reference_flag
@@ -1679,7 +1759,7 @@ mod tests {
     fn vaapi_packed_p_slice_header_matches_va_slice_fields() {
         let frame_num = 31;
         let poc = 62;
-        let (header, bit_length) = generate_packed_slice_header(false, frame_num, poc);
+        let (header, bit_length) = generate_packed_slice_header(false, frame_num, 0, poc);
         assert_eq!(&header[..5], &[0, 0, 0, 1, 0x61]);
 
         let mut bits = TestBitReader::from_escaped(&header[5..]);
@@ -1704,7 +1784,9 @@ mod tests {
         for is_idr in [false, true] {
             for frame_num in [0u16, 1, 127, 255] {
                 for poc in [0i32, 2, 126, 254] {
-                    let (header, _) = generate_packed_slice_header(is_idr, frame_num, poc);
+                    let idr_pic_id = h264_idr_pic_id(u64::from(frame_num));
+                    let (header, _) =
+                        generate_packed_slice_header(is_idr, frame_num, idr_pic_id, poc);
                     let mut bits = TestBitReader::from_escaped(&header[5..]);
                     assert_eq!(bits.read_ue(), 0);
                     assert_eq!(
@@ -1714,7 +1796,7 @@ mod tests {
                     assert_eq!(bits.read_ue(), 0);
                     assert_eq!(bits.read_bits(8), u32::from(frame_num));
                     if is_idr {
-                        assert_eq!(bits.read_ue(), u32::from(h264_idr_pic_id(frame_num)));
+                        assert_eq!(bits.read_ue(), u32::from(idr_pic_id));
                     }
                     assert_eq!(bits.read_bits(8), poc as u32);
                 }

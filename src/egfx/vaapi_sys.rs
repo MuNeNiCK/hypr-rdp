@@ -532,6 +532,12 @@ impl VaBuffer {
         let mut segment = ptr as *const va::VACodedBufferSegment;
         while !segment.is_null() {
             let segment_ref = unsafe { &*segment };
+            // The driver truncates the bitstream and raises this status bit
+            // when a slice outgrew the coded buffer; forwarding the
+            // truncated frame corrupts the client's decoder state.
+            if segment_ref.status & va::VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK != 0 {
+                bail!("coded buffer overflow: encoded slice exceeded the coded buffer");
+            }
             if !segment_ref.buf.is_null() && segment_ref.size > 0 {
                 let bytes = unsafe {
                     std::slice::from_raw_parts(
