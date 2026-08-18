@@ -43,6 +43,8 @@ struct WaylandInput {
     vk: ZwpVirtualKeyboardV1,
     vp: ZwlrVirtualPointerV1,
     output_layout: Arc<SharedOutputLayout>,
+    scroll_residual_v: f64,
+    scroll_residual_h: f64,
 }
 
 impl WaylandInput {
@@ -155,28 +157,39 @@ impl InputBackend for WaylandInput {
                 self.flush();
             }
             MouseEvent::VerticalScroll { value } => {
-                // Negate: RDP positive=up, Wayland positive=down
-                let discrete = -((value as f64 / 120.0).round() as i32);
-                let continuous = discrete as f64 * 15.0;
+                let (continuous, discrete) =
+                    scroll_axis_step(&mut self.scroll_residual_v, f64::from(value));
                 self.vp.axis_source(AxisSource::Wheel);
-                self.vp
-                    .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
+                if discrete != 0 {
+                    self.vp
+                        .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
+                } else {
+                    self.vp.axis(t, Axis::VerticalScroll, continuous);
+                }
                 self.vp.frame();
                 self.flush();
             }
             MouseEvent::Scroll { x, y } => {
                 self.vp.axis_source(AxisSource::Wheel);
                 if y != 0 {
-                    let discrete = -((y as f64 / 120.0).round() as i32);
-                    let continuous = discrete as f64 * 15.0;
-                    self.vp
-                        .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
+                    let (continuous, discrete) =
+                        scroll_axis_step(&mut self.scroll_residual_v, f64::from(y));
+                    if discrete != 0 {
+                        self.vp
+                            .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
+                    } else {
+                        self.vp.axis(t, Axis::VerticalScroll, continuous);
+                    }
                 }
                 if x != 0 {
-                    let discrete = -((x as f64 / 120.0).round() as i32);
-                    let continuous = discrete as f64 * 15.0;
-                    self.vp
-                        .axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
+                    let (continuous, discrete) =
+                        scroll_axis_step(&mut self.scroll_residual_h, f64::from(x));
+                    if discrete != 0 {
+                        self.vp
+                            .axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
+                    } else {
+                        self.vp.axis(t, Axis::HorizontalScroll, continuous);
+                    }
                 }
                 self.vp.frame();
                 self.flush();
@@ -203,6 +216,26 @@ impl InputBackend for WaylandInput {
             tracing::trace!("Wayland flush failed: {}", err);
         }
     }
+}
+
+/// Convert an RDP wheel delta into a Wayland axis emission. RDP wheel
+/// deltas follow the Windows WHEEL_DELTA convention: 120 units per detent,
+/// with high-resolution devices (touchpads, free-spinning wheels) sending
+/// fractions of 120. Rounding each event to whole detents silences slow
+/// touchpad scrolling entirely, so sub-detent remainders accumulate in
+/// `residual` across events; the protocol's `axis` request carries the
+/// sub-detent motion and `axis_discrete` extends it once whole detents
+/// accumulate. Returns the continuous axis value and the whole detents to
+/// report, both in Wayland's sign convention (positive = down/right).
+fn scroll_axis_step(residual: &mut f64, delta_units: f64) -> (f64, i32) {
+    let ticks = delta_units / 120.0;
+    let continuous = -ticks * 15.0;
+    *residual += ticks;
+    // INVARIANT: |residual| < 1 before the update and |ticks| <= 32768/120,
+    // so the truncated value always fits in i32.
+    let discrete = residual.trunc() as i32;
+    *residual -= f64::from(discrete);
+    (continuous, -discrete)
 }
 
 fn map_rdp_pointer_to_source(layout: &OutputLayoutSnapshot, x: u16, y: u16) -> (u32, u32) {
@@ -327,6 +360,8 @@ impl HyprInputHandler {
             vk,
             vp,
             output_layout,
+            scroll_residual_v: 0.0,
+            scroll_residual_h: 0.0,
         };
 
         // Flush the device setup requests before handing the connection to
@@ -898,6 +933,52 @@ mod tests {
             presentation_geometry: PresentationGeometry::new(source_size, presentation_size),
             geometry_generation: 0,
         }
+    }
+
+    #[test]
+    fn scroll_full_detent_reports_a_discrete_step() {
+        let mut residual = 0.0;
+
+        assert_eq!(scroll_axis_step(&mut residual, 120.0), (-15.0, -1));
+        assert_eq!(scroll_axis_step(&mut residual, -120.0), (15.0, 1));
+        assert_eq!(residual, 0.0);
+    }
+
+    #[test]
+    fn scroll_sub_detent_deltas_accumulate_instead_of_vanishing() {
+        // A touchpad sending 12 slow ticks of +10 must scroll one detent in
+        // total; the old per-event rounding dropped every one of them.
+        let mut residual = 0.0;
+        let mut discrete_total = 0;
+        let mut continuous_total = 0.0;
+        for _ in 0..12 {
+            let (continuous, discrete) = scroll_axis_step(&mut residual, 10.0);
+            continuous_total += continuous;
+            discrete_total += discrete;
+        }
+
+        assert_eq!(discrete_total, -1);
+        assert!((continuous_total - -15.0).abs() < 1e-9);
+        assert!(residual.abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_direction_change_cancels_the_residual() {
+        let mut residual = 0.0;
+
+        assert_eq!(scroll_axis_step(&mut residual, 60.0).1, 0);
+        assert_eq!(scroll_axis_step(&mut residual, -60.0).1, 0);
+        assert!(residual.abs() < 1e-9);
+    }
+
+    #[test]
+    fn scroll_oversized_delta_reports_multiple_detents_and_keeps_remainder() {
+        let mut residual = 0.0;
+
+        let (continuous, discrete) = scroll_axis_step(&mut residual, 250.0);
+        assert_eq!(discrete, -2);
+        assert!((continuous - -31.25).abs() < 1e-9);
+        assert!((residual - 250.0 / 120.0 % 1.0).abs() < 1e-9);
     }
 
     #[test]
