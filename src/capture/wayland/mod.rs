@@ -9,7 +9,7 @@ use ironrdp_server::{DesktopSize, DisplayUpdate};
 use tokio::sync::mpsc;
 
 use super::CaptureMode;
-use crate::egfx::{EgfxShared, H264RateControl};
+use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
 use crate::input::{OutputLayoutSnapshot, SharedOutputLayout};
 pub(crate) use output::{
     create_headless_output, list_stale_headless_outputs, output_info, wait_for_output_size,
@@ -119,6 +119,7 @@ pub async fn start_capture(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    h264_backend: H264BackendPolicy,
     output_name: String,
     pending_initial_resize: Option<DesktopSize>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -138,6 +139,7 @@ pub async fn start_capture(
                 quality,
                 rate_control,
                 fps,
+                h264_backend,
                 output_name,
                 pending_initial_resize,
                 stop_flag,
@@ -161,6 +163,7 @@ fn capture_thread(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    h264_backend: H264BackendPolicy,
     output_name: String,
     pending_initial_resize: Option<DesktopSize>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -179,6 +182,7 @@ fn capture_thread(
             quality,
             rate_control,
             fps,
+            h264_backend,
             output_name.clone(),
             pending_initial_resize,
             Arc::clone(&stop_flag),
@@ -286,6 +290,7 @@ fn capture_thread_inner(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    h264_backend: H264BackendPolicy,
     output_name: String,
     pending_initial_resize: Option<DesktopSize>,
     stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -345,6 +350,7 @@ fn capture_thread_inner(
             quality,
             rate_control,
             fps,
+            h264_backend,
             pending_initial_resize,
         ),
         CaptureMode::Wlr => {
@@ -369,6 +375,7 @@ fn capture_thread_inner(
                 quality,
                 rate_control,
                 fps,
+                h264_backend,
                 pending_initial_resize,
             )
         }

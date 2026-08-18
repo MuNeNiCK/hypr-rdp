@@ -170,28 +170,67 @@ fn copy_scaled_visible_rect(
             source_required
         );
     }
+    let source_row_bytes = usize::try_from(source.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
+        .context("source row size overflow")?;
+    if source_stride < source_row_bytes {
+        bail!(
+            "source stride {} too small for width {}",
+            source_stride,
+            source.width
+        );
+    }
 
+    let source_w = u64::from(source.width);
+    let source_h = u64::from(source.height);
+    let visible_w = u64::from(visible.width);
+    let visible_h = u64::from(visible.height);
+
+    // Area-average box filter: every output pixel averages the source region
+    // it covers, so downscaling anti-aliases instead of dropping pixels the
+    // way nearest sampling does (visible as jagged text on 4K -> window-size
+    // presentations). For upscaling the box degenerates to a single source
+    // pixel, matching the previous behavior.
     for py in visible.y..visible.bottom() {
-        let rel_y = py - visible.y;
-        let sy = ((u64::from(rel_y) * u64::from(source.height)) / u64::from(visible.height))
-            .min(u64::from(source.height - 1)) as usize;
+        let rel_y = u64::from(py - visible.y);
+        let sy0 = (rel_y * source_h) / visible_h;
+        let sy1 = (((rel_y + 1) * source_h) / visible_h)
+            .max(sy0 + 1)
+            .min(source_h);
+        let (sy0, sy1) = (sy0 as usize, sy1 as usize);
         for px in visible.x..visible.right() {
-            let rel_x = px - visible.x;
-            let sx = ((u64::from(rel_x) * u64::from(source.width)) / u64::from(visible.width))
-                .min(u64::from(source.width - 1)) as usize;
+            let rel_x = u64::from(px - visible.x);
+            let sx0 = (rel_x * source_w) / visible_w;
+            let sx1 = (((rel_x + 1) * source_w) / visible_w)
+                .max(sx0 + 1)
+                .min(source_w);
+            let (sx0, sx1) = (sx0 as usize, sx1 as usize);
 
-            let source_offset = sy
-                .checked_mul(source_stride)
-                .and_then(|row| row.checked_add(sx.checked_mul(4)?))
-                .context("source pixel offset overflow")?;
+            let mut sum = [0u64; 4];
+            for sy in sy0..sy1 {
+                let row = sy * source_stride;
+                for sx in sx0..sx1 {
+                    let s = row + sx * 4;
+                    sum[0] += u64::from(source_data[s]);
+                    sum[1] += u64::from(source_data[s + 1]);
+                    sum[2] += u64::from(source_data[s + 2]);
+                    sum[3] += u64::from(source_data[s + 3]);
+                }
+            }
+            let count = ((sy1 - sy0) * (sx1 - sx0)) as u64;
+
             let output_offset = usize::try_from(py)
                 .ok()
                 .and_then(|row| row.checked_mul(output_stride))
                 .and_then(|row| row.checked_add(usize::try_from(px).ok()?.checked_mul(4)?))
                 .context("output pixel offset overflow")?;
 
-            output[output_offset..output_offset + 4]
-                .copy_from_slice(&source_data[source_offset..source_offset + 4]);
+            let half = count / 2;
+            output[output_offset] = ((sum[0] + half) / count) as u8;
+            output[output_offset + 1] = ((sum[1] + half) / count) as u8;
+            output[output_offset + 2] = ((sum[2] + half) / count) as u8;
+            output[output_offset + 3] = ((sum[3] + half) / count) as u8;
         }
     }
 
@@ -276,6 +315,113 @@ mod tests {
         assert_eq!(&prepared.data[0..4], &[0, 0, 0, 255]);
         assert_eq!(&prepared.data[16..20], &[0, 0, 0x80, 0xff]);
         assert_eq!(&prepared.data[48..52], &[0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn capture_scale_downscale_averages_covered_source_pixels() {
+        // 2x1 black+white halves -> 1x1: the area filter must yield mid-gray;
+        // nearest sampling would return one of the extremes.
+        let mut source = vec![0u8; 8];
+        source[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        source[4..8].copy_from_slice(&[255, 255, 255, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            2,
+            1,
+            8,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 1)],
+            &snapshot((2, 1), (1, 1)),
+        )
+        .expect("scaled frame prepares");
+
+        assert_eq!(&prepared.data[0..4], &[128, 128, 128, 255]);
+    }
+
+    #[test]
+    fn capture_scale_downscale_partitions_non_integer_ratio_without_dropping_pixels() {
+        let mut source = vec![0u8; 12];
+        source[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        source[4..8].copy_from_slice(&[100, 100, 100, 255]);
+        source[8..12].copy_from_slice(&[200, 200, 200, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            3,
+            1,
+            12,
+            PixelFormat::BgrA32,
+            &[(0, 0, 3, 1)],
+            &snapshot((3, 1), (2, 1)),
+        )
+        .expect("scaled frame prepares");
+
+        assert_eq!(&prepared.data[0..4], &[0, 0, 0, 255]);
+        assert_eq!(&prepared.data[4..8], &[150, 150, 150, 255]);
+    }
+
+    #[test]
+    fn capture_scale_downscale_averages_both_axes_without_reading_stride_padding() {
+        let mut source = vec![0xee; 24];
+        source[0..4].copy_from_slice(&[0, 0, 0, 255]);
+        source[4..8].copy_from_slice(&[64, 64, 64, 255]);
+        source[12..16].copy_from_slice(&[128, 128, 128, 255]);
+        source[16..20].copy_from_slice(&[255, 255, 255, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            2,
+            2,
+            12,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 2)],
+            &snapshot((2, 2), (1, 1)),
+        )
+        .expect("scaled frame prepares");
+
+        assert_eq!(&prepared.data[0..4], &[112, 112, 112, 255]);
+    }
+
+    #[test]
+    fn capture_scale_upscale_keeps_nearest_sampled_pixels() {
+        let mut source = vec![0u8; 8];
+        source[0..4].copy_from_slice(&[10, 20, 30, 255]);
+        source[4..8].copy_from_slice(&[110, 120, 130, 255]);
+
+        let prepared = prepare_presentation_frame(
+            &source,
+            2,
+            1,
+            8,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 1)],
+            &snapshot((2, 1), (4, 2)),
+        )
+        .expect("scaled frame prepares");
+
+        let expected_row = [
+            10, 20, 30, 255, 10, 20, 30, 255, 110, 120, 130, 255, 110, 120, 130, 255,
+        ];
+        assert_eq!(&prepared.data[0..16], &expected_row);
+        assert_eq!(&prepared.data[16..32], &expected_row);
+    }
+
+    #[test]
+    fn capture_scale_rejects_stride_shorter_than_source_row() {
+        let error = prepare_presentation_frame(
+            &[0; 8],
+            2,
+            1,
+            4,
+            PixelFormat::BgrA32,
+            &[(0, 0, 2, 1)],
+            &snapshot((2, 1), (1, 1)),
+        )
+        .err()
+        .expect("short source stride must fail");
+
+        assert_eq!(error.to_string(), "source stride 4 too small for width 2");
     }
 
     #[test]

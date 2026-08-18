@@ -16,6 +16,32 @@ pub enum H264RateControl {
     Cqp,
 }
 
+/// Which H.264 backend encoder creation is allowed to pick.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum H264BackendPolicy {
+    /// Try VA-API, fall back to software (historical behavior).
+    #[default]
+    Auto,
+    /// Never try VA-API.
+    Software,
+    /// Require VA-API; encoder creation fails if it is unavailable.
+    Vaapi,
+}
+
+impl H264BackendPolicy {
+    pub(crate) fn allows_vaapi(self) -> bool {
+        self != Self::Software
+    }
+
+    pub(crate) fn allows_software(self) -> bool {
+        self != Self::Vaapi
+    }
+
+    pub(crate) fn allows_runtime_software_fallback(self) -> bool {
+        self == Self::Auto
+    }
+}
+
 /// Encoder backend: hardware VAAPI, common H.264 software, or AVC444 software.
 pub enum FrameEncoder {
     #[cfg(feature = "vaapi")]
@@ -29,8 +55,10 @@ pub enum FrameEncoder {
 }
 
 impl FrameEncoder {
-    /// Try VAAPI first, fall back to software.
+    /// Create an encoder following the caller-supplied [`H264BackendPolicy`].
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
+        policy: H264BackendPolicy,
         width: u32,
         height: u32,
         bitrate: u32,
@@ -39,16 +67,24 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
-        {
+        if policy.allows_vaapi() {
             match vaapi::VaapiEncoder::new(width, height, bitrate, fps, quality, rate_control) {
                 Ok(enc) => {
                     tracing::info!("Using VA-API hardware encoder");
                     return Ok(Self::Vaapi(Box::new(enc)));
                 }
+                Err(e) if !policy.allows_software() => {
+                    return Err(e.context("h264_backend=vaapi requested but VA-API init failed"));
+                }
                 Err(e) => {
                     tracing::warn!("VA-API init failed, falling back to software: {:#}", e);
                 }
             }
+        }
+
+        #[cfg(not(feature = "vaapi"))]
+        if !policy.allows_software() {
+            anyhow::bail!("h264_backend=vaapi requested but built without the vaapi feature");
         }
 
         let enc = H264Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
@@ -193,7 +229,9 @@ impl FrameEncoder {
         Ok(Self::Software(Box::new(enc)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_for_egfx_codec(
+        policy: H264BackendPolicy,
         codec: EgfxFrameCodec,
         width: u32,
         height: u32,
@@ -203,14 +241,17 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         match codec {
-            EgfxFrameCodec::Avc420 => Self::new(width, height, bitrate, fps, quality, rate_control),
+            EgfxFrameCodec::Avc420 => {
+                Self::new(policy, width, height, bitrate, fps, quality, rate_control)
+            }
             EgfxFrameCodec::Avc444 => {
-                Self::new_avc444(width, height, bitrate, fps, quality, rate_control)
+                Self::new_avc444(policy, width, height, bitrate, fps, quality, rate_control)
             }
         }
     }
 
     pub fn new_avc444(
+        policy: H264BackendPolicy,
         width: u32,
         height: u32,
         bitrate: u32,
@@ -219,12 +260,15 @@ impl FrameEncoder {
         rate_control: H264RateControl,
     ) -> Result<Self> {
         #[cfg(feature = "vaapi")]
-        {
+        if policy.allows_vaapi() {
             match Avc444Encoder::new_with_vaapi(width, height, bitrate, fps, quality, rate_control)
             {
                 Ok(enc) => {
                     tracing::info!("Using FFmpeg/VAAPI hardware AVC444 encoder");
                     return Ok(Self::SoftwareAvc444(Box::new(enc)));
+                }
+                Err(e) if !policy.allows_software() => {
+                    return Err(e.context("h264_backend=vaapi requested but VA-API init failed"));
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -233,6 +277,11 @@ impl FrameEncoder {
                     );
                 }
             }
+        }
+
+        #[cfg(not(feature = "vaapi"))]
+        if !policy.allows_software() {
+            anyhow::bail!("h264_backend=vaapi requested but built without the vaapi feature");
         }
 
         let enc = Avc444Encoder::new(width, height, bitrate, fps, quality, rate_control)?;
@@ -310,12 +359,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn software_policy_never_selects_vaapi() {
+        let encoder = FrameEncoder::new(
+            H264BackendPolicy::Software,
+            64,
+            64,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        )
+        .expect("software encoder initializes");
+
+        assert_eq!(encoder.backend_name(), "ffmpeg-h264");
+        assert!(!encoder.is_vaapi());
+    }
+
+    #[test]
+    fn backend_policy_permissions_match_the_documented_modes() {
+        assert!(H264BackendPolicy::Auto.allows_vaapi());
+        assert!(H264BackendPolicy::Auto.allows_software());
+        assert!(H264BackendPolicy::Auto.allows_runtime_software_fallback());
+
+        assert!(!H264BackendPolicy::Software.allows_vaapi());
+        assert!(H264BackendPolicy::Software.allows_software());
+        assert!(!H264BackendPolicy::Software.allows_runtime_software_fallback());
+
+        assert!(H264BackendPolicy::Vaapi.allows_vaapi());
+        assert!(!H264BackendPolicy::Vaapi.allows_software());
+        assert!(!H264BackendPolicy::Vaapi.allows_runtime_software_fallback());
+    }
+
+    #[test]
     fn avc444_software_backend_reports_ffmpeg_and_not_vaapi() {
-        let encoder =
-            FrameEncoder::new_avc444_software_only(64, 64, 1_000_000, 30, 23, H264RateControl::Cqp)
-                .expect("software AVC444 encoder initializes");
+        let encoder = FrameEncoder::new_avc444(
+            H264BackendPolicy::Software,
+            64,
+            64,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        )
+        .expect("software AVC444 encoder initializes");
 
         assert_eq!(encoder.backend_name(), "ffmpeg-avc444");
         assert!(!encoder.is_vaapi());
+    }
+
+    #[cfg(not(feature = "vaapi"))]
+    #[test]
+    fn forced_vaapi_reports_unavailable_in_non_vaapi_builds() {
+        let avc420 = FrameEncoder::new(
+            H264BackendPolicy::Vaapi,
+            64,
+            64,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        );
+        let avc420_error = match avc420 {
+            Ok(_) => panic!("VA-API must be unavailable"),
+            Err(error) => error,
+        };
+        assert!(format!("{avc420_error:#}").contains("built without the vaapi feature"));
+
+        let avc444 = FrameEncoder::new_avc444(
+            H264BackendPolicy::Vaapi,
+            64,
+            64,
+            1_000_000,
+            30,
+            23,
+            H264RateControl::Cqp,
+        );
+        let avc444_error = match avc444 {
+            Ok(_) => panic!("VA-API must be unavailable"),
+            Err(error) => error,
+        };
+        assert!(format!("{avc444_error:#}").contains("built without the vaapi feature"));
     }
 }

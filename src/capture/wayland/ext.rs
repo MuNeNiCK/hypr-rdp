@@ -18,7 +18,7 @@ use crate::capture::scale::dmabuf_zero_copy_allowed;
 use crate::capture::scale::{
     output_downscaling_generation_action, prepare_presentation_frame, presentation_frame_shape,
 };
-use crate::egfx::{EgfxShared, H264RateControl};
+use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
 #[cfg(feature = "vaapi")]
 use crate::input::OutputLayoutSnapshot;
 use crate::input::SharedOutputLayout;
@@ -31,8 +31,12 @@ enum DmaBufCaptureErrorAction {
 }
 
 #[cfg(feature = "vaapi")]
-fn dmabuf_setup_allowed(egfx_available: bool, snapshot: Option<&OutputLayoutSnapshot>) -> bool {
-    egfx_available && snapshot.is_some_and(dmabuf_zero_copy_allowed)
+fn dmabuf_setup_allowed(
+    h264_backend: H264BackendPolicy,
+    egfx_available: bool,
+    snapshot: Option<&OutputLayoutSnapshot>,
+) -> bool {
+    h264_backend.allows_vaapi() && egfx_available && snapshot.is_some_and(dmabuf_zero_copy_allowed)
 }
 
 #[cfg(feature = "vaapi")]
@@ -60,6 +64,7 @@ pub(super) fn capture_loop_ext(
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    h264_backend: H264BackendPolicy,
     pending_initial_resize: Option<DesktopSize>,
 ) -> Result<()> {
     let capture_mgr = state
@@ -99,7 +104,7 @@ pub(super) fn capture_loop_ext(
     #[cfg(feature = "vaapi")]
     {
         let snapshot = output_layout.snapshot();
-        if dmabuf_setup_allowed(egfx_shared.is_some(), snapshot.as_ref()) {
+        if dmabuf_setup_allowed(h264_backend, egfx_shared.is_some(), snapshot.as_ref()) {
             if let Some(ref dmabuf_result) =
                 dmabuf_capture::try_setup_dmabuf(state, qh, width, height)
             {
@@ -126,6 +131,7 @@ pub(super) fn capture_loop_ext(
                             quality,
                             rate_control,
                             fps,
+                            h264_backend,
                             pending_initial_resize,
                             Arc::clone(&output_layout),
                         ) {
@@ -219,7 +225,7 @@ pub(super) fn capture_loop_ext(
         presentation_frame_shape(width, height, stride, &snapshot)?;
     let mut processor_generation = snapshot.geometry_generation;
 
-    let mut proc = FrameProcessor::new(
+    let mut proc = FrameProcessor::new_with_h264_backend(
         egfx_shared.clone(),
         presentation_width,
         presentation_height,
@@ -229,6 +235,7 @@ pub(super) fn capture_loop_ext(
         quality,
         rate_control,
         fps,
+        h264_backend,
     );
     proc.set_pending_initial_resize(pending_initial_resize);
     let mut frame_pacer = FramePacer::new(fps, Instant::now());
@@ -304,7 +311,7 @@ pub(super) fn capture_loop_ext(
         let action = output_downscaling_generation_action(processor_generation, &prepared);
         if action.refresh_processor {
             processor_generation = action.next_generation;
-            proc = FrameProcessor::new(
+            proc = FrameProcessor::new_with_h264_backend(
                 egfx_shared.clone(),
                 prepared.width,
                 prepared.height,
@@ -314,6 +321,7 @@ pub(super) fn capture_loop_ext(
                 quality,
                 rate_control,
                 fps,
+                h264_backend,
             );
         }
         proc.queue_damage(&action.damage_regions);
@@ -374,18 +382,26 @@ mod tests {
     #[test]
     fn ext_dmabuf_branch_skips_setup_when_presentation_geometry_is_scaled() {
         assert!(dmabuf_setup_allowed(
+            H264BackendPolicy::Auto,
             true,
             Some(&snapshot((1920, 1080), (1920, 1080)))
         ));
         assert!(!dmabuf_setup_allowed(
+            H264BackendPolicy::Auto,
             true,
             Some(&snapshot((3840, 2160), (1920, 1080)))
         ));
         assert!(!dmabuf_setup_allowed(
+            H264BackendPolicy::Auto,
             false,
             Some(&snapshot((1920, 1080), (1920, 1080)))
         ));
-        assert!(!dmabuf_setup_allowed(true, None));
+        assert!(!dmabuf_setup_allowed(H264BackendPolicy::Auto, true, None));
+        assert!(!dmabuf_setup_allowed(
+            H264BackendPolicy::Software,
+            true,
+            Some(&snapshot((1920, 1080), (1920, 1080)))
+        ));
     }
 
     #[test]
