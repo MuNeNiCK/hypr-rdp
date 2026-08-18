@@ -171,6 +171,26 @@ impl VaDisplay {
         Ok(formats)
     }
 
+    /// Query a single configuration attribute for (profile, entrypoint).
+    /// Returns the raw attribute value (`VA_ATTRIB_NOT_SUPPORTED` when the
+    /// driver does not know the attribute).
+    pub(crate) fn get_config_attrib(
+        &self,
+        profile: VAProfile,
+        entrypoint: VAEntrypoint,
+        attrib_type: u32,
+    ) -> Result<u32> {
+        let mut attrib = VAConfigAttrib {
+            type_: attrib_type,
+            value: 0,
+        };
+        va_check(
+            unsafe { va::vaGetConfigAttributes(self.raw, profile, entrypoint, &mut attrib, 1) },
+            "vaGetConfigAttributes",
+        )?;
+        Ok(attrib.value)
+    }
+
     pub(crate) fn create_config(
         self: &Rc<Self>,
         profile: VAProfile,
@@ -384,6 +404,29 @@ impl VaContext {
                     mem::size_of::<T>() as u32,
                     1,
                     &mut value as *mut _ as *mut c_void,
+                    &mut id,
+                )
+            },
+            op,
+        )?;
+        Ok(VaBuffer {
+            display: Rc::clone(&self.display),
+            id,
+        })
+    }
+
+    /// Create a buffer from raw bytes (e.g. packed header data).
+    pub(crate) fn create_data_buffer(&self, type_: u32, data: &[u8], op: &str) -> Result<VaBuffer> {
+        let mut id = 0 as VABufferID;
+        va_check(
+            unsafe {
+                va::vaCreateBuffer(
+                    self.display.raw,
+                    self.id,
+                    type_,
+                    data.len() as u32,
+                    1,
+                    data.as_ptr() as *mut c_void,
                     &mut id,
                 )
             },

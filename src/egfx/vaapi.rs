@@ -29,6 +29,78 @@ const SLICE_TYPE_P: u8 = 0;
 
 const IDR_INTERVAL: u32 = 30;
 const H264_DEFAULT_PIC_INIT_QP: u8 = 26;
+const VAAPI_DESIRED_PACKED_HEADERS: u32 =
+    va::VA_ENC_PACKED_HEADER_SEQUENCE | va::VA_ENC_PACKED_HEADER_SLICE;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PackedHeaderPlan {
+    sequence: bool,
+    slice: bool,
+}
+
+fn packed_header_config_attrib(supported: u32) -> Option<VAConfigAttrib> {
+    if supported == va::VA_ATTRIB_NOT_SUPPORTED {
+        return None;
+    }
+
+    let selected = supported & VAAPI_DESIRED_PACKED_HEADERS;
+    (selected != va::VA_ENC_PACKED_HEADER_NONE).then_some(VAConfigAttrib {
+        type_: va::VAConfigAttribType_VAConfigAttribEncPackedHeaders,
+        value: selected,
+    })
+}
+
+fn packed_header_plan(selected: u32, is_idr: bool) -> PackedHeaderPlan {
+    PackedHeaderPlan {
+        sequence: is_idr && (selected & va::VA_ENC_PACKED_HEADER_SEQUENCE) != 0,
+        slice: (selected & va::VA_ENC_PACKED_HEADER_SLICE) != 0,
+    }
+}
+
+fn h264_idr_pic_id(frame_num: u16) -> u16 {
+    frame_num
+}
+
+/// Build a packed slice header matching the SPS/PPS and VA slice parameters:
+/// 8-bit frame number/POC, CABAC, one reference, and deblocking enabled.
+/// The returned bit length excludes byte-padding after the final syntax bit.
+fn generate_packed_slice_header(is_idr: bool, frame_num: u16, poc: i32) -> (Vec<u8>, u32) {
+    let mut data = Vec::with_capacity(16);
+    data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
+
+    let mut bits = BitWriter::new();
+    bits.write_bits(0, 1); // forbidden_zero_bit
+    bits.write_bits(3, 2); // nal_ref_idc: reference picture
+    bits.write_bits(if is_idr { 5 } else { 1 }, 5); // nal_unit_type
+
+    bits.write_ue(0); // first_mb_in_slice
+    bits.write_ue(if is_idr { 7 } else { 5 }); // slice_type: all-I / all-P
+    bits.write_ue(0); // pic_parameter_set_id
+    bits.write_bits(u32::from(frame_num) & 0xff, 8); // frame_num
+    if is_idr {
+        bits.write_ue(u32::from(h264_idr_pic_id(frame_num)));
+    }
+    bits.write_bits((poc as u32) & 0xff, 8); // pic_order_cnt_lsb
+    if !is_idr {
+        bits.write_bits(0, 1); // num_ref_idx_active_override_flag
+        bits.write_bits(0, 1); // ref_pic_list_modification_flag_l0
+    }
+    if is_idr {
+        bits.write_bits(0, 1); // no_output_of_prior_pics_flag
+        bits.write_bits(0, 1); // long_term_reference_flag
+    } else {
+        bits.write_bits(0, 1); // adaptive_ref_pic_marking_mode_flag
+        bits.write_ue(0); // cabac_init_idc
+    }
+    bits.write_se(0); // slice_qp_delta
+    bits.write_ue(0); // disable_deblocking_filter_idc
+    bits.write_se(0); // slice_alpha_c0_offset_div2
+    bits.write_se(0); // slice_beta_offset_div2
+
+    let bit_length = 32 + bits.bit_len();
+    data.extend_from_slice(&bits.finish_with_emulation_prevention());
+    (data, bit_length)
+}
 
 /// Scan /dev/dri/renderD* for a VA-API device that supports H.264 encoding.
 fn find_vaapi_device() -> Result<PathBuf> {
@@ -284,6 +356,7 @@ pub struct VaapiEncoder {
     references: VaapiReferenceState,
     reference_mode: VaapiReferenceMode,
     cached_sps_pps: Option<Vec<u8>>,
+    packed_headers: u32,
     width: u32,
     height: u32,
     bitrate: u32,
@@ -366,8 +439,18 @@ impl VaapiEncoder {
             bail!("H.264 encode entrypoint not supported");
         }
 
+        let supported_packed_headers = display
+            .get_config_attrib(
+                h264_profile,
+                sys::VA_ENTRYPOINT_ENC_SLICE,
+                va::VAConfigAttribType_VAConfigAttribEncPackedHeaders,
+            )
+            .context("Failed to query VA-API packed-header support")?;
+        let packed_header_attrib = packed_header_config_attrib(supported_packed_headers);
+        let packed_headers = packed_header_attrib.map_or(0, |attrib| attrib.value);
+
         let rc_policy = vaapi_rate_control_policy(bitrate, quality, rate_control);
-        let config_attribs = [
+        let mut config_attribs = vec![
             VAConfigAttrib {
                 type_: sys::VA_CONFIG_ATTRIB_RT_FORMAT,
                 value: VA_RT_FORMAT_YUV420,
@@ -377,6 +460,9 @@ impl VaapiEncoder {
                 value: rc_policy.config_mode,
             },
         ];
+        if let Some(attrib) = packed_header_attrib {
+            config_attribs.push(attrib);
+        }
         let config = display
             .create_config(h264_profile, sys::VA_ENTRYPOINT_ENC_SLICE, &config_attribs)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
@@ -431,6 +517,7 @@ impl VaapiEncoder {
             profile = ?h264_profile,
             rate_control = ?rate_control,
             quality = quality,
+            packed_headers,
             "VA-API encoder ready: {}x{}, {}kbps, IDR every {} frames",
             width, height, bitrate / 1000, IDR_INTERVAL,
         );
@@ -449,6 +536,7 @@ impl VaapiEncoder {
             references: VaapiReferenceState::default(),
             reference_mode,
             cached_sps_pps: None,
+            packed_headers,
             width,
             height,
             bitrate,
@@ -465,6 +553,71 @@ impl VaapiEncoder {
     /// Force the next encoded frame to be an IDR (used after error recovery).
     pub fn force_idr(&mut self) {
         self.force_idr = true;
+    }
+
+    /// Create the packed SPS/PPS pair selected during config creation.
+    fn create_packed_sequence_buffers(&mut self) -> Result<[VaBuffer; 2]> {
+        let sps_pps = self.generate_sps_pps();
+        let param = va::VAEncPackedHeaderParameterBuffer {
+            type_: va::VAEncPackedHeaderType_VAEncPackedHeaderSequence,
+            bit_length: (sps_pps.len() * 8) as u32,
+            has_emulation_bytes: 1,
+            va_reserved: [0; 4],
+        };
+        let param_buffer = self
+            .context
+            .create_buffer(
+                va::VABufferType_VAEncPackedHeaderParameterBufferType,
+                param,
+                "vaCreateBuffer (packed sequence param)",
+            )
+            .context("Failed to create packed sequence param buffer")?;
+        let data_buffer = self
+            .context
+            .create_data_buffer(
+                va::VABufferType_VAEncPackedHeaderDataBufferType,
+                &sps_pps,
+                "vaCreateBuffer (packed sequence data)",
+            )
+            .context("Failed to create packed sequence data buffer")?;
+        self.cached_sps_pps = Some(sps_pps);
+        Ok([param_buffer, data_buffer])
+    }
+
+    /// Packed slice header for drivers that require it. Mesa radeonsi parses
+    /// this header for nal_ref_idc/nal_unit_type and the slice fields the
+    /// firmware writes into the final slice NAL; without it the emitted
+    /// slice carries a zeroed NAL header byte and never decodes (#21).
+    fn create_packed_slice_buffers(
+        &mut self,
+        is_idr: bool,
+        frame_num: u16,
+        poc: i32,
+    ) -> Result<[VaBuffer; 2]> {
+        let (header, bit_length) = generate_packed_slice_header(is_idr, frame_num, poc);
+        let param = va::VAEncPackedHeaderParameterBuffer {
+            type_: va::VAEncPackedHeaderType_VAEncPackedHeaderSlice,
+            bit_length,
+            has_emulation_bytes: 1,
+            va_reserved: [0; 4],
+        };
+        let param_buffer = self
+            .context
+            .create_buffer(
+                va::VABufferType_VAEncPackedHeaderParameterBufferType,
+                param,
+                "vaCreateBuffer (packed slice param)",
+            )
+            .context("Failed to create packed slice param buffer")?;
+        let data_buffer = self
+            .context
+            .create_data_buffer(
+                va::VABufferType_VAEncPackedHeaderDataBufferType,
+                &header,
+                "vaCreateBuffer (packed slice data)",
+            )
+            .context("Failed to create packed slice data buffer")?;
+        Ok([param_buffer, data_buffer])
     }
 
     fn is_idr_frame(&self) -> bool {
@@ -527,6 +680,7 @@ impl VaapiEncoder {
         let frame_num = (self.frame_count % 256) as u16;
         // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
         let poc = ((self.frame_count * 2) % 256) as i32;
+        let packed_header_plan = packed_header_plan(self.packed_headers, is_idr);
 
         let mut picture_buffers = Vec::new();
 
@@ -545,6 +699,9 @@ impl VaapiEncoder {
             picture_buffers.push(seq_buffer);
 
             picture_buffers.extend(self.create_rate_control_buffers()?);
+            if packed_header_plan.sequence {
+                picture_buffers.extend(self.create_packed_sequence_buffers()?);
+            }
         }
 
         let pic_param = self.build_picture_params(
@@ -575,6 +732,9 @@ impl VaapiEncoder {
             )
             .context("Failed to create slice buffer")?;
         picture_buffers.push(slice_buffer);
+        if packed_header_plan.slice {
+            picture_buffers.extend(self.create_packed_slice_buffers(is_idr, frame_num, poc)?);
+        }
 
         self.context
             .render_picture(self.input_surfaces[input_idx].id(), &picture_buffers)?;
@@ -693,6 +853,7 @@ impl VaapiEncoder {
         let frame_num = (self.frame_count % 256) as u16;
         // max_pic_order_cnt_lsb = 2^(log2_max_pic_order_cnt_lsb_minus4+4) = 256
         let poc = ((self.frame_count * 2) % 256) as i32;
+        let packed_header_plan = packed_header_plan(self.packed_headers, is_idr);
 
         let mut picture_buffers = Vec::new();
 
@@ -710,6 +871,9 @@ impl VaapiEncoder {
             picture_buffers.push(seq_buffer);
 
             picture_buffers.extend(self.create_rate_control_buffers()?);
+            if packed_header_plan.sequence {
+                picture_buffers.extend(self.create_packed_sequence_buffers()?);
+            }
         }
 
         let pic_param = self.build_picture_params(
@@ -740,6 +904,9 @@ impl VaapiEncoder {
             )
             .context("Failed to create slice buffer")?;
         picture_buffers.push(slice_buffer);
+        if packed_header_plan.slice {
+            picture_buffers.extend(self.create_packed_slice_buffers(is_idr, frame_num, poc)?);
+        }
 
         self.context
             .render_picture(dmabuf_surface_id, &picture_buffers)
@@ -1009,7 +1176,7 @@ impl VaapiEncoder {
         params.macroblock_info = VA_INVALID_ID;
         params.slice_type = slice_type;
         params.pic_parameter_set_id = 0;
-        params.idr_pic_id = frame_num;
+        params.idr_pic_id = h264_idr_pic_id(frame_num);
         params.pic_order_cnt_lsb = poc as u16;
         params.delta_pic_order_cnt_bottom = 0;
         params.delta_pic_order_cnt = [0, 0];
@@ -1323,6 +1490,10 @@ impl BitWriter {
         self.write_ue(mapped);
     }
 
+    fn bit_len(&self) -> u32 {
+        (self.data.len() as u32 * 8) + u32::from(self.bits_in_byte)
+    }
+
     fn write_rbsp_trailing_bits(&mut self) {
         self.write_bits(1, 1); // rbsp_stop_one_bit
                                // Pad to byte boundary with zeros
@@ -1362,6 +1533,223 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestBitReader {
+        data: Vec<u8>,
+        bit_pos: usize,
+    }
+
+    impl TestBitReader {
+        fn from_escaped(data: &[u8]) -> Self {
+            let mut rbsp = Vec::with_capacity(data.len());
+            let mut zero_count = 0;
+            for &byte in data {
+                if zero_count >= 2 && byte == 0x03 {
+                    zero_count = 0;
+                    continue;
+                }
+                rbsp.push(byte);
+                if byte == 0 {
+                    zero_count += 1;
+                } else {
+                    zero_count = 0;
+                }
+            }
+            Self {
+                data: rbsp,
+                bit_pos: 0,
+            }
+        }
+
+        fn read_bits(&mut self, count: usize) -> u32 {
+            let mut value = 0;
+            for _ in 0..count {
+                let byte = self.data[self.bit_pos / 8];
+                let bit = (byte >> (7 - self.bit_pos % 8)) & 1;
+                value = (value << 1) | u32::from(bit);
+                self.bit_pos += 1;
+            }
+            value
+        }
+
+        fn read_ue(&mut self) -> u32 {
+            let mut leading_zeros = 0;
+            while self.read_bits(1) == 0 {
+                leading_zeros += 1;
+            }
+            if leading_zeros == 0 {
+                return 0;
+            }
+            (1u32 << leading_zeros) - 1 + self.read_bits(leading_zeros)
+        }
+
+        fn read_se(&mut self) -> i32 {
+            let code_num = self.read_ue();
+            if code_num.is_multiple_of(2) {
+                -(code_num as i32 / 2)
+            } else {
+                (code_num as i32 + 1) / 2
+            }
+        }
+    }
+
+    #[test]
+    fn vaapi_packed_header_config_selects_only_supported_headers_we_supply() {
+        assert!(packed_header_config_attrib(va::VA_ATTRIB_NOT_SUPPORTED).is_none());
+        assert!(packed_header_config_attrib(va::VA_ENC_PACKED_HEADER_NONE).is_none());
+
+        let all_driver_headers = va::VA_ENC_PACKED_HEADER_SEQUENCE
+            | va::VA_ENC_PACKED_HEADER_PICTURE
+            | va::VA_ENC_PACKED_HEADER_SLICE
+            | va::VA_ENC_PACKED_HEADER_MISC;
+        let attrib = packed_header_config_attrib(all_driver_headers).unwrap();
+        assert_eq!(
+            attrib.type_,
+            va::VAConfigAttribType_VAConfigAttribEncPackedHeaders
+        );
+        assert_eq!(attrib.value, VAAPI_DESIRED_PACKED_HEADERS);
+
+        let sequence_only = packed_header_config_attrib(va::VA_ENC_PACKED_HEADER_SEQUENCE).unwrap();
+        assert_eq!(sequence_only.value, va::VA_ENC_PACKED_HEADER_SEQUENCE);
+
+        let all_known_flags = va::VA_ENC_PACKED_HEADER_RAW_DATA
+            | va::VA_ENC_PACKED_HEADER_MISC
+            | va::VA_ENC_PACKED_HEADER_SLICE
+            | va::VA_ENC_PACKED_HEADER_PICTURE
+            | va::VA_ENC_PACKED_HEADER_SEQUENCE;
+        for supported in 0..=all_known_flags {
+            let expected = supported & VAAPI_DESIRED_PACKED_HEADERS;
+            assert_eq!(
+                packed_header_config_attrib(supported).map(|attrib| attrib.value),
+                (expected != 0).then_some(expected),
+                "supported packed-header mask {supported:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_packed_header_plan_matches_idr_and_delta_submissions() {
+        assert_eq!(
+            packed_header_plan(VAAPI_DESIRED_PACKED_HEADERS, true),
+            PackedHeaderPlan {
+                sequence: true,
+                slice: true,
+            }
+        );
+        assert_eq!(
+            packed_header_plan(VAAPI_DESIRED_PACKED_HEADERS, false),
+            PackedHeaderPlan {
+                sequence: false,
+                slice: true,
+            }
+        );
+        assert_eq!(
+            packed_header_plan(va::VA_ENC_PACKED_HEADER_NONE, true),
+            PackedHeaderPlan {
+                sequence: false,
+                slice: false,
+            }
+        );
+    }
+
+    #[test]
+    fn vaapi_packed_idr_slice_header_matches_va_slice_fields() {
+        let frame_num = 30;
+        let poc = 60;
+        let (header, bit_length) = generate_packed_slice_header(true, frame_num, poc);
+        assert_eq!(&header[..5], &[0, 0, 0, 1, 0x65]);
+
+        let mut bits = TestBitReader::from_escaped(&header[5..]);
+        assert_eq!(bits.read_ue(), 0); // first_mb_in_slice
+        assert_eq!(bits.read_ue() % 5, u32::from(SLICE_TYPE_I));
+        assert_eq!(bits.read_ue(), 0); // pic_parameter_set_id
+        assert_eq!(bits.read_bits(8), u32::from(frame_num));
+        assert_eq!(bits.read_ue(), u32::from(h264_idr_pic_id(frame_num)));
+        assert_eq!(bits.read_bits(8), poc as u32);
+        assert_eq!(bits.read_bits(1), 0); // no_output_of_prior_pics_flag
+        assert_eq!(bits.read_bits(1), 0); // long_term_reference_flag
+        assert_eq!(bits.read_se(), 0); // slice_qp_delta
+        assert_eq!(bits.read_ue(), 0); // disable_deblocking_filter_idc
+        assert_eq!(bits.read_se(), 0);
+        assert_eq!(bits.read_se(), 0);
+        assert_eq!(40 + bits.bit_pos as u32, bit_length);
+    }
+
+    #[test]
+    fn vaapi_packed_p_slice_header_matches_va_slice_fields() {
+        let frame_num = 31;
+        let poc = 62;
+        let (header, bit_length) = generate_packed_slice_header(false, frame_num, poc);
+        assert_eq!(&header[..5], &[0, 0, 0, 1, 0x61]);
+
+        let mut bits = TestBitReader::from_escaped(&header[5..]);
+        assert_eq!(bits.read_ue(), 0); // first_mb_in_slice
+        assert_eq!(bits.read_ue() % 5, u32::from(SLICE_TYPE_P));
+        assert_eq!(bits.read_ue(), 0); // pic_parameter_set_id
+        assert_eq!(bits.read_bits(8), u32::from(frame_num));
+        assert_eq!(bits.read_bits(8), poc as u32);
+        assert_eq!(bits.read_bits(1), 0); // num_ref_idx_active_override_flag
+        assert_eq!(bits.read_bits(1), 0); // ref_pic_list_modification_flag_l0
+        assert_eq!(bits.read_bits(1), 0); // adaptive_ref_pic_marking_mode_flag
+        assert_eq!(bits.read_ue(), 0); // cabac_init_idc
+        assert_eq!(bits.read_se(), 0); // slice_qp_delta
+        assert_eq!(bits.read_ue(), 0); // disable_deblocking_filter_idc
+        assert_eq!(bits.read_se(), 0);
+        assert_eq!(bits.read_se(), 0);
+        assert_eq!(40 + bits.bit_pos as u32, bit_length);
+    }
+
+    #[test]
+    fn vaapi_packed_slice_headers_preserve_frame_and_poc_boundaries() {
+        for is_idr in [false, true] {
+            for frame_num in [0u16, 1, 127, 255] {
+                for poc in [0i32, 2, 126, 254] {
+                    let (header, _) = generate_packed_slice_header(is_idr, frame_num, poc);
+                    let mut bits = TestBitReader::from_escaped(&header[5..]);
+                    assert_eq!(bits.read_ue(), 0);
+                    assert_eq!(
+                        bits.read_ue() % 5,
+                        u32::from(if is_idr { SLICE_TYPE_I } else { SLICE_TYPE_P })
+                    );
+                    assert_eq!(bits.read_ue(), 0);
+                    assert_eq!(bits.read_bits(8), u32::from(frame_num));
+                    if is_idr {
+                        assert_eq!(bits.read_ue(), u32::from(h264_idr_pic_id(frame_num)));
+                    }
+                    assert_eq!(bits.read_bits(8), poc as u32);
+                }
+            }
+        }
+    }
+
+    /// Offline probe for the white-screen report (#21): encode solid red
+    /// frames and dump the Annex-B stream for external analysis
+    /// (`ffmpeg -i <file> …`). Requires VA-API hardware.
+    #[test]
+    #[ignore = "requires VA-API hardware; writes a stream for offline analysis"]
+    fn vaapi_encode_probe_writes_stream_to_disk() {
+        let (width, height) = (704u32, 396u32);
+        let mut encoder = VaapiEncoder::new(width, height, 5_000_000, 30, 23, H264RateControl::Vbr)
+            .expect("VA-API encoder initializes");
+
+        let stride = (width * 4) as usize;
+        let mut frame = vec![0u8; stride * height as usize];
+        for px in frame.chunks_exact_mut(4) {
+            px[0] = 0; // B
+            px[1] = 0; // G
+            px[2] = 255; // R
+            px[3] = 255;
+        }
+
+        let mut stream = Vec::new();
+        for _ in 0..30 {
+            stream.extend_from_slice(&encoder.encode(&frame, stride).expect("frame encodes"));
+        }
+
+        let path = std::env::temp_dir().join("hypr-rdp-vaapi-probe.h264");
+        std::fs::write(&path, &stream).expect("probe stream written");
+        eprintln!("probe: {} bytes -> {}", stream.len(), path.display());
+    }
 
     fn dpb(surface_id: u32, frame_num: u16, poc: i32) -> DpbEntry {
         DpbEntry {
