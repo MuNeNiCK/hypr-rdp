@@ -27,7 +27,7 @@ ironrdp-displaycontrol = { git = "https://github.com/MuNeNICK/IronRDP.git", rev 
 ironrdp-graphics = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "541362ccffd2bc9f40e77f53e678f39ada84a4bf" }
 
 # H.264 encoding (FFmpeg/libavcodec software encoder)
-ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec", "format"] }
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format"] }
 yuv = "0.8.14"
 
 # Async runtime
