@@ -12,7 +12,7 @@ use ironrdp_egfx::pdu::{
     Avc420BitmapStream, Avc420Region, Avc444BitmapStream, Codec1Type, Encoding, GfxPdu,
     PixelFormat, QuantQuality, QueueDepth, WireToSurface1Pdu,
 };
-use ironrdp_pdu::geometry::InclusiveRectangle;
+use ironrdp_pdu::geometry::ExclusiveRectangle;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -244,7 +244,7 @@ fn avc420_rdpegfx_queue_emits_logical_frame_wire_shape() {
     assert_eq!(wire.pixel_format, PixelFormat::XRgb);
     assert_eq!(
         wire.destination_rectangle,
-        InclusiveRectangle {
+        ExclusiveRectangle {
             left: 4,
             top: 6,
             right: 20,
@@ -655,7 +655,7 @@ fn avc444v2_rdpegfx_queue_emits_logical_frame_wire_shape() {
 
 #[test]
 fn avc444_stream_info_encodes_lc_and_stream1_size() {
-    let rectangle = InclusiveRectangle {
+    let rectangle = ExclusiveRectangle {
         left: 0,
         top: 0,
         right: 15,
@@ -695,7 +695,7 @@ fn avc444_stream_info_encodes_lc_and_stream1_size() {
 
 #[test]
 fn avc444_luma_only_decodes_stream1_without_stream2() {
-    let rectangle = InclusiveRectangle {
+    let rectangle = ExclusiveRectangle {
         left: 2,
         top: 4,
         right: 18,
@@ -729,7 +729,7 @@ fn avc444_luma_only_decodes_stream1_without_stream2() {
 
 #[test]
 fn avc444_chroma_only_decodes_stream1_without_stream2() {
-    let rectangle = InclusiveRectangle {
+    let rectangle = ExclusiveRectangle {
         left: 4,
         top: 2,
         right: 11,
@@ -763,7 +763,7 @@ fn avc444_chroma_only_decodes_stream1_without_stream2() {
 
 #[test]
 fn wire_to_surface1_roundtrips_avc444v2_bitmap_payload() {
-    let rectangle = InclusiveRectangle {
+    let rectangle = ExclusiveRectangle {
         left: 0,
         top: 0,
         right: 32,
@@ -787,11 +787,17 @@ fn wire_to_surface1_roundtrips_avc444v2_bitmap_payload() {
             data: &[0x11, 0x22],
         }),
     };
+    let destination_rectangle = ExclusiveRectangle {
+        left: rectangle.left,
+        top: rectangle.top,
+        right: rectangle.right,
+        bottom: rectangle.bottom,
+    };
     let pdu = WireToSurface1Pdu {
         surface_id: 7,
         codec_id: Codec1Type::Avc444v2,
         pixel_format: PixelFormat::ARgb,
-        destination_rectangle: rectangle.clone(),
+        destination_rectangle: destination_rectangle.clone(),
         bitmap_data: encode_vec(&avc444).expect("AVC444 stream encodes"),
     };
 
@@ -804,7 +810,7 @@ fn wire_to_surface1_roundtrips_avc444v2_bitmap_payload() {
     assert_eq!(decoded.surface_id, 7);
     assert_eq!(decoded.codec_id, Codec1Type::Avc444v2);
     assert_eq!(decoded.pixel_format, PixelFormat::ARgb);
-    assert_eq!(decoded.destination_rectangle, rectangle.clone());
+    assert_eq!(decoded.destination_rectangle, destination_rectangle);
     assert_eq!(bitmap.encoding, Encoding::LUMA_AND_CHROMA);
     assert_eq!(bitmap.stream1.rectangles, vec![rectangle.clone()]);
     assert_eq!(bitmap.stream1.quant_qual_vals, vec![quant.clone()]);
@@ -1070,11 +1076,12 @@ fn new_gfx_server_requires_fresh_capabilities_and_surface_setup() {
     assert!(drain_gfx_pdus(&mut event_rx).is_empty());
 
     new_bridge.start(TEST_CHANNEL_ID).expect("channel starts");
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
-        },
-    ]));
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V8_1 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+        ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
     let _ = new_bridge
         .process(TEST_CHANNEL_ID, &caps)
@@ -1113,11 +1120,12 @@ fn repeated_compatible_capabilities_keep_surface_generation() {
         .start(TEST_CHANNEL_ID)
         .expect("channel starts");
 
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V10_7 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
-        },
-    ]));
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+            },
+        ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
 
     let _ = session
@@ -1145,14 +1153,14 @@ fn changed_avc_capabilities_bump_generation_for_surface_reinit() {
         .expect("channel starts");
 
     let avc_caps =
-        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
             ironrdp_egfx::pdu::CapabilitySet::V10_7 {
                 flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
             },
         ]));
     let avc_caps = encode_vec(&avc_caps).expect("AVC capabilities encode");
     let no_avc_caps =
-        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
             ironrdp_egfx::pdu::CapabilitySet::V8 {
                 flags: ironrdp_egfx::pdu::CapabilitiesV8Flags::empty(),
             },
@@ -1181,14 +1189,15 @@ fn auto_policy_uses_v10_avc444_when_v81_lacks_avc420_flag() {
         .start(TEST_CHANNEL_ID)
         .expect("channel starts");
 
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::empty(),
-        },
-        ironrdp_egfx::pdu::CapabilitySet::V10 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV10Flags::empty(),
-        },
-    ]));
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V8_1 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::empty(),
+            },
+            ironrdp_egfx::pdu::CapabilitySet::V10 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV10Flags::empty(),
+            },
+        ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
 
     let _ = session

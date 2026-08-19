@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use ironrdp_dvc::DvcMessage;
-use ironrdp_egfx::pdu::{Avc420Region, Codec1Type, Encoding};
+use ironrdp_egfx::pdu::{Avc420Region, Encoding};
 use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
@@ -519,8 +519,7 @@ impl EgfxShared {
     ) -> Option<QueuedRdpegfxFrame> {
         Self::queue_rdpegfx_frame(handle, "avc444_rdpegfx_frame", |server| {
             server
-                .send_avc444_frame_with_encoding(
-                    Codec1Type::Avc444v2,
+                .send_avc444v2_frame(
                     surface_id,
                     encoding,
                     stream1_data,
