@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.1.5] - 2026-08-19
+
+### Fixed
+
+- Fixed PipeWire initialization across repeated RDP sessions so later sessions can create the redirect sink and capture streams.
+- Fixed RDPSND Wave2 timestamps to use boot-time milliseconds instead of advancing by audio frames.
+- Fixed the compositor keyboard layout policy so startup state and later Hyprland layout switches converge without being reverted by modifier updates.
+
 ## [0.1.4] - 2026-08-18
 
 ### Added
@@ -66,6 +74,7 @@
 
 - Initial public release.
 
+[0.1.5]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.1...v0.1.2
