@@ -725,10 +725,12 @@ impl RdpServerDisplay for HyprDisplay {
         inner.update_tx = tx.clone();
 
         let pending_initial_resize = inner.pending_initial_resize.take();
+        let capture_dead = Arc::new(tokio::sync::Notify::new());
 
         inner.stop_flag = Arc::new(AtomicBool::new(false));
         let (capture_info, capture_handle) = wayland::start_capture(
             tx,
+            Arc::clone(&capture_dead),
             inner.capture_mode,
             inner.egfx_shared.clone(),
             Arc::clone(&inner.output_layout),
@@ -755,24 +757,76 @@ impl RdpServerDisplay for HyprDisplay {
             inner.resolution = (capture_info.width, capture_info.height);
         }
 
-        Ok(Box::new(HyprDisplayUpdates { rx }))
+        Ok(Box::new(HyprDisplayUpdates { rx, capture_dead }))
     }
 }
 
 struct HyprDisplayUpdates {
     rx: mpsc::Receiver<DisplayUpdate>,
+    /// Signaled when the capture thread exits without a stop request. The
+    /// display half keeps a live sender for resize delivery, so the update
+    /// channel cannot close by itself; without this signal a dead capture
+    /// freezes the session instead of disconnecting it.
+    capture_dead: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait]
 impl RdpServerDisplayUpdates for HyprDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
-        Ok(self.rx.recv().await)
+        tokio::select! {
+            biased;
+            update = self.rx.recv() => Ok(update),
+            _ = self.capture_dead.notified() => Ok(None),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn next_update_delivers_buffered_updates_before_the_death_signal() {
+        let (tx, rx) = mpsc::channel(4);
+        let capture_dead = Arc::new(tokio::sync::Notify::new());
+        let mut updates = HyprDisplayUpdates {
+            rx,
+            capture_dead: Arc::clone(&capture_dead),
+        };
+
+        tx.send(DisplayUpdate::Resize(DesktopSize {
+            width: 800,
+            height: 600,
+        }))
+        .await
+        .unwrap();
+        capture_dead.notify_one();
+
+        assert!(matches!(
+            updates.next_update().await.unwrap(),
+            Some(DisplayUpdate::Resize(_))
+        ));
+        // With the queue drained, the stored death permit disconnects.
+        assert!(updates.next_update().await.unwrap().is_none());
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn next_update_disconnects_when_capture_dies_with_a_live_sender() {
+        // The display half keeps a sender clone for resizes, so the channel
+        // alone can never close; the death signal must end the session.
+        let (tx, rx) = mpsc::channel::<DisplayUpdate>(4);
+        let capture_dead = Arc::new(tokio::sync::Notify::new());
+        let mut updates = HyprDisplayUpdates {
+            rx,
+            capture_dead: Arc::clone(&capture_dead),
+        };
+
+        capture_dead.notify_one();
+
+        assert!(updates.next_update().await.unwrap().is_none());
+        drop(tx);
+    }
 
     #[test]
     fn h264_software_limit_keeps_supported_landscape_size() {
