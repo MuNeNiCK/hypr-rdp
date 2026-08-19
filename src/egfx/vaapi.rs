@@ -71,26 +71,54 @@ fn h264_idr_pic_id(idr_sequence: u64) -> u16 {
 /// non-conformant levels for large frames: 3840x2160 is 32400 macroblocks,
 /// past level 5.0's MaxFS of 22080 even at low frame rates. Macroblock
 /// counts round up for non-multiple-of-16 sizes.
-fn h264_level(width: u32, height: u32, fps: u32) -> u8 {
-    const LEVELS: &[(u8, u32, u32)] = &[
-        // (level_idc, MaxMBPS, MaxFS)
-        (30, 40_500, 1_620),
-        (31, 108_000, 3_600),
-        (32, 216_000, 5_120),
-        (40, 245_760, 8_192),
-        (42, 522_240, 8_704),
-        (50, 589_824, 22_080),
-        (51, 983_040, 36_864),
-        (52, 2_073_600, 36_864),
+fn h264_level(
+    profile: VAProfile,
+    bitrate: u32,
+    width: u32,
+    height: u32,
+    fps: u32,
+    max_dec_frame_buffering: u32,
+) -> Option<u8> {
+    // level_idc, MaxMBPS, MaxFS, MaxDpbMbs, MaxBR (Table A-1 units).
+    const LEVELS: &[(u8, u32, u32, u32, u32)] = &[
+        (30, 40_500, 1_620, 8_100, 10_000),
+        (31, 108_000, 3_600, 18_000, 14_000),
+        (32, 216_000, 5_120, 20_480, 20_000),
+        (40, 245_760, 8_192, 32_768, 20_000),
+        (41, 245_760, 8_192, 32_768, 50_000),
+        (42, 522_240, 8_704, 34_816, 50_000),
+        (50, 589_824, 22_080, 110_400, 135_000),
+        (51, 983_040, 36_864, 184_320, 240_000),
+        (52, 2_073_600, 36_864, 184_320, 240_000),
     ];
 
-    let frame_mbs = width.div_ceil(16) * height.div_ceil(16);
-    let mbs_per_sec = frame_mbs.saturating_mul(fps);
+    let width_mbs = u64::from(width.div_ceil(16));
+    let height_mbs = u64::from(height.div_ceil(16));
+    let frame_mbs = width_mbs * height_mbs;
+    if frame_mbs == 0 || fps == 0 {
+        return None;
+    }
+    let mbs_per_sec = frame_mbs * u64::from(fps);
+    // Annex A Table A-2: High profile permits the larger NAL bitrate factor.
+    let bitrate_factor = if profile == sys::VA_PROFILE_H264_HIGH {
+        1_500u64
+    } else {
+        1_200u64
+    };
+
     LEVELS
         .iter()
-        .find(|(_, max_mbps, max_fs)| mbs_per_sec <= *max_mbps && frame_mbs <= *max_fs)
-        .map(|(level, _, _)| *level)
-        .unwrap_or(52)
+        .find(|(_, max_mbps, max_fs, max_dpb_mbs, max_br)| {
+            let max_fs = u64::from(*max_fs);
+            let max_dpb_frames = (u64::from(*max_dpb_mbs) / frame_mbs).min(16);
+            mbs_per_sec <= u64::from(*max_mbps)
+                && frame_mbs <= max_fs
+                && width_mbs * width_mbs <= 8 * max_fs
+                && height_mbs * height_mbs <= 8 * max_fs
+                && u64::from(max_dec_frame_buffering) <= max_dpb_frames
+                && u64::from(bitrate) <= u64::from(*max_br) * bitrate_factor
+        })
+        .map(|(level, ..)| *level)
 }
 
 /// frame_num and pic_order_cnt_lsb for a picture, counted from the last
@@ -411,6 +439,7 @@ pub struct VaapiEncoder {
     quality: u8,
     rate_control: H264RateControl,
     fps: u32,
+    level_idc: u8,
     frame_count: u64,
     /// frame_count value at the most recent IDR; frame_num counts from it.
     idr_base: u64,
@@ -502,6 +531,24 @@ impl VaapiEncoder {
         let packed_headers = packed_header_attrib.map_or(0, |attrib| attrib.value);
 
         let rc_policy = vaapi_rate_control_policy(bitrate, quality, rate_control);
+        let level_idc = h264_level(
+            h264_profile,
+            rc_policy.bits_per_second,
+            width,
+            height,
+            fps,
+            reference_mode.max_num_ref_frames(),
+        )
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no supported H.264 level for {}x{}@{}fps, {}bps, {} references",
+                width,
+                height,
+                fps,
+                rc_policy.bits_per_second,
+                reference_mode.max_num_ref_frames()
+            )
+        })?;
         let mut config_attribs = vec![
             VAConfigAttrib {
                 type_: sys::VA_CONFIG_ATTRIB_RT_FORMAT,
@@ -595,6 +642,7 @@ impl VaapiEncoder {
             quality,
             rate_control,
             fps,
+            level_idc,
             frame_count: 0,
             idr_base: 0,
             idr_count: 0,
@@ -1084,10 +1132,6 @@ impl VaapiEncoder {
         }
     }
 
-    fn get_h264_level(&self) -> u8 {
-        h264_level(self.width, self.height, self.fps)
-    }
-
     fn build_sequence_params(
         &self,
         mb_width: u16,
@@ -1095,7 +1139,7 @@ impl VaapiEncoder {
     ) -> va::VAEncSequenceParameterBufferH264 {
         let mut params: va::VAEncSequenceParameterBufferH264 = unsafe { mem::zeroed() };
         params.seq_parameter_set_id = 0;
-        params.level_idc = self.get_h264_level();
+        params.level_idc = self.level_idc;
         params.intra_period = IDR_INTERVAL;
         params.intra_idr_period = IDR_INTERVAL;
         params.ip_period = 1;
@@ -1328,7 +1372,7 @@ impl VaapiEncoder {
 
         bs.write_bits(profile_idc, 8);
         bs.write_bits(0, 8);
-        bs.write_bits(self.get_h264_level() as u32, 8);
+        bs.write_bits(self.level_idc as u32, 8);
         bs.write_ue(0);
 
         if is_high_profile {
@@ -1706,14 +1750,32 @@ mod tests {
 
     #[test]
     fn h264_level_respects_both_throughput_and_frame_size_limits() {
-        assert_eq!(h264_level(1280, 720, 30), 31);
-        assert_eq!(h264_level(1920, 1080, 30), 40);
+        let high = sys::VA_PROFILE_H264_HIGH;
+        assert_eq!(h264_level(high, 10_000_000, 1280, 720, 30, 1), Some(31));
+        assert_eq!(h264_level(high, 10_000_000, 1920, 1080, 30, 1), Some(40));
         // 3840x2160 is 32400 macroblocks: past level 5.0's MaxFS of 22080
         // regardless of frame rate.
-        assert_eq!(h264_level(3840, 2160, 30), 51);
-        assert_eq!(h264_level(3840, 2160, 60), 52);
+        assert_eq!(h264_level(high, 10_000_000, 3840, 2160, 30, 1), Some(51));
+        assert_eq!(h264_level(high, 10_000_000, 3840, 2160, 60, 1), Some(52));
         // Non-multiple-of-16 sizes round the macroblock count up.
-        assert_eq!(h264_level(1366, 768, 30), 32);
+        assert_eq!(h264_level(high, 10_000_000, 1366, 768, 30, 1), Some(32));
+    }
+
+    #[test]
+    fn h264_level_respects_bitrate_dpb_axis_and_supported_range() {
+        let high = sys::VA_PROFILE_H264_HIGH;
+        let main = sys::VA_PROFILE_H264_MAIN;
+
+        // Level 4.0 cannot advertise this configured rate; 4.1 can.
+        assert_eq!(h264_level(high, 40_000_000, 1920, 1080, 30, 1), Some(41));
+        // Main profile has the lower Annex A-2 bitrate factor.
+        assert_eq!(h264_level(main, 25_000_000, 1920, 1080, 30, 1), Some(41));
+        // Five buffered 1080p pictures exceed level 4.x MaxDpbMbs.
+        assert_eq!(h264_level(high, 10_000_000, 1920, 1080, 30, 5), Some(50));
+        // Annex A constrains each macroblock axis as well as total MaxFS.
+        assert_eq!(h264_level(high, 0, 65_534, 2, 30, 1), None);
+        assert_eq!(h264_level(high, 10_000_000, 7680, 4320, 60, 1), None);
+        assert_eq!(h264_level(high, 0, 0, 1080, 30, 1), None);
     }
 
     #[test]
