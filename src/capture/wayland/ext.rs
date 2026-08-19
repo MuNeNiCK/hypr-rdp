@@ -10,7 +10,7 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 
 #[cfg(feature = "vaapi")]
 use super::dmabuf_capture;
-use super::state::AppState;
+use super::state::{AppState, ExtFrameFailure};
 use super::{create_shm_fd, poll_dispatch, CaptureInfo, MmapRegion, POLL_TIMEOUT_MS};
 use crate::capture::frame::{FramePacer, FrameProcessor};
 #[cfg(feature = "vaapi")]
@@ -28,6 +28,21 @@ use crate::input::SharedOutputLayout;
 enum DmaBufCaptureErrorAction {
     FallBackToShm,
     RestartCapture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtFrameFailureAction {
+    Retry,
+    RestartSession,
+    Stop,
+}
+
+fn ext_frame_failure_action(failure: ExtFrameFailure) -> ExtFrameFailureAction {
+    match failure {
+        ExtFrameFailure::Unknown => ExtFrameFailureAction::Retry,
+        ExtFrameFailure::BufferConstraints => ExtFrameFailureAction::RestartSession,
+        ExtFrameFailure::Stopped => ExtFrameFailureAction::Stop,
+    }
 }
 
 #[cfg(feature = "vaapi")]
@@ -248,6 +263,7 @@ pub(super) fn capture_loop_ext(
     let mut frame = session.create_frame(qh, ());
     state.frame_ready = false;
     state.frame_failed = false;
+    state.ext_frame_failure = None;
     state.damage_regions.clear();
     frame.attach_buffer(buffers[cap_idx]);
     frame.damage_buffer(0, 0, width as i32, height as i32);
@@ -301,8 +317,26 @@ pub(super) fn capture_loop_ext(
 
         // Save completed frame state before starting next capture
         let completed_failed = state.frame_failed;
+        let completed_failure = state.ext_frame_failure.take();
         let completed_idx = cap_idx;
         let completed_damage_regions = state.damage_regions.clone();
+
+        // A failed capture does not refresh the deferred buffer. The next
+        // request can reuse that same mmap, so drop the borrow before any new
+        // buffer is submitted to the compositor. Pending damage remains in
+        // FrameProcessor and will be applied to the next successful frame.
+        if completed_failed {
+            super::discard_deferred_after_failed_capture(true, &mut deferred);
+            match ext_frame_failure_action(completed_failure.unwrap_or(ExtFrameFailure::Unknown)) {
+                ExtFrameFailureAction::RestartSession => {
+                    return Err(super::wlr::BufferParametersChanged.into());
+                }
+                ExtFrameFailureAction::Stop => {
+                    bail!("ext-image-copy capture session stopped");
+                }
+                ExtFrameFailureAction::Retry => {}
+            }
+        }
 
         // Start NEXT capture immediately into the other buffer.
         // This ensures a capture request is always pending with the compositor,
@@ -310,6 +344,7 @@ pub(super) fn capture_loop_ext(
         cap_idx = 1 - cap_idx;
         state.frame_ready = false;
         state.frame_failed = false;
+        state.ext_frame_failure = None;
         state.damage_regions.clear();
         frame = session.create_frame(qh, ());
         frame.attach_buffer(buffers[cap_idx]);
@@ -319,16 +354,6 @@ pub(super) fn capture_loop_ext(
 
         // Process the completed frame while next capture is pending
         if completed_failed {
-            if state.buffer_width > 0
-                && (state.buffer_width != width || state.buffer_height != height)
-            {
-                // The compositor re-sent constraints; the protocol requires
-                // re-allocating buffers and retrying. Restart the session to
-                // rebuild them at the new size instead of re-attaching stale
-                // buffers at failure speed.
-                frame.destroy();
-                return Err(super::wlr::BufferParametersChanged.into());
-            }
             failed_streak += 1;
             if failed_streak >= super::CAPTURE_FAILED_FRAME_LIMIT {
                 frame.destroy();
@@ -402,6 +427,27 @@ pub(super) fn capture_loop_ext(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn ext_failure_recovery_follows_protocol_reason() {
+        assert_eq!(
+            ext_frame_failure_action(ExtFrameFailure::Unknown),
+            ExtFrameFailureAction::Retry
+        );
+        assert_eq!(
+            ext_frame_failure_action(ExtFrameFailure::BufferConstraints),
+            ExtFrameFailureAction::RestartSession
+        );
+        assert_eq!(
+            ext_frame_failure_action(ExtFrameFailure::Stopped),
+            ExtFrameFailureAction::Stop
+        );
+    }
 }
 
 #[cfg(all(test, feature = "vaapi"))]

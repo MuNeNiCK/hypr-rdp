@@ -63,6 +63,12 @@ fn replenished_restarts(restarts: u32, since_last_restart: std::time::Duration) 
     }
 }
 
+fn discard_deferred_after_failed_capture<T>(failed: bool, deferred: &mut Option<T>) {
+    if failed {
+        *deferred = None;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CaptureRestartDecision {
     Restart { restarts: u32 },
@@ -504,8 +510,9 @@ fn is_wayland_would_block(err: &wayland_client::backend::WaylandError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        capture_session_restart_decision, refresh_output_layout_for_capture, replenished_restarts,
-        wlr, CaptureRestartDecision, FramesRepeatedlyFailed, CAPTURE_RESTART_BUDGET_RESET,
+        capture_session_restart_decision, discard_deferred_after_failed_capture,
+        refresh_output_layout_for_capture, replenished_restarts, wlr, CaptureRestartDecision,
+        FramesRepeatedlyFailed, CAPTURE_RESTART_BUDGET_RESET,
     };
     use crate::input::SharedOutputLayout;
 
@@ -587,6 +594,16 @@ mod tests {
             capture_session_restart_decision(&err, true, 0),
             CaptureRestartDecision::Propagate
         );
+    }
+
+    #[test]
+    fn failed_capture_discards_deferred_buffer_before_reuse() {
+        let mut deferred = Some(7u8);
+        discard_deferred_after_failed_capture(false, &mut deferred);
+        assert_eq!(deferred, Some(7));
+
+        discard_deferred_after_failed_capture(true, &mut deferred);
+        assert_eq!(deferred, None);
     }
 
     #[test]

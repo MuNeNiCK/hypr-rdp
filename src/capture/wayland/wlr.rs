@@ -260,6 +260,11 @@ pub(super) fn capture_loop_wlr(
         let completed_damage_regions = state.damage_regions.clone();
         frame.destroy();
 
+        // The next request may reuse the mmap backing a pacer-deferred frame.
+        // Drop that borrow before submitting any buffer to the compositor;
+        // FrameProcessor retains the pending damage for the next success.
+        super::discard_deferred_after_failed_capture(completed_failed, &mut deferred);
+
         if state.should_stop() {
             break;
         }
