@@ -41,7 +41,6 @@ pub(super) fn capability_avc_support(
             let enabled = !flags.contains(CapabilitiesV107Flags::AVC_DISABLED);
             (enabled, enabled)
         }
-        CapabilitySet::Unknown(_) => (false, false),
     };
     let avc444 = match codec_policy {
         EgfxCodecPolicy::Auto | EgfxCodecPolicy::Avc444 => avc444 && !disable_avc444,
@@ -169,11 +168,12 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
         u32::MAX
     }
 
-    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32) {
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, total_frames_decoded: u32) {
         self.shared.record_frame_ack(frame_id, queue_depth);
         tracing::trace!(
             frame_id,
             queue_depth,
+            total_frames_decoded,
             in_flight = self.shared.frames_in_flight(),
             "EGFX: frame acknowledged"
         );

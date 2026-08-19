@@ -7,7 +7,7 @@ use std::thread;
 use std::time::Duration;
 
 use ironrdp_rdpsnd::pdu::AudioFormat;
-use ironrdp_rdpsnd::server::RdpsndServerHandler;
+use ironrdp_rdpsnd::server::{NegotiatedFormat, RdpsndError, RdpsndServerHandler};
 use ironrdp_server::{ServerEvent, ServerEventSender, SoundServerFactory};
 use tokio::sync::mpsc;
 
@@ -100,6 +100,17 @@ struct HyprSoundHandler {
     audio_mode: AudioMode,
 }
 
+#[derive(Debug)]
+struct AudioStartError(String);
+
+impl fmt::Display for AudioStartError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AudioStartError {}
+
 impl fmt::Debug for HyprSoundHandler {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HyprSoundHandler")
@@ -108,56 +119,24 @@ impl fmt::Debug for HyprSoundHandler {
     }
 }
 
-impl RdpsndServerHandler for HyprSoundHandler {
-    fn get_formats(&self) -> &[AudioFormat] {
-        &self.formats
-    }
-
-    fn start(&mut self, client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu) -> Option<u16> {
-        tracing::trace!(
-            client_formats = client_format.formats.len(),
-            "Audio: starting capture ({}Hz, {}ch, {}bit)",
-            SAMPLE_RATE,
-            CHANNELS,
-            BITS_PER_SAMPLE
-        );
-
-        let client_format_index = match matching_client_format_index(&self.formats, client_format) {
-            Some(idx) => idx as u16,
-            None => {
-                tracing::warn!("Audio: client does not support our PCM format, audio disabled");
-                return None;
-            }
-        };
-
+impl HyprSoundHandler {
+    fn start_capture(&mut self) -> Result<(), AudioStartError> {
         let Some(ref sender) = self.event_sender else {
-            tracing::warn!("Audio: no event sender, audio disabled");
-            return None;
+            return Err(AudioStartError("no event sender".into()));
         };
 
-        let active_routing = match self.routing_runner.start(self.audio_mode) {
-            Ok(active_routing) => active_routing,
-            Err(e) => {
-                tracing::error!("Audio: failed to configure audio routing: {:#}", e);
-                return None;
-            }
-        };
+        let active_routing = self
+            .routing_runner
+            .start(self.audio_mode)
+            .map_err(|e| AudioStartError(format!("failed to configure audio routing: {e:#}")))?;
 
         let stop_signal = Arc::new(AtomicBool::new(false));
         let (startup_tx, startup_rx) = std_mpsc::channel();
 
-        let handle =
-            match self
-                .capture_runner
-                .spawn(sender.clone(), Arc::clone(&stop_signal), startup_tx)
-            {
-                Ok(handle) => handle,
-                Err(e) => {
-                    tracing::error!("Audio: failed to spawn capture thread: {}", e);
-                    drop(active_routing);
-                    return None;
-                }
-            };
+        let handle = self
+            .capture_runner
+            .spawn(sender.clone(), Arc::clone(&stop_signal), startup_tx)
+            .map_err(|e| AudioStartError(format!("failed to spawn capture thread: {e}")))?;
 
         match startup_rx.recv_timeout(AUDIO_STARTUP_TIMEOUT) {
             Ok(Ok(())) => {
@@ -165,33 +144,56 @@ impl RdpsndServerHandler for HyprSoundHandler {
                 self.capture_thread = Some(handle);
             }
             Ok(Err(e)) => {
-                tracing::error!("Audio: PipeWire startup failed: {}", e);
                 let _ = handle.join();
-                drop(active_routing);
-                return None;
+                return Err(AudioStartError(format!("failed to start PipeWire: {e}")));
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                tracing::error!(
-                    timeout_ms = AUDIO_STARTUP_TIMEOUT.as_millis(),
-                    "Audio: timed out waiting for PipeWire startup"
-                );
                 stop_signal.store(true, Ordering::SeqCst);
                 self.stop_signal = Some(stop_signal);
                 self.capture_thread = Some(handle);
-                drop(active_routing);
-                return None;
+                return Err(AudioStartError(format!(
+                    "timed out waiting for PipeWire startup after {} ms",
+                    AUDIO_STARTUP_TIMEOUT.as_millis()
+                )));
             }
             Err(std_mpsc::RecvTimeoutError::Disconnected) => {
-                tracing::error!("Audio: capture thread exited before reporting startup");
                 let _ = handle.join();
-                drop(active_routing);
-                return None;
+                return Err(AudioStartError(
+                    "capture thread exited before reporting startup".into(),
+                ));
             }
         }
 
         self.active_routing = active_routing;
-        tracing::trace!(client_format_index, "Audio: PipeWire capture started");
-        Some(client_format_index)
+        Ok(())
+    }
+}
+
+impl RdpsndServerHandler for HyprSoundHandler {
+    fn get_formats(&self) -> &[AudioFormat] {
+        &self.formats
+    }
+
+    fn choose_format<'a>(
+        &mut self,
+        common: &'a [NegotiatedFormat],
+    ) -> Option<&'a NegotiatedFormat> {
+        common.first()
+    }
+
+    fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        tracing::trace!(
+            negotiated_format = ?format.format(),
+            "Audio: starting capture ({}Hz, {}ch, {}bit)",
+            SAMPLE_RATE,
+            CHANNELS,
+            BITS_PER_SAMPLE
+        );
+
+        self.start_capture()
+            .map_err(|e| Box::new(e) as Box<dyn RdpsndError>)?;
+        tracing::trace!("Audio: PipeWire capture started");
+        Ok(())
     }
 
     fn stop(&mut self) {
@@ -215,27 +217,12 @@ impl Drop for HyprSoundHandler {
     }
 }
 
-fn matching_client_format_index(
-    server_formats: &[AudioFormat],
-    client_format: &ironrdp_rdpsnd::pdu::ClientAudioFormatPdu,
-) -> Option<usize> {
-    let our_format = server_formats.first()?;
-    client_format.formats.iter().position(|f| {
-        f.format == our_format.format
-            && f.n_channels == our_format.n_channels
-            && f.n_samples_per_sec == our_format.n_samples_per_sec
-            && f.bits_per_sample == our_format.bits_per_sample
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use ironrdp_rdpsnd::pdu::{AudioFormatFlags, ClientAudioFormatPdu, Version, WaveFormat};
     use ironrdp_server::{ServerEvent, SoundServerFactory};
     use tokio::sync::mpsc;
 
     use super::*;
-    use crate::audio::format::BLOCK_ALIGN;
 
     struct NoopRoutingGuard;
 
@@ -355,90 +342,21 @@ mod tests {
         }
     }
 
-    fn client_formats(formats: Vec<AudioFormat>) -> ClientAudioFormatPdu {
-        ClientAudioFormatPdu {
-            version: Version::V8,
-            flags: AudioFormatFlags::ALIVE,
-            volume_left: 0xffff,
-            volume_right: 0xffff,
-            pitch: 0,
-            dgram_port: 0,
-            formats,
-        }
-    }
-
-    fn pcm_format(sample_rate: u32, channels: u16, bits_per_sample: u16) -> AudioFormat {
-        AudioFormat {
-            format: WaveFormat::PCM,
-            n_channels: channels,
-            n_samples_per_sec: sample_rate,
-            n_avg_bytes_per_sec: sample_rate * u32::from(BLOCK_ALIGN),
-            n_block_align: BLOCK_ALIGN,
-            bits_per_sample,
-            data: None,
-        }
-    }
-
     #[test]
-    fn matching_client_format_index_selects_first_exact_pcm_match() {
-        let server_formats = vec![advertised_format()];
-        let client_format = client_formats(vec![
-            pcm_format(SAMPLE_RATE, CHANNELS, 8),
-            pcm_format(SAMPLE_RATE, CHANNELS, BITS_PER_SAMPLE),
-            pcm_format(48000, CHANNELS, BITS_PER_SAMPLE),
-        ]);
-
-        assert_eq!(
-            matching_client_format_index(&server_formats, &client_format),
-            Some(1)
-        );
-    }
-
-    #[test]
-    fn matching_client_format_index_rejects_missing_or_mismatched_format() {
-        let server_formats = vec![advertised_format()];
-
-        assert_eq!(
-            matching_client_format_index(&server_formats, &client_formats(Vec::new())),
-            None
-        );
-        assert_eq!(
-            matching_client_format_index(
-                &server_formats,
-                &client_formats(vec![pcm_format(48000, CHANNELS, BITS_PER_SAMPLE)])
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn start_rejects_matching_format_when_event_sender_is_missing() {
+    fn start_capture_rejects_when_event_sender_is_missing() {
         let mut handler = handler_with_runner(None, Arc::new(PanicRunner));
-        let client_format = client_formats(vec![advertised_format()]);
 
-        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.start_capture().is_err());
         assert!(handler.stop_signal.is_none());
         assert!(handler.capture_thread.is_none());
     }
 
     #[test]
-    fn start_rejects_unsupported_client_format_before_capture_spawn() {
-        let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
-        let mut handler = handler_with_runner(Some(sender), Arc::new(PanicRunner));
-        let client_format = client_formats(vec![pcm_format(48000, CHANNELS, BITS_PER_SAMPLE)]);
-
-        assert_eq!(handler.start(&client_format), None);
-        assert!(handler.stop_signal.is_none());
-        assert!(handler.capture_thread.is_none());
-    }
-
-    #[test]
-    fn start_accepts_matching_format_after_capture_runner_reports_ready() {
+    fn start_capture_accepts_after_capture_runner_reports_ready() {
         let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
         let mut handler = handler_with_runner(Some(sender), Arc::new(ReadyRunner));
-        let client_format = client_formats(vec![advertised_format()]);
 
-        assert_eq!(handler.start(&client_format), Some(0));
+        assert!(handler.start_capture().is_ok());
         assert!(handler.stop_signal.is_some());
         assert!(handler.capture_thread.is_some());
 
@@ -448,29 +366,25 @@ mod tests {
     }
 
     #[test]
-    fn start_rejects_matching_format_when_capture_startup_fails() {
+    fn start_capture_rejects_when_capture_startup_fails() {
         let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
         let mut handler = handler_with_runner(Some(sender), Arc::new(FailingStartupRunner));
-        let client_format = client_formats(vec![advertised_format()]);
-
-        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.start_capture().is_err());
         assert!(handler.stop_signal.is_none());
         assert!(handler.capture_thread.is_none());
     }
 
     #[test]
-    fn start_rejects_matching_format_when_capture_spawn_fails() {
+    fn start_capture_rejects_when_capture_spawn_fails() {
         let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
         let mut handler = handler_with_runner(Some(sender), Arc::new(SpawnErrorRunner));
-        let client_format = client_formats(vec![advertised_format()]);
-
-        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.start_capture().is_err());
         assert!(handler.stop_signal.is_none());
         assert!(handler.capture_thread.is_none());
     }
 
     #[test]
-    fn start_accepts_redirect_mode_after_routing_and_capture_start() {
+    fn start_capture_accepts_redirect_mode_after_routing_and_capture_start() {
         let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
         let mut handler = handler_with_runner_and_routing(
             Some(sender),
@@ -478,9 +392,7 @@ mod tests {
             Arc::new(ReadyRoutingRunner),
             AudioMode::Redirect,
         );
-        let client_format = client_formats(vec![advertised_format()]);
-
-        assert_eq!(handler.start(&client_format), Some(0));
+        assert!(handler.start_capture().is_ok());
         assert!(handler.active_routing.is_some());
 
         handler.stop();
@@ -488,7 +400,7 @@ mod tests {
     }
 
     #[test]
-    fn start_rejects_redirect_mode_when_routing_fails_before_capture_spawn() {
+    fn start_capture_rejects_redirect_mode_when_routing_fails_before_capture_spawn() {
         let (sender, _receiver) = mpsc::unbounded_channel::<ServerEvent>();
         let mut handler = handler_with_runner_and_routing(
             Some(sender),
@@ -496,9 +408,7 @@ mod tests {
             Arc::new(FailingRoutingRunner),
             AudioMode::Redirect,
         );
-        let client_format = client_formats(vec![advertised_format()]);
-
-        assert_eq!(handler.start(&client_format), None);
+        assert!(handler.start_capture().is_err());
         assert!(handler.stop_signal.is_none());
         assert!(handler.capture_thread.is_none());
         assert!(handler.active_routing.is_none());

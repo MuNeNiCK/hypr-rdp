@@ -1,4 +1,4 @@
-use ironrdp_server::{ClientKeyboardData, KeyboardEvent, MouseEvent, RdpServerInputHandler};
+use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 
 use super::actor::InputCommand;
 use super::keyboard::{generate_xkb_keymap_from_names, xkb_names_for_rdp_keyboard_layout};
@@ -6,15 +6,12 @@ use super::wayland::HyprInputHandler;
 use super::KeyboardLayoutPolicy;
 
 impl RdpServerInputHandler for HyprInputHandler {
-    fn client_keyboard_data(&mut self, keyboard_data: ClientKeyboardData) {
-        let Some(keymap_data) = client_keymap_from_keyboard_layout(
-            self.keyboard_layout_policy,
-            keyboard_data.keyboard_layout,
-        ) else {
+    fn client_keyboard_layout(&mut self, keyboard_layout: u32) {
+        let Some(keymap_data) =
+            client_keymap_from_keyboard_layout(self.keyboard_layout_policy, keyboard_layout)
+        else {
             tracing::info!(
-                keyboard_layout = %format_args!("{:#010x}", keyboard_data.keyboard_layout),
-                keyboard_type = ?keyboard_data.keyboard_type,
-                keyboard_subtype = keyboard_data.keyboard_subtype,
+                keyboard_layout = %format_args!("{keyboard_layout:#010x}"),
                 keyboard_layout_policy = ?self.keyboard_layout_policy,
                 "Keeping existing keyboard keymap"
             );
@@ -22,10 +19,7 @@ impl RdpServerInputHandler for HyprInputHandler {
         };
 
         tracing::info!(
-            keyboard_layout = %format_args!("{:#010x}", keyboard_data.keyboard_layout),
-            keyboard_type = ?keyboard_data.keyboard_type,
-            keyboard_subtype = keyboard_data.keyboard_subtype,
-            keyboard_functional_keys_count = keyboard_data.keyboard_functional_keys_count,
+            keyboard_layout = %format_args!("{keyboard_layout:#010x}"),
             "Applying client keyboard layout"
         );
         self.send_input_command(InputCommand::ApplyKeymap {
