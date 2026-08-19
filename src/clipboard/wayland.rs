@@ -21,6 +21,12 @@ use super::formats::{
     TEXT_PLAIN_MIME, UTF8_MIME,
 };
 
+const DATA_CONTROL_VERSION: u32 = 1;
+
+fn data_control_manager_version(advertised_version: u32) -> u32 {
+    advertised_version.min(DATA_CONTROL_VERSION)
+}
+
 pub(super) fn clipboard_thread(
     event_sender: mpsc::UnboundedSender<ServerEvent>,
     suppress: Arc<AtomicBool>,
@@ -222,7 +228,10 @@ impl Dispatch<wl_registry::WlRegistry, ()> for ClipState {
         {
             match interface.as_str() {
                 "zwlr_data_control_manager_v1" => {
-                    state.manager = Some(registry.bind(name, version.min(2), qh, ()));
+                    // Primary-selection support starts at v2. Stay on v1 until
+                    // this backend handles its offer lifecycle.
+                    state.manager =
+                        Some(registry.bind(name, data_control_manager_version(version), qh, ()));
                 }
                 "wl_seat" if state.seat.is_none() => {
                     state.seat = Some(registry.bind(name, version.min(1), qh, ()));
@@ -380,7 +389,6 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 tracing::warn!("Clipboard: data control device finished");
                 state.device = None;
             }
-            zwlr_data_control_device_v1::Event::PrimarySelection { .. } => {}
             _ => {}
         }
     }
@@ -539,5 +547,12 @@ mod tests {
     #[test]
     fn source_data_writer_reports_failed_write() {
         assert!(!write_source_data(FailingWriter, b"clipboard"));
+    }
+
+    #[test]
+    fn data_control_manager_version_is_limited_to_used_v1_surface() {
+        assert_eq!(data_control_manager_version(1), 1);
+        assert_eq!(data_control_manager_version(2), 1);
+        assert_eq!(data_control_manager_version(u32::MAX), 1);
     }
 }
