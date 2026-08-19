@@ -400,6 +400,15 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
 const PIPE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const PIPE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
 
+fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0i32; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+}
+
 fn set_nonblocking(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -539,16 +548,13 @@ fn read_offer_data(
     mime: &str,
     conn: &Connection,
 ) -> Option<Vec<u8>> {
-    let mut fds = [0i32; 2];
-    // O_CLOEXEC: without it the write end leaks into children spawned
-    // elsewhere in the process (session hooks), and the read side never
-    // sees EOF while such a child lives.
-    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        tracing::warn!("Clipboard: pipe2() failed");
-        return None;
-    }
-    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let (read_fd, write_fd) = match pipe_cloexec() {
+        Ok(fds) => fds,
+        Err(e) => {
+            tracing::warn!("Clipboard: failed to create pipe: {}", e);
+            return None;
+        }
+    };
 
     offer.receive(mime.to_string(), write_fd.as_fd());
     let _ = conn.flush();
@@ -665,11 +671,30 @@ mod tests {
     const FAST_TOTAL: Duration = Duration::from_secs(3);
 
     fn pipe_pair() -> (OwnedFd, OwnedFd) {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        (unsafe { OwnedFd::from_raw_fd(fds[0]) }, unsafe {
-            OwnedFd::from_raw_fd(fds[1])
-        })
+        pipe_cloexec().unwrap()
+    }
+
+    #[test]
+    fn clipboard_pipe_ends_are_close_on_exec() {
+        let (read_fd, write_fd) = pipe_pair();
+
+        for fd in [&read_fd, &write_fd] {
+            let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+            assert_ne!(flags, -1);
+            assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        }
+    }
+
+    #[test]
+    fn transfer_timeout_enforces_total_duration_despite_recent_progress() {
+        let now = std::time::Instant::now();
+
+        assert!(transfer_timed_out(
+            now - Duration::from_secs(2),
+            now,
+            Duration::from_secs(10),
+            Duration::from_secs(1),
+        ));
     }
 
     #[test]
