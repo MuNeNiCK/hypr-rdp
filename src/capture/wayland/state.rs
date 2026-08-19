@@ -18,6 +18,13 @@ use wayland_protocols_wlr::screencopy::v1::client::{
     zwlr_screencopy_frame_v1, zwlr_screencopy_manager_v1,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExtFrameFailure {
+    Unknown,
+    BufferConstraints,
+    Stopped,
+}
+
 pub(super) struct AppState {
     pub(super) tx: mpsc::Sender<DisplayUpdate>,
     pub(super) target_output_name: String,
@@ -48,6 +55,7 @@ pub(super) struct AppState {
     pub(super) active_wlr_frame_id: Option<u32>,
     pub(super) frame_ready: bool,
     pub(super) frame_failed: bool,
+    pub(super) ext_frame_failure: Option<ExtFrameFailure>,
     pub(super) damage_regions: Vec<(i32, i32, i32, i32)>,
     pub(super) stopped: bool,
     pub(super) stop_flag: Arc<std::sync::atomic::AtomicBool>,
@@ -87,6 +95,7 @@ impl AppState {
             active_wlr_frame_id: None,
             frame_ready: false,
             frame_failed: false,
+            ext_frame_failure: None,
             damage_regions: Vec::new(),
             stopped: false,
             stop_flag,
@@ -249,8 +258,24 @@ impl Dispatch<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1, ()> f
             ext_image_copy_capture_frame_v1::Event::Ready => {
                 state.frame_ready = true;
             }
-            ext_image_copy_capture_frame_v1::Event::Failed { .. } => {
+            ext_image_copy_capture_frame_v1::Event::Failed { reason } => {
                 state.frame_failed = true;
+                state.ext_frame_failure = Some(match reason {
+                    WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::Unknown) => {
+                        ExtFrameFailure::Unknown
+                    }
+                    WEnum::Value(
+                        ext_image_copy_capture_frame_v1::FailureReason::BufferConstraints,
+                    ) => ExtFrameFailure::BufferConstraints,
+                    WEnum::Value(ext_image_copy_capture_frame_v1::FailureReason::Stopped) => {
+                        ExtFrameFailure::Stopped
+                    }
+                    WEnum::Unknown(raw) => {
+                        tracing::warn!(raw, "Unknown ext-image-copy frame failure reason");
+                        ExtFrameFailure::Unknown
+                    }
+                    _ => ExtFrameFailure::Unknown,
+                });
             }
             ext_image_copy_capture_frame_v1::Event::Damage {
                 x,

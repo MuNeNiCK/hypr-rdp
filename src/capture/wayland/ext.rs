@@ -10,7 +10,7 @@ use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_captu
 
 #[cfg(feature = "vaapi")]
 use super::dmabuf_capture;
-use super::state::AppState;
+use super::state::{AppState, ExtFrameFailure};
 use super::{create_shm_fd, poll_dispatch, CaptureInfo, MmapRegion, POLL_TIMEOUT_MS};
 use crate::capture::frame::{FramePacer, FrameProcessor};
 #[cfg(feature = "vaapi")]
@@ -28,6 +28,21 @@ use crate::input::SharedOutputLayout;
 enum DmaBufCaptureErrorAction {
     FallBackToShm,
     RestartCapture,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExtFrameFailureAction {
+    Retry,
+    RestartSession,
+    Stop,
+}
+
+fn ext_frame_failure_action(failure: ExtFrameFailure) -> ExtFrameFailureAction {
+    match failure {
+        ExtFrameFailure::Unknown => ExtFrameFailureAction::Retry,
+        ExtFrameFailure::BufferConstraints => ExtFrameFailureAction::RestartSession,
+        ExtFrameFailure::Stopped => ExtFrameFailureAction::Stop,
+    }
 }
 
 #[cfg(feature = "vaapi")]
@@ -248,11 +263,19 @@ pub(super) fn capture_loop_ext(
     let mut frame = session.create_frame(qh, ());
     state.frame_ready = false;
     state.frame_failed = false;
+    state.ext_frame_failure = None;
     state.damage_regions.clear();
     frame.attach_buffer(buffers[cap_idx]);
     frame.damage_buffer(0, 0, width as i32, height as i32);
     frame.capture();
     conn.flush().context("Wayland flush failed")?;
+
+    let mut failed_streak = 0u32;
+    // A frame the pacer skipped, retained so its damage still reaches the
+    // client if the screen then goes quiet (the buffer stays valid for the
+    // whole wait: the next capture writes into the other buffer).
+    let mut deferred: Option<crate::capture::scale::PreparedPresentationFrame<'_>> = None;
+    let mut tx_closed = false;
 
     loop {
         if state.should_stop() {
@@ -265,8 +288,27 @@ pub(super) fn capture_loop_ext(
             if state.should_stop() {
                 break;
             }
+            // Flush a pacer-skipped frame once the pacing window opens; on a
+            // static screen no further capture completes to deliver it.
+            if let Some(pending) = deferred.as_ref() {
+                if frame_pacer.should_send(
+                    Instant::now(),
+                    proc.sent_first_frame,
+                    proc.has_pending_damage(),
+                    proc.pacing_fps(),
+                ) {
+                    if !proc.process(pending.data.as_ref(), &state.tx) {
+                        tx_closed = true;
+                        break;
+                    }
+                    deferred = None;
+                }
+            }
         }
         frame.destroy();
+        if tx_closed {
+            break;
+        }
 
         // Shutdown interrupted the wait — exit cleanly
         if !state.frame_ready && !state.frame_failed {
@@ -275,8 +317,26 @@ pub(super) fn capture_loop_ext(
 
         // Save completed frame state before starting next capture
         let completed_failed = state.frame_failed;
+        let completed_failure = state.ext_frame_failure.take();
         let completed_idx = cap_idx;
         let completed_damage_regions = state.damage_regions.clone();
+
+        // A failed capture does not refresh the deferred buffer. The next
+        // request can reuse that same mmap, so drop the borrow before any new
+        // buffer is submitted to the compositor. Pending damage remains in
+        // FrameProcessor and will be applied to the next successful frame.
+        if completed_failed {
+            super::discard_deferred_after_failed_capture(true, &mut deferred);
+            match ext_frame_failure_action(completed_failure.unwrap_or(ExtFrameFailure::Unknown)) {
+                ExtFrameFailureAction::RestartSession => {
+                    return Err(super::wlr::BufferParametersChanged.into());
+                }
+                ExtFrameFailureAction::Stop => {
+                    bail!("ext-image-copy capture session stopped");
+                }
+                ExtFrameFailureAction::Retry => {}
+            }
+        }
 
         // Start NEXT capture immediately into the other buffer.
         // This ensures a capture request is always pending with the compositor,
@@ -284,6 +344,7 @@ pub(super) fn capture_loop_ext(
         cap_idx = 1 - cap_idx;
         state.frame_ready = false;
         state.frame_failed = false;
+        state.ext_frame_failure = None;
         state.damage_regions.clear();
         frame = session.create_frame(qh, ());
         frame.attach_buffer(buffers[cap_idx]);
@@ -293,8 +354,17 @@ pub(super) fn capture_loop_ext(
 
         // Process the completed frame while next capture is pending
         if completed_failed {
+            failed_streak += 1;
+            if failed_streak >= super::CAPTURE_FAILED_FRAME_LIMIT {
+                frame.destroy();
+                return Err(super::FramesRepeatedlyFailed.into());
+            }
+            std::thread::sleep(super::CAPTURE_FAILED_FRAME_BACKOFF);
             continue;
         }
+        failed_streak = 0;
+        // A fresh frame supersedes anything the pacer previously skipped.
+        deferred = None;
         let data = mmaps[completed_idx].as_slice();
         let snapshot = output_layout
             .snapshot()
@@ -352,10 +422,32 @@ pub(super) fn capture_loop_ext(
         } else {
             proc.stats
                 .record_pacer_skip(prepared.width, prepared.height);
+            deferred = Some(prepared);
         }
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod failure_tests {
+    use super::*;
+
+    #[test]
+    fn ext_failure_recovery_follows_protocol_reason() {
+        assert_eq!(
+            ext_frame_failure_action(ExtFrameFailure::Unknown),
+            ExtFrameFailureAction::Retry
+        );
+        assert_eq!(
+            ext_frame_failure_action(ExtFrameFailure::BufferConstraints),
+            ExtFrameFailureAction::RestartSession
+        );
+        assert_eq!(
+            ext_frame_failure_action(ExtFrameFailure::Stopped),
+            ExtFrameFailureAction::Stop
+        );
+    }
 }
 
 #[cfg(all(test, feature = "vaapi"))]

@@ -21,6 +21,7 @@ use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
 use crate::input::SharedOutputLayout;
 
 const WLR_FRAME_STALL_TIMEOUT: Duration = Duration::from_secs(2);
+
 const WLR_EMPTY_DAMAGE_FULL_SCAN_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug)]
@@ -245,12 +246,24 @@ pub(super) fn capture_loop_wlr(
         }
     }
 
+    let mut failed_streak = 0u32;
+    // A frame the pacer skipped, retained so its damage still reaches the
+    // client if the screen then goes quiet (the buffer stays valid for the
+    // whole wait: the next capture writes into the other buffer).
+    let mut deferred: Option<crate::capture::scale::PreparedPresentationFrame<'_>> = None;
+    let mut tx_closed = false;
+
     loop {
         // Save completed frame state
         let completed_failed = state.frame_failed;
         let completed_idx = cap_idx;
         let completed_damage_regions = state.damage_regions.clone();
         frame.destroy();
+
+        // The next request may reuse the mmap backing a pacer-deferred frame.
+        // Drop that borrow before submitting any buffer to the compositor;
+        // FrameProcessor retains the pending damage for the next success.
+        super::discard_deferred_after_failed_capture(completed_failed, &mut deferred);
 
         if state.should_stop() {
             break;
@@ -267,6 +280,9 @@ pub(super) fn capture_loop_wlr(
 
         // Process the completed frame while waiting for next buffer info + capture
         if !completed_failed {
+            failed_streak = 0;
+            // A fresh frame supersedes anything the pacer previously skipped.
+            deferred = None;
             let mut damage_regions = completed_damage_regions;
             let promoted_full_scan = promote_empty_damage_to_full_scan_if_due(
                 &mut damage_regions,
@@ -335,12 +351,36 @@ pub(super) fn capture_loop_wlr(
             } else {
                 proc.stats
                     .record_pacer_skip(prepared.width, prepared.height);
+                deferred = Some(prepared);
             }
+        } else {
+            failed_streak += 1;
+            if failed_streak >= super::CAPTURE_FAILED_FRAME_LIMIT {
+                frame.destroy();
+                return Err(super::FramesRepeatedlyFailed.into());
+            }
+            std::thread::sleep(super::CAPTURE_FAILED_FRAME_BACKOFF);
         }
 
         // Wait for next frame to complete (poll-based for responsive shutdown)
         while !state.frame_ready && !state.frame_failed {
             poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
+            // Flush a pacer-skipped frame once the pacing window opens; on a
+            // static screen no further capture completes to deliver it.
+            if let Some(pending) = deferred.as_ref() {
+                if frame_pacer.should_send(
+                    Instant::now(),
+                    proc.sent_first_frame,
+                    proc.has_pending_damage(),
+                    proc.pacing_fps(),
+                ) {
+                    if !proc.process(pending.data.as_ref(), &state.tx) {
+                        tx_closed = true;
+                        break;
+                    }
+                    deferred = None;
+                }
+            }
             if !buffer_sent && state.buffer_width > 0 {
                 // Detect compositor buffer renegotiation (dimensions, stride, or format)
                 let new_stride = if state.wlr_stride > 0 {
@@ -382,6 +422,9 @@ pub(super) fn capture_loop_wlr(
                 buffer_sent = false;
                 wait_started = Instant::now();
             }
+        }
+        if tx_closed {
+            break;
         }
     }
 
