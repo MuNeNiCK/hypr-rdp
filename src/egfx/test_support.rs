@@ -716,33 +716,36 @@ pub(crate) fn start_gfx_channel(bridge: &mut GfxDvcBridge) {
 }
 
 pub(crate) fn process_avc444_capabilities(bridge: &mut GfxDvcBridge) {
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V10_7 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
-        },
-    ]));
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+            },
+        ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
     let _ = ironrdp_dvc::DvcProcessor::process(bridge, TEST_CHANNEL_ID, &caps)
         .expect("capabilities process");
 }
 
 pub(crate) fn process_avc420_capabilities(bridge: &mut GfxDvcBridge) {
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8_1 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
-        },
-    ]));
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V8_1 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV81Flags::AVC420_ENABLED,
+            },
+        ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
     let _ = ironrdp_dvc::DvcProcessor::process(bridge, TEST_CHANNEL_ID, &caps)
         .expect("capabilities process");
 }
 
 pub(crate) fn process_no_avc_capabilities(bridge: &mut GfxDvcBridge) {
-    let caps = GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu(vec![
-        ironrdp_egfx::pdu::CapabilitySet::V8 {
-            flags: ironrdp_egfx::pdu::CapabilitiesV8Flags::empty(),
-        },
-    ]));
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V8 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV8Flags::empty(),
+            },
+        ]));
     let caps = encode_vec(&caps).expect("capabilities encode");
     let _ = ironrdp_dvc::DvcProcessor::process(bridge, TEST_CHANNEL_ID, &caps)
         .expect("capabilities process");
@@ -1005,6 +1008,7 @@ pub(crate) fn drain_gfx_pdus(event_rx: &mut mpsc::UnboundedReceiver<ServerEvent>
                         }
                     }
                 }
+                other => panic!("unexpected DRDYNVC data PDU: {other:?}"),
             };
 
             if let Some(gfx_bytes) = complete {
