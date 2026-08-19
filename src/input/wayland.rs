@@ -43,8 +43,8 @@ struct WaylandInput {
     vk: ZwpVirtualKeyboardV1,
     vp: ZwlrVirtualPointerV1,
     output_layout: Arc<SharedOutputLayout>,
-    scroll_residual_v: f64,
-    scroll_residual_h: f64,
+    scroll_residual_v: i64,
+    scroll_residual_h: i64,
 }
 
 impl WaylandInput {
@@ -157,41 +157,25 @@ impl InputBackend for WaylandInput {
                 self.flush();
             }
             MouseEvent::VerticalScroll { value } => {
-                let (continuous, discrete) =
-                    scroll_axis_step(&mut self.scroll_residual_v, f64::from(value));
-                self.vp.axis_source(AxisSource::Wheel);
-                if discrete != 0 {
-                    self.vp
-                        .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
-                } else {
-                    self.vp.axis(t, Axis::VerticalScroll, continuous);
-                }
-                self.vp.frame();
+                emit_scroll_event(
+                    &self.vp,
+                    t,
+                    0,
+                    i32::from(value),
+                    &mut self.scroll_residual_h,
+                    &mut self.scroll_residual_v,
+                );
                 self.flush();
             }
             MouseEvent::Scroll { x, y } => {
-                self.vp.axis_source(AxisSource::Wheel);
-                if y != 0 {
-                    let (continuous, discrete) =
-                        scroll_axis_step(&mut self.scroll_residual_v, f64::from(y));
-                    if discrete != 0 {
-                        self.vp
-                            .axis_discrete(t, Axis::VerticalScroll, continuous, discrete);
-                    } else {
-                        self.vp.axis(t, Axis::VerticalScroll, continuous);
-                    }
-                }
-                if x != 0 {
-                    let (continuous, discrete) =
-                        scroll_axis_step(&mut self.scroll_residual_h, f64::from(x));
-                    if discrete != 0 {
-                        self.vp
-                            .axis_discrete(t, Axis::HorizontalScroll, continuous, discrete);
-                    } else {
-                        self.vp.axis(t, Axis::HorizontalScroll, continuous);
-                    }
-                }
-                self.vp.frame();
+                emit_scroll_event(
+                    &self.vp,
+                    t,
+                    x,
+                    y,
+                    &mut self.scroll_residual_h,
+                    &mut self.scroll_residual_v,
+                );
                 self.flush();
             }
             MouseEvent::RelMove { x, y } => {
@@ -218,24 +202,87 @@ impl InputBackend for WaylandInput {
     }
 }
 
-/// Convert an RDP wheel delta into a Wayland axis emission. RDP wheel
-/// deltas follow the Windows WHEEL_DELTA convention: 120 units per detent,
-/// with high-resolution devices (touchpads, free-spinning wheels) sending
-/// fractions of 120. Rounding each event to whole detents silences slow
-/// touchpad scrolling entirely, so sub-detent remainders accumulate in
-/// `residual` across events; the protocol's `axis` request carries the
-/// sub-detent motion and `axis_discrete` extends it once whole detents
-/// accumulate. Returns the continuous axis value and the whole detents to
-/// report, both in Wayland's sign convention (positive = down/right).
-fn scroll_axis_step(residual: &mut f64, delta_units: f64) -> (f64, i32) {
-    let ticks = delta_units / 120.0;
-    let continuous = -ticks * 15.0;
-    *residual += ticks;
-    // INVARIANT: |residual| < 1 before the update and |ticks| <= 32768/120,
-    // so the truncated value always fits in i32.
-    let discrete = residual.trunc() as i32;
-    *residual -= f64::from(discrete);
-    (continuous, -discrete)
+trait ScrollRequestSink {
+    fn axis_source(&self, source: AxisSource);
+    fn axis(&self, time: u32, axis: Axis, value: f64);
+    fn axis_discrete(&self, time: u32, axis: Axis, value: f64, discrete: i32);
+    fn frame(&self);
+}
+
+impl ScrollRequestSink for ZwlrVirtualPointerV1 {
+    fn axis_source(&self, source: AxisSource) {
+        self.axis_source(source);
+    }
+
+    fn axis(&self, time: u32, axis: Axis, value: f64) {
+        self.axis(time, axis, value);
+    }
+
+    fn axis_discrete(&self, time: u32, axis: Axis, value: f64, discrete: i32) {
+        self.axis_discrete(time, axis, value, discrete);
+    }
+
+    fn frame(&self) {
+        self.frame();
+    }
+}
+
+fn emit_scroll_event(
+    sink: &impl ScrollRequestSink,
+    time: u32,
+    horizontal_units: i32,
+    vertical_units: i32,
+    horizontal_residual: &mut i64,
+    vertical_residual: &mut i64,
+) {
+    sink.axis_source(AxisSource::Wheel);
+    if vertical_units != 0 {
+        emit_scroll_axis(
+            sink,
+            time,
+            Axis::VerticalScroll,
+            vertical_units,
+            vertical_residual,
+        );
+    }
+    if horizontal_units != 0 {
+        emit_scroll_axis(
+            sink,
+            time,
+            Axis::HorizontalScroll,
+            horizontal_units,
+            horizontal_residual,
+        );
+    }
+    sink.frame();
+}
+
+fn emit_scroll_axis(
+    sink: &impl ScrollRequestSink,
+    time: u32,
+    axis: Axis,
+    delta_units: i32,
+    residual: &mut i64,
+) {
+    let (continuous, discrete) = scroll_axis_step(residual, delta_units);
+    if discrete == 0 {
+        sink.axis(time, axis, continuous);
+    } else {
+        sink.axis_discrete(time, axis, continuous, discrete);
+    }
+}
+
+/// Convert integer RDP wheel units into Wayland continuous motion and whole
+/// detents. Keeping the remainder in RDP units avoids floating-point drift at
+/// the 120-unit detent boundary.
+fn scroll_axis_step(residual: &mut i64, delta_units: i32) -> (f64, i32) {
+    let continuous = -(f64::from(delta_units) / 120.0) * 15.0;
+    let accumulated = *residual + i64::from(delta_units);
+    let discrete = accumulated / 120;
+    *residual = accumulated % 120;
+    let wayland_discrete =
+        i32::try_from(-discrete).expect("i32 wheel delta produces i32 detent count");
+    (continuous, wayland_discrete)
 }
 
 fn map_rdp_pointer_to_source(layout: &OutputLayoutSnapshot, x: u16, y: u16) -> (u32, u32) {
@@ -360,8 +407,8 @@ impl HyprInputHandler {
             vk,
             vp,
             output_layout,
-            scroll_residual_v: 0.0,
-            scroll_residual_h: 0.0,
+            scroll_residual_v: 0,
+            scroll_residual_h: 0,
         };
 
         // Flush the device setup requests before handing the connection to
@@ -859,6 +906,8 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for WlState
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
     use crate::input::keyboard::KeyboardStateTracker;
 
@@ -937,48 +986,147 @@ mod tests {
 
     #[test]
     fn scroll_full_detent_reports_a_discrete_step() {
-        let mut residual = 0.0;
+        let mut residual = 0;
 
-        assert_eq!(scroll_axis_step(&mut residual, 120.0), (-15.0, -1));
-        assert_eq!(scroll_axis_step(&mut residual, -120.0), (15.0, 1));
-        assert_eq!(residual, 0.0);
+        assert_eq!(scroll_axis_step(&mut residual, 120), (-15.0, -1));
+        assert_eq!(scroll_axis_step(&mut residual, -120), (15.0, 1));
+        assert_eq!(residual, 0);
     }
 
     #[test]
     fn scroll_sub_detent_deltas_accumulate_instead_of_vanishing() {
         // A touchpad sending 12 slow ticks of +10 must scroll one detent in
         // total; the old per-event rounding dropped every one of them.
-        let mut residual = 0.0;
+        let mut residual = 0;
         let mut discrete_total = 0;
         let mut continuous_total = 0.0;
         for _ in 0..12 {
-            let (continuous, discrete) = scroll_axis_step(&mut residual, 10.0);
+            let (continuous, discrete) = scroll_axis_step(&mut residual, 10);
             continuous_total += continuous;
             discrete_total += discrete;
         }
 
         assert_eq!(discrete_total, -1);
         assert!((continuous_total - -15.0).abs() < 1e-9);
-        assert!(residual.abs() < 1e-9);
+        assert_eq!(residual, 0);
     }
 
     #[test]
     fn scroll_direction_change_cancels_the_residual() {
-        let mut residual = 0.0;
+        let mut residual = 0;
 
-        assert_eq!(scroll_axis_step(&mut residual, 60.0).1, 0);
-        assert_eq!(scroll_axis_step(&mut residual, -60.0).1, 0);
-        assert!(residual.abs() < 1e-9);
+        assert_eq!(scroll_axis_step(&mut residual, 60).1, 0);
+        assert_eq!(scroll_axis_step(&mut residual, -60).1, 0);
+        assert_eq!(residual, 0);
     }
 
     #[test]
     fn scroll_oversized_delta_reports_multiple_detents_and_keeps_remainder() {
-        let mut residual = 0.0;
+        let mut residual = 0;
 
-        let (continuous, discrete) = scroll_axis_step(&mut residual, 250.0);
+        let (continuous, discrete) = scroll_axis_step(&mut residual, 250);
         assert_eq!(discrete, -2);
         assert!((continuous - -31.25).abs() < 1e-9);
-        assert!((residual - 250.0 / 120.0 % 1.0).abs() < 1e-9);
+        assert_eq!(residual, 10);
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum RecordedScrollRequest {
+        Source(AxisSource),
+        Axis(u32, Axis, f64),
+        Discrete(u32, Axis, f64, i32),
+        Frame,
+    }
+
+    #[derive(Default)]
+    struct RecordingScrollSink(RefCell<Vec<RecordedScrollRequest>>);
+
+    impl ScrollRequestSink for RecordingScrollSink {
+        fn axis_source(&self, source: AxisSource) {
+            self.0
+                .borrow_mut()
+                .push(RecordedScrollRequest::Source(source));
+        }
+
+        fn axis(&self, time: u32, axis: Axis, value: f64) {
+            self.0
+                .borrow_mut()
+                .push(RecordedScrollRequest::Axis(time, axis, value));
+        }
+
+        fn axis_discrete(&self, time: u32, axis: Axis, value: f64, discrete: i32) {
+            self.0
+                .borrow_mut()
+                .push(RecordedScrollRequest::Discrete(time, axis, value, discrete));
+        }
+
+        fn frame(&self) {
+            self.0.borrow_mut().push(RecordedScrollRequest::Frame);
+        }
+    }
+
+    #[test]
+    fn scroll_event_emits_both_axes_with_one_wayland_frame() {
+        let sink = RecordingScrollSink::default();
+        let mut horizontal_residual = 0;
+        let mut vertical_residual = 0;
+
+        emit_scroll_event(
+            &sink,
+            42,
+            120,
+            10,
+            &mut horizontal_residual,
+            &mut vertical_residual,
+        );
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedScrollRequest::Source(AxisSource::Wheel),
+                RecordedScrollRequest::Axis(42, Axis::VerticalScroll, -1.25),
+                RecordedScrollRequest::Discrete(42, Axis::HorizontalScroll, -15.0, -1),
+                RecordedScrollRequest::Frame,
+            ]
+        );
+        assert_eq!(horizontal_residual, 0);
+        assert_eq!(vertical_residual, 10);
+    }
+
+    #[test]
+    fn scroll_event_switches_to_discrete_request_at_one_detent() {
+        let sink = RecordingScrollSink::default();
+        let mut horizontal_residual = 0;
+        let mut vertical_residual = 0;
+
+        for time in 0..12 {
+            emit_scroll_event(
+                &sink,
+                time,
+                0,
+                10,
+                &mut horizontal_residual,
+                &mut vertical_residual,
+            );
+        }
+
+        let requests = sink.0.borrow();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| matches!(request, RecordedScrollRequest::Discrete(..)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            &requests[requests.len() - 3..],
+            [
+                RecordedScrollRequest::Source(AxisSource::Wheel),
+                RecordedScrollRequest::Discrete(11, Axis::VerticalScroll, -1.25, -1),
+                RecordedScrollRequest::Frame,
+            ]
+        );
+        assert_eq!(vertical_residual, 0);
     }
 
     #[test]
