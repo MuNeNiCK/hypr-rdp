@@ -512,6 +512,24 @@ pub(crate) struct VaBuffer {
     id: VABufferID,
 }
 
+unsafe fn collect_coded_segments(mut segment: *const va::VACodedBufferSegment) -> Result<Vec<u8>> {
+    let mut data = Vec::new();
+    while !segment.is_null() {
+        let segment_ref = unsafe { &*segment };
+        if segment_ref.status & va::VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK != 0 {
+            bail!("coded buffer overflow: encoded slice exceeded the coded buffer");
+        }
+        if !segment_ref.buf.is_null() && segment_ref.size > 0 {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(segment_ref.buf as *const u8, segment_ref.size as usize)
+            };
+            data.extend_from_slice(bytes);
+        }
+        segment = segment_ref.next as *const va::VACodedBufferSegment;
+    }
+    Ok(data)
+}
+
 impl VaBuffer {
     pub(crate) fn id(&self) -> VABufferID {
         self.id
@@ -528,23 +546,10 @@ impl VaBuffer {
             id: self.id,
         };
 
-        let mut data = Vec::new();
-        let mut segment = ptr as *const va::VACodedBufferSegment;
-        while !segment.is_null() {
-            let segment_ref = unsafe { &*segment };
-            if !segment_ref.buf.is_null() && segment_ref.size > 0 {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        segment_ref.buf as *const u8,
-                        segment_ref.size as usize,
-                    )
-                };
-                data.extend_from_slice(bytes);
-            }
-            segment = segment_ref.next as *const va::VACodedBufferSegment;
-        }
-
-        Ok(data)
+        // The driver truncates the bitstream and marks the segment when a
+        // slice outgrows the coded buffer. Reject the whole access unit before
+        // any of its bytes can be forwarded to the client.
+        unsafe { collect_coded_segments(ptr as *const va::VACodedBufferSegment) }
     }
 }
 
@@ -700,4 +705,41 @@ fn pointer_surface_attr(type_: u32, value: *mut c_void) -> VASurfaceAttrib {
     attr.value.type_ = va::VAGenericValueType_VAGenericValueTypePointer;
     attr.value.value.p = value;
     attr
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(bytes: &mut [u8]) -> va::VACodedBufferSegment {
+        let mut segment: va::VACodedBufferSegment = unsafe { std::mem::zeroed() };
+        segment.buf = bytes.as_mut_ptr().cast();
+        segment.size = bytes.len() as u32;
+        segment
+    }
+
+    #[test]
+    fn coded_segment_collection_joins_all_segments() {
+        let mut first_bytes = [1u8, 2];
+        let mut second_bytes = [3u8, 4, 5];
+        let mut second = segment(&mut second_bytes);
+        let mut first = segment(&mut first_bytes);
+        first.next = (&mut second as *mut va::VACodedBufferSegment).cast();
+
+        let data = unsafe { collect_coded_segments(&first) }.unwrap();
+        assert_eq!(data, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn coded_segment_collection_rejects_overflow_without_partial_payload() {
+        let mut first_bytes = [1u8, 2];
+        let mut overflow_bytes = [3u8, 4];
+        let mut overflow = segment(&mut overflow_bytes);
+        overflow.status = va::VA_CODED_BUF_STATUS_SLICE_OVERFLOW_MASK;
+        let mut first = segment(&mut first_bytes);
+        first.next = (&mut overflow as *mut va::VACodedBufferSegment).cast();
+
+        let err = unsafe { collect_coded_segments(&first) }.unwrap_err();
+        assert!(err.to_string().contains("coded buffer overflow"));
+    }
 }
