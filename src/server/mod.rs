@@ -3,14 +3,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use ironrdp_server::{Credentials, RdpServer, SoundServerFactory, TlsIdentityCtx};
+use ironrdp_server::{
+    ConnectionHandler, ConnectionInfo, Credentials, RdpServer, SoundServerFactory, TlsIdentityCtx,
+};
 
 use crate::audio::{AudioMode, HyprSoundFactory};
 use crate::capture::{HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
 use crate::config::RuntimeConfig;
 use crate::egfx::{EgfxShared, HyprGfxFactory};
-use crate::input::{HyprInputHandler, SharedOutputLayout};
+use crate::input::{ClientKeyboardLayoutSink, HyprInputHandler, SharedOutputLayout};
 
 mod tls;
 
@@ -67,6 +69,10 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let input_handler =
         HyprInputHandler::new(rdp_width, rdp_height, output_layout, keyboard_layout_policy)
             .context("failed to initialize input handler")?;
+    let keyboard_layout_sink = input_handler
+        .client_keyboard_layout_handle()
+        .context("input handler has no command channel")?;
+    let keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink> = Box::new(keyboard_layout_sink);
 
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
@@ -91,6 +97,9 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let mut server = secured_builder
         .with_input_handler(input_handler)
         .with_display_handler(display)
+        .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
+            keyboard_layout_sink,
+        ))))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
         .with_sound_factory(sound_factory)
@@ -117,6 +126,31 @@ fn sound_factory_for_audio_mode(audio_mode: AudioMode) -> Option<Box<dyn SoundSe
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
     ctx.server.run().await
+}
+
+/// Forwards per-connection client metadata to the input-layout policy.
+///
+/// IronRDP calls `on_connection_info` once after authentication and initial
+/// activation (never during reactivation); the keyboard layout is forwarded
+/// to the input module's owner-specific sink, which applies the layout policy
+/// and enqueues the keymap command on the input actor.
+struct ClientConnectionHandler {
+    keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>,
+}
+
+impl ClientConnectionHandler {
+    fn new(keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>) -> Self {
+        Self {
+            keyboard_layout_sink,
+        }
+    }
+}
+
+impl ConnectionHandler for ClientConnectionHandler {
+    fn on_connection_info(&mut self, info: &ConnectionInfo) {
+        self.keyboard_layout_sink
+            .set_keyboard_layout(info.keyboard_layout);
+    }
 }
 
 fn credentials_from_config(username: &str, password: &str) -> Option<Credentials> {
@@ -154,10 +188,42 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    use ironrdp_server::{ConnectionHandler, PostConnectionAction, RdpServer, ServerEvent};
+    use ironrdp_pdu::gcc::KeyboardType;
+    use ironrdp_server::{
+        ConnectionHandler, ConnectionInfo, PostConnectionAction, RdpServer, ServerEvent,
+    };
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
+
+    #[test]
+    fn on_connection_info_forwards_keyboard_layout_to_sink() {
+        use std::sync::{Arc, Mutex};
+
+        struct RecordingSink {
+            layouts: Arc<Mutex<Vec<u32>>>,
+        }
+
+        impl ClientKeyboardLayoutSink for RecordingSink {
+            fn set_keyboard_layout(&self, keyboard_layout: u32) {
+                self.layouts.lock().unwrap().push(keyboard_layout);
+            }
+        }
+
+        let layouts = Arc::new(Mutex::new(Vec::new()));
+        let sink = RecordingSink {
+            layouts: Arc::clone(&layouts),
+        };
+        let mut handler = ClientConnectionHandler::new(Box::new(sink));
+
+        handler.on_connection_info(&ConnectionInfo::new(
+            0x00000407,
+            KeyboardType::IBM_ENHANCED,
+            String::new(),
+        ));
+
+        assert_eq!(*layouts.lock().unwrap(), vec![0x00000407]);
+    }
 
     #[test]
     fn empty_username_and_password_disable_authentication() {

@@ -27,6 +27,7 @@ use super::keyboard::{
     KeyboardStateTracker, XkbKeymapNames,
 };
 use super::layout::{OutputLayoutSnapshot, SharedOutputLayout};
+use super::rdp::ClientKeyboardLayoutHandle;
 use super::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1};
 use super::{keymap, KeyboardLayoutPolicy};
 
@@ -298,7 +299,7 @@ struct LayoutListener {
 
 pub struct HyprInputHandler {
     pub(super) keyboard_layout_policy: KeyboardLayoutPolicy,
-    pub(super) input_commands: Option<mpsc::Sender<InputCommand>>,
+    pub(super) input_commands: Option<Arc<mpsc::Sender<InputCommand>>>,
     actor_thread: Option<thread::JoinHandle<()>>,
     layout_listener: Option<LayoutListener>,
 }
@@ -310,6 +311,15 @@ impl HyprInputHandler {
                 tracing::warn!("Input actor is gone; dropping input command");
             }
         }
+    }
+
+    /// Owner-specific handle for the server connection layer: forwards
+    /// client keyboard-layout metadata to the input-layout policy without
+    /// exposing `InputCommand`.
+    pub(crate) fn client_keyboard_layout_handle(&self) -> Option<ClientKeyboardLayoutHandle> {
+        self.input_commands.as_ref().map(|commands| {
+            ClientKeyboardLayoutHandle::new(self.keyboard_layout_policy, Arc::downgrade(commands))
+        })
     }
 }
 
@@ -425,6 +435,7 @@ impl HyprInputHandler {
                 run_input_actor(command_rx, keymap_data, keymap_source, epoch, wayland_input)
             })
             .context("failed to spawn input actor thread")?;
+        let input_commands = Arc::new(input_commands);
 
         tracing::info!(
             rdp_width, rdp_height,
@@ -440,7 +451,7 @@ impl HyprInputHandler {
         // Hyprland does not send wl_keyboard.modifiers to this surfaceless
         // client, so external layout switches come from Hyprland IPC instead.
         let layout_listener = if keyboard_layout_policy == KeyboardLayoutPolicy::Compositor {
-            Some(spawn_layout_listener(input_commands.clone())?)
+            Some(spawn_layout_listener(input_commands.as_ref().clone())?)
         } else {
             None
         };

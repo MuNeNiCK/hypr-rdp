@@ -1,3 +1,5 @@
+use std::sync::{mpsc, Weak};
+
 use ironrdp_server::{KeyboardEvent, MouseEvent, RdpServerInputHandler};
 
 use super::actor::InputCommand;
@@ -6,7 +8,47 @@ use super::wayland::HyprInputHandler;
 use super::KeyboardLayoutPolicy;
 
 impl RdpServerInputHandler for HyprInputHandler {
-    fn client_keyboard_layout(&mut self, keyboard_layout: u32) {
+    fn keyboard(&mut self, event: KeyboardEvent) {
+        self.send_input_command(InputCommand::Keyboard(event));
+    }
+
+    fn mouse(&mut self, event: MouseEvent) {
+        self.send_input_command(InputCommand::Mouse(event));
+    }
+}
+
+/// Owner-specific sink for client keyboard-layout metadata.
+///
+/// The server connection layer forwards `ConnectionInfo.keyboard_layout`
+/// (MS-RDPBCGR 2.2.1.3.2 Client Core Data) here after authentication. The
+/// input module owns the policy that turns the HKL into an XKB keymap
+/// command; the connection layer must not depend on `InputCommand`.
+pub(crate) trait ClientKeyboardLayoutSink: Send {
+    fn set_keyboard_layout(&self, keyboard_layout: u32);
+}
+
+/// Production `ClientKeyboardLayoutSink` owned by the input module: applies
+/// the layout policy and enqueues an `ApplyKeymap` command on the input
+/// actor's channel.
+pub(crate) struct ClientKeyboardLayoutHandle {
+    keyboard_layout_policy: KeyboardLayoutPolicy,
+    commands: Weak<mpsc::Sender<InputCommand>>,
+}
+
+impl ClientKeyboardLayoutHandle {
+    pub(super) fn new(
+        keyboard_layout_policy: KeyboardLayoutPolicy,
+        commands: Weak<mpsc::Sender<InputCommand>>,
+    ) -> Self {
+        Self {
+            keyboard_layout_policy,
+            commands,
+        }
+    }
+}
+
+impl ClientKeyboardLayoutSink for ClientKeyboardLayoutHandle {
+    fn set_keyboard_layout(&self, keyboard_layout: u32) {
         let Some(keymap_data) =
             client_keymap_from_keyboard_layout(self.keyboard_layout_policy, keyboard_layout)
         else {
@@ -22,18 +64,19 @@ impl RdpServerInputHandler for HyprInputHandler {
             keyboard_layout = %format_args!("{keyboard_layout:#010x}"),
             "Applying client keyboard layout"
         );
-        self.send_input_command(InputCommand::ApplyKeymap {
-            keymap_data,
-            keymap_source: "rdp-client",
-        });
-    }
-
-    fn keyboard(&mut self, event: KeyboardEvent) {
-        self.send_input_command(InputCommand::Keyboard(event));
-    }
-
-    fn mouse(&mut self, event: MouseEvent) {
-        self.send_input_command(InputCommand::Mouse(event));
+        let Some(commands) = self.commands.upgrade() else {
+            tracing::warn!("Input actor is gone; dropping keyboard layout command");
+            return;
+        };
+        if commands
+            .send(InputCommand::ApplyKeymap {
+                keymap_data,
+                keymap_source: "rdp-client",
+            })
+            .is_err()
+        {
+            tracing::warn!("Input actor is gone; dropping keyboard layout command");
+        }
     }
 }
 
@@ -64,8 +107,13 @@ fn client_keymap_from_keyboard_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::client_keymap_from_keyboard_layout;
+    use std::sync::{mpsc, Arc};
+    use std::time::Duration;
+
+    use super::{client_keymap_from_keyboard_layout, ClientKeyboardLayoutHandle};
+    use crate::input::actor::InputCommand;
     use crate::input::keyboard::KeyboardStateTracker;
+    use crate::input::rdp::ClientKeyboardLayoutSink;
     use crate::input::KeyboardLayoutPolicy;
 
     #[test]
@@ -91,5 +139,87 @@ mod tests {
             client_keymap_from_keyboard_layout(KeyboardLayoutPolicy::Compositor, 0x00000407,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn client_keyboard_layout_handle_sends_apply_keymap_for_supported_layout() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle = ClientKeyboardLayoutHandle::new(
+            KeyboardLayoutPolicy::Client,
+            Arc::downgrade(&commands),
+        );
+
+        handle.set_keyboard_layout(0x00000407);
+
+        let command = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("command");
+        assert!(
+            matches!(
+                command,
+                InputCommand::ApplyKeymap {
+                    keymap_source: "rdp-client",
+                    ..
+                }
+            ),
+            "supported client HKL must enqueue an ApplyKeymap command"
+        );
+    }
+
+    #[test]
+    fn client_keyboard_layout_handle_keeps_existing_keymap_when_unknown() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle = ClientKeyboardLayoutHandle::new(
+            KeyboardLayoutPolicy::Client,
+            Arc::downgrade(&commands),
+        );
+
+        handle.set_keyboard_layout(0x0000ffff);
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "unknown client HKL must not enqueue a keymap command"
+        );
+    }
+
+    #[test]
+    fn compositor_keyboard_layout_handle_ignores_supported_client_layout() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle = ClientKeyboardLayoutHandle::new(
+            KeyboardLayoutPolicy::Compositor,
+            Arc::downgrade(&commands),
+        );
+
+        handle.set_keyboard_layout(0x00000407);
+
+        assert!(
+            receiver.try_recv().is_err(),
+            "compositor policy must not enqueue a keymap command"
+        );
+    }
+
+    #[test]
+    fn client_keyboard_layout_handle_does_not_keep_input_actor_alive() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle = ClientKeyboardLayoutHandle::new(
+            KeyboardLayoutPolicy::Client,
+            Arc::downgrade(&commands),
+        );
+
+        drop(commands);
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
+        handle.set_keyboard_layout(0x00000407);
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Disconnected)
+        ));
     }
 }
