@@ -121,19 +121,66 @@ fn clamp_to_h264_software_limits(width: u32, height: u32) -> (u32, u32) {
     (scaled_width, scaled_height)
 }
 
-/// Clamp a requested presentation size to the H.264 policy limits and even
-/// dimensions. Aspect mismatches are letterboxed by the presentation scaler,
-/// so the requested size is otherwise kept as-is: reshaping it here announces
-/// a size the client did not ask for, which clients answer with another
-/// resize request — the negotiation then walks a shrinking staircase
-/// (728x408 → 724x408 → 724x406 → …) instead of converging.
+/// Fit a requested presentation size to the captured source and the H.264
+/// policy limits, keeping both dimensions even. Aspect mismatches are
+/// letterboxed by the presentation scaler, so the requested size is otherwise
+/// kept as-is: reshaping it here announces a size the client did not ask for,
+/// which clients answer with another resize request — the negotiation then
+/// walks a shrinking staircase (728x408 → 724x408 → 724x406 → …) instead of
+/// converging.
+///
+/// Mirroring cannot invent detail the captured output does not have. The
+/// scaler magnifies the source by `min(width / source_width, height /
+/// source_height)`, and only above 1 is every extra pixel invented: a HiDPI
+/// client asking in physical pixels — a 1707x960 window on a 1.5-scaled 4K
+/// screen requests 2560x1440 — spreads the configured bitrate over 1.78x the
+/// pixels of a 1080p source and pays the encode time for them.
+///
+/// Dividing both sides by that factor keeps the requested aspect ratio, so a
+/// presentation the client picked for letterboxing (a 1920x1200 window onto a
+/// 3840x1080 output magnifies by 0.5 and is left alone) is unaffected. When
+/// the request matches the source aspect the result is the source itself,
+/// which is an identity geometry and keeps the zero-copy capture path;
+/// otherwise the same letterboxing as before happens on a smaller canvas.
+/// For any source with even dimensions of at least two pixels the fitted size
+/// normalizes to itself, so a client repeating its request still converges.
 fn normalize_presentation_size(requested_size: (u32, u32), source_size: (u32, u32)) -> (u32, u32) {
-    let (width, height) = clamp_to_h264_software_limits(requested_size.0, requested_size.1);
     let (source_w, source_h) = source_size;
+    let (width, height) = (requested_size.0 & !1, requested_size.1 & !1);
     if width == 0 || height == 0 || source_w == 0 || source_h == 0 {
         return (0, 0);
     }
-    (width, height)
+
+    // The encoder only emits even sizes, so the largest presentation that can
+    // carry the source 1:1 is the source rounded down to even, floored at the
+    // two-pixel minimum.
+    let (fit_w, fit_h) = (source_w.max(2) & !1, source_h.max(2) & !1);
+    let (fitted_width, fitted_height) = if width <= fit_w || height <= fit_h {
+        (u64::from(width), u64::from(height))
+    } else {
+        let (requested_w, requested_h) = (u64::from(width), u64::from(height));
+        let (fit_w, fit_h) = (u64::from(fit_w), u64::from(fit_h));
+        if requested_w * fit_h <= requested_h * fit_w {
+            // Width-limited: the fit lands on the source width exactly.
+            (fit_w, requested_h * fit_w / requested_w)
+        } else {
+            // Height-limited. This axis only adds letterbox padding, and
+            // AVC444 needs a width that is a multiple of four, so round to one
+            // where there is room for it.
+            let padded = requested_w * fit_h / requested_h;
+            let padded = if padded >= 4 {
+                padded & !3
+            } else {
+                padded & !1
+            };
+            (padded, fit_h)
+        }
+    };
+
+    // Encoder limits last: the fit only shrinks, so clamping after it never
+    // undoes the fit, while clamping first can land a pixel under the source
+    // and lose the identity geometry.
+    clamp_to_h264_software_limits(fitted_width as u32, fitted_height as u32)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,11 +207,15 @@ fn startup_presentation_size(
     } else {
         configured_resolution
     };
-    if physical_output {
-        normalize_presentation_size(requested, source_size)
-    } else {
-        requested
+    if !physical_output {
+        return requested;
     }
+    if resolution_fixed {
+        // A pinned resolution is the operator's call, upscale included; only
+        // the encoder limits still apply.
+        return clamp_to_h264_software_limits(requested.0, requested.1);
+    }
+    normalize_presentation_size(requested, source_size)
 }
 
 fn initial_size_resize_decision(
@@ -419,7 +470,7 @@ impl HyprDisplay {
                 source_h = capture_info.height,
                 applied_w = presentation_resolution.0,
                 applied_h = presentation_resolution.1,
-                "Physical output presentation bounds clamped to encoder limits"
+                "Physical output presentation bounds clamped to encoder limits and captured source"
             );
         }
         output_layout
@@ -549,15 +600,16 @@ impl HyprDisplay {
                 }
             }
         } else if cw > 0 && ch > 0 && (cw != inner.resolution.0 || ch != inner.resolution.1) {
+            let (source_w, source_h) = source_size.unwrap_or_default();
             tracing::info!(
                 client_w = requested_w,
                 client_h = requested_h,
-                applied_w = cw,
-                applied_h = ch,
-                server_w = inner.width,
-                server_h = inner.height,
+                applied_w = inner.width,
+                applied_h = inner.height,
+                source_w,
+                source_h,
                 resolution_fixed = inner.resolution_fixed,
-                "Client requested initial size (keeping configured server size)"
+                "Client requested initial size; keeping the current presentation"
             );
         }
 
@@ -624,7 +676,9 @@ impl HyprDisplay {
                         requested_h,
                         applied_w = decision.width,
                         applied_h = decision.height,
-                        "DisplayControl presentation bounds clamped to encoder limits"
+                        source_w = source_size.map(|(w, _)| w).unwrap_or_default(),
+                        source_h = source_size.map(|(_, h)| h).unwrap_or_default(),
+                        "DisplayControl presentation bounds clamped to encoder limits and captured source"
                     );
                 }
                 ResizeTarget::ManagedHeadlessOutput => {
@@ -944,6 +998,156 @@ mod output_downscaling {
             snapshot.output_offset_y,
             presentation,
         )
+    }
+
+    #[test]
+    fn presentation_fits_a_hidpi_request_to_the_source_instead_of_upscaling() {
+        // A 1707x960 window on a 1.5-scaled 4K screen asks in physical pixels.
+        assert_eq!(
+            normalize_presentation_size((2560, 1440), (1920, 1080)),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_lands_on_the_source_exactly() {
+        // Landing a pixel short would stop the geometry from being an identity,
+        // which costs the zero-copy capture path.
+        for request in [(1984, 1116), (2944, 1656), (2560, 1440)] {
+            assert_eq!(
+                normalize_presentation_size(request, (1920, 1080)),
+                (1920, 1080),
+                "request {request:?}"
+            );
+        }
+        assert_eq!(
+            normalize_presentation_size((2656, 1494), (2560, 1440)),
+            (2560, 1440)
+        );
+    }
+
+    #[test]
+    fn physical_output_startup_keeps_pinned_resolution_above_the_source() {
+        // --resolution is an explicit operator choice, upscale included.
+        assert_eq!(
+            startup_presentation_size(true, true, (2560, 1440), (1920, 1080)),
+            (2560, 1440)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_keeps_the_requested_aspect_ratio() {
+        // Magnification is min(3000/1920, 1200/1080) = 1.111: the width stays
+        // proportional to the request instead of collapsing to the source.
+        assert_eq!(
+            normalize_presentation_size((3000, 1200), (1920, 1080)),
+            (2700, 1080)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_lands_on_the_source_when_the_height_limits_it() {
+        // The other branch: a wide request whose height runs out first keeps
+        // the source height exactly and pads the width.
+        assert_eq!(
+            normalize_presentation_size((3840, 1200), (1920, 1080)),
+            (3456, 1080)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_runs_before_the_encoder_limits() {
+        // Clamping first would land two pixels under the source and lose the
+        // identity geometry the zero-copy capture path needs.
+        assert_eq!(
+            normalize_presentation_size((3842, 2162), (3840, 2160)),
+            (3840, 2160)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_keeps_even_dimensions_for_the_encoder() {
+        // A 1600x900 window at 125% scale asks for 2000x1125; the fit divides
+        // that request down to 1921 columns, which H.264 cannot encode.
+        assert_eq!(
+            normalize_presentation_size((2000, 1125), (1920, 1080)),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_never_falls_below_the_encoder_minimum() {
+        // A source under the two-pixel minimum is still magnified: a zero
+        // dimension reads as "no resize" everywhere downstream.
+        assert_eq!(normalize_presentation_size((1920, 1080), (1, 1)), (2, 2));
+        assert_eq!(normalize_presentation_size((640, 480), (2, 1)), (2, 2));
+    }
+
+    #[test]
+    fn an_odd_request_is_evened_before_it_is_fitted() {
+        // DisplayControl layouts carry odd sizes; fitting the raw request
+        // instead of the evened one lands two rows off the source.
+        assert_eq!(
+            normalize_presentation_size((1924, 1085), (1920, 1080)),
+            (1920, 1080)
+        );
+    }
+
+    #[test]
+    fn an_unknown_source_size_is_rejected_instead_of_fitted() {
+        // A zero source size means "not known yet"; fitting to it would
+        // announce the two-pixel encoder minimum as the presentation.
+        assert_eq!(normalize_presentation_size((1920, 1080), (0, 0)), (0, 0));
+        assert_eq!(normalize_presentation_size((1920, 1080), (1920, 0)), (0, 0));
+        assert_eq!(
+            initial_size_resize_decision(true, false, (1920, 1080), (1600, 900), Some((0, 0))),
+            None
+        );
+    }
+
+    #[test]
+    fn presentation_at_or_below_the_source_is_left_alone() {
+        assert_eq!(
+            normalize_presentation_size((1920, 1080), (1920, 1080)),
+            (1920, 1080)
+        );
+        assert_eq!(
+            normalize_presentation_size((960, 540), (1920, 1080)),
+            (960, 540)
+        );
+        // Letterboxing: the window is taller than the ultrawide source, which
+        // magnifies by 0.5 and needs no fitting.
+        assert_eq!(
+            normalize_presentation_size((1920, 1200), (3840, 1080)),
+            (1920, 1200)
+        );
+    }
+
+    #[test]
+    fn presentation_fit_converges_when_a_client_repeats_its_request() {
+        // Clients answer a new size with another request; a fitted size must
+        // survive re-normalization unchanged or the negotiation walks a
+        // shrinking staircase.
+        let source = (1920, 1080);
+        for request in [(2560, 1440), (4000, 1200), (3000, 3000)] {
+            let fitted = normalize_presentation_size(request, source);
+            assert_eq!(normalize_presentation_size(fitted, source), fitted);
+        }
+    }
+
+    #[test]
+    fn physical_output_displaycontrol_fits_a_hidpi_request_to_the_source() {
+        let decision = display_control_resize_decision(
+            &single_primary(2560, 1440),
+            true,
+            false,
+            (1280, 720),
+            Some((1920, 1080)),
+        )
+        .unwrap();
+
+        assert_eq!(decision.target, ResizeTarget::PhysicalPresentation);
+        assert_eq!((decision.width, decision.height), (1920, 1080));
     }
 
     #[test]
