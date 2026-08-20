@@ -41,8 +41,13 @@ async fn main() -> Result<()> {
 
 async fn shutdown_signal() -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // SIGHUP arrives when the session that started hypr-rdp goes away (logout,
+    // the launching terminal closing). Its default disposition would kill the
+    // process outright, skipping the shutdown path that runs session hooks.
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+        _ = sighup.recv() => tracing::info!("Received SIGHUP"),
         _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT"),
     }
     Ok(())
