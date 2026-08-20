@@ -14,4 +14,5 @@ pub enum KeyboardLayoutPolicy {
 
 pub(crate) use layout::OutputLayoutSnapshot;
 pub use layout::SharedOutputLayout;
+pub(crate) use rdp::ClientKeyboardLayoutSink;
 pub use wayland::HyprInputHandler;
