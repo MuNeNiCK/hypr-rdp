@@ -243,7 +243,7 @@ fn convert_to_s16le(format: SpaAudioFormat, input: &[u8], byte_count: usize) -> 
         SpaAudioFormat::S16LE => input[..byte_count].to_vec(),
         SpaAudioFormat::S16BE => {
             let mut out = Vec::with_capacity(byte_count);
-            for pair in input[..byte_count].chunks_exact(2) {
+            for pair in input[..byte_count].as_chunks::<2>().0 {
                 out.push(pair[1]);
                 out.push(pair[0]);
             }
@@ -251,12 +251,11 @@ fn convert_to_s16le(format: SpaAudioFormat, input: &[u8], byte_count: usize) -> 
         }
         SpaAudioFormat::F32LE | SpaAudioFormat::F32BE => {
             let mut out = Vec::with_capacity((byte_count / 4) * 2);
-            for chunk in input[..byte_count].chunks_exact(4) {
-                let bytes: [u8; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+            for bytes in input[..byte_count].as_chunks::<4>().0 {
                 let sample = if format == SpaAudioFormat::F32LE {
-                    f32::from_le_bytes(bytes)
+                    f32::from_le_bytes(*bytes)
                 } else {
-                    f32::from_be_bytes(bytes)
+                    f32::from_be_bytes(*bytes)
                 };
                 let s16 = (sample.clamp(-1.0, 1.0) * 32767.0) as i16;
                 out.extend_from_slice(&s16.to_le_bytes());
@@ -404,8 +403,10 @@ mod tests {
         .unwrap();
 
         let samples: Vec<i16> = converted
-            .chunks_exact(2)
-            .map(|chunk| i16::from_le_bytes([chunk[0], chunk[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|chunk| i16::from_le_bytes(*chunk))
             .collect();
         assert_eq!(samples, vec![-32767, -16383, 0, 16383, 32767]);
     }
