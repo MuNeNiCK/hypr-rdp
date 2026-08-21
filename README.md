@@ -131,7 +131,7 @@ CLI arguments override config file values.
 | `--h264-backend` | H.264 backend: `auto` tries VA-API then software, `software` avoids VA-API, `vaapi` never substitutes software H.264 | `auto` |
 | `--audio-mode` | Audio policy: `redirect` routes playback to a temporary RDP sink while connected, `mirror` captures the current sink audio, `off` disables RDPSND | `redirect` |
 | `--keyboard-layout-policy` | Keyboard layout policy: `client` applies the RDP client layout; `compositor` keeps the compositor/Hyprland keymap | `client` |
-| `--output` | Specific output name. The presentation is capped at the captured output size: a larger client request is scaled down to it rather than upscaled. | _(headless)_ |
+| `--output` | Specific output name. Automatic sizing does not magnify the captured content; one presentation axis may remain larger for letterboxing. | _(headless)_ |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
 
 ## License
