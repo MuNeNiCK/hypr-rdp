@@ -1,7 +1,4 @@
-use std::fs::File;
-use std::io::Read;
-use std::os::fd::AsFd;
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -771,11 +768,35 @@ fn read_keymap(fd: OwnedFd, size: u32) -> Result<Vec<u8>> {
     if size == 0 {
         bail!("keyboard keymap is empty");
     }
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to inspect Wayland keyboard keymap");
+    }
+    let file_size = usize::try_from(unsafe { stat.assume_init() }.st_size)
+        .context("keyboard keymap file size is invalid")?;
+    if file_size < size {
+        bail!("Wayland keyboard keymap is shorter than its advertised size");
+    }
 
-    let mut file = File::from(fd);
-    let mut data = vec![0u8; size];
-    file.read_exact(&mut data)
-        .context("failed to read Wayland keyboard keymap")?;
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            fd.as_raw_fd(),
+            0,
+        )
+    };
+    if ptr == libc::MAP_FAILED {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to map Wayland keyboard keymap");
+    }
+    let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), size) }.to_vec();
+    unsafe {
+        libc::munmap(ptr, size);
+    }
     Ok(data)
 }
 
@@ -921,6 +942,26 @@ mod tests {
 
     use super::*;
     use crate::input::keyboard::KeyboardStateTracker;
+
+    #[test]
+    fn keymap_read_does_not_depend_on_shared_file_offset() {
+        let keymap = b"xkb-keymap\0";
+        let fd = create_keymap_fd(keymap).expect("keymap fd");
+        assert_eq!(
+            unsafe { libc::lseek(fd.as_raw_fd(), 0, libc::SEEK_END) },
+            keymap.len() as i64
+        );
+
+        assert_eq!(read_keymap(fd, keymap.len() as u32).unwrap(), keymap);
+    }
+
+    #[test]
+    fn keymap_read_rejects_a_short_backing_file() {
+        let keymap = b"xkb-keymap\0";
+        let fd = create_keymap_fd(keymap).expect("keymap fd");
+
+        assert!(read_keymap(fd, keymap.len() as u32 + 1).is_err());
+    }
 
     #[test]
     fn fallback_keymap_uses_hyprland_layout_names_when_present() {
