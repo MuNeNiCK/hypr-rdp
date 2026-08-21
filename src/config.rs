@@ -81,6 +81,17 @@ struct Args {
     #[arg(long)]
     output: Option<String>,
 
+    /// Shell command to run when an authenticated session starts
+    /// (without configured credentials: any established session)
+    #[arg(long)]
+    on_session_start: Option<String>,
+
+    /// Shell command to run when an authenticated session ends
+    /// (also on service stop, and without configured credentials: any
+    /// established session)
+    #[arg(long)]
+    on_session_end: Option<String>,
+
     /// Path to config file [default: ~/.config/hypr-rdp/config.toml]
     #[arg(long)]
     config: Option<String>,
@@ -105,6 +116,8 @@ struct ConfigFile {
     audio_mode: Option<String>,
     h264_backend: Option<String>,
     output: Option<String>,
+    on_session_start: Option<String>,
+    on_session_end: Option<String>,
 }
 
 impl ConfigFile {
@@ -171,6 +184,8 @@ pub struct RuntimeConfig {
     pub h264_backend: H264BackendPolicy,
     pub resolution_fixed: bool,
     pub output: Option<String>,
+    pub on_session_start: Option<String>,
+    pub on_session_end: Option<String>,
 }
 
 impl RuntimeConfig {
@@ -225,6 +240,8 @@ impl RuntimeConfig {
         let audio_mode = resolve_audio_mode(args.audio_mode, config.audio_mode)?;
         let h264_backend = resolve_h264_backend_policy(args.h264_backend, config.h264_backend)?;
         let output = args.output.or(config.output);
+        let on_session_start = args.on_session_start.or(config.on_session_start);
+        let on_session_end = args.on_session_end.or(config.on_session_end);
 
         let resolution = parse_resolution(&resolution_str)?;
         let capture_mode = parse_capture_mode(&capture_mode_str)?;
@@ -258,6 +275,8 @@ impl RuntimeConfig {
             h264_backend,
             resolution_fixed,
             output,
+            on_session_start,
+            on_session_end,
         })
     }
 }
@@ -627,6 +646,21 @@ mod tests {
         let args = Args::try_parse_from(["hypr-rdp", "--h264-backend", "software"]).unwrap();
 
         assert_eq!(args.h264_backend.as_deref(), Some("software"));
+    }
+
+    #[test]
+    fn cli_accepts_session_hook_commands() {
+        let args = Args::try_parse_from([
+            "hypr-rdp",
+            "--on-session-start",
+            "start command",
+            "--on-session-end",
+            "end command",
+        ])
+        .unwrap();
+
+        assert_eq!(args.on_session_start.as_deref(), Some("start command"));
+        assert_eq!(args.on_session_end.as_deref(), Some("end command"));
     }
 
     proptest! {

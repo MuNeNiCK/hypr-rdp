@@ -9,6 +9,7 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 - **Audio** — PipeWire audio forwarding via RDPSND
 - **Clipboard** — Bidirectional text and image clipboard sync
 - **Input** — Full keyboard and mouse support via virtual keyboard/pointer protocols
+- **Session hooks** — Run a command when a client session starts and ends
 - **TLS** — Auto-generated self-signed certificates, or bring your own
 - **Config file** — `~/.config/hypr-rdp/config.toml`
 
@@ -107,9 +108,48 @@ egfx_codec = "avc420"
 # audio_mode = "redirect"
 # keyboard_layout_policy = "client"
 # output = "DP-1"
+# on_session_start = "hyprctl dispatch dpms off eDP-1"  # see "Session hooks"
+# on_session_end = "hyprctl dispatch dpms on eDP-1"
 ```
 
 CLI arguments override config file values.
+
+### Session hooks
+
+`on_session_start` and `on_session_end` run a shell command when a client
+session begins and ends:
+
+```toml
+on_session_start = "hyprctl dispatch dpms off eDP-1"
+on_session_end = "hyprctl dispatch dpms on eDP-1"
+```
+
+- Only a fully established session runs a command: port probes, TLS scanners
+  and rejected logins never do, and a client resize does not re-run the start
+  command. With `-u`/`-p` set the client must pass NLA first; without
+  credentials there is no authentication step, so any client that completes
+  the RDP handshake runs the command.
+- Configured commands run in session order: each waits for the previous one to
+  finish, for up to 10 seconds. An unconfigured boundary does not release a
+  running command, so a fast reconnect cannot overtake it. Past the deadline
+  the previous command is left running, the next one starts alongside it, and
+  a warning is logged.
+- Stopping hypr-rdp during a session attempts to run the end command and waits
+  for it within the same 10-second budget. A command that fails to start,
+  exits unsuccessfully, or outlives the deadline cannot guarantee that the
+  corresponding start action is undone.
+- Commands run through `/bin/sh -c` as the same user as hypr-rdp, with its
+  environment and working directory, so `hyprctl` works but shell profiles are
+  not read — use absolute paths for anything outside the inherited `PATH`.
+  hypr-rdp never kills a command; one still running at exit is left to the
+  service manager. Hook command text is not written to hypr-rdp's logs.
+
+Name the monitor when blanking a screen. A bare `hyprctl dispatch dpms off`
+also blanks the `hypr-rdp-*` headless output the session is rendered on, which
+blanks the session itself. Blanking the captured output is worse still: while
+it is off the compositor stops committing frames, so the session freezes, and
+remote input wakes it again unless `misc:mouse_move_enables_dpms` and
+`misc:key_press_enables_dpms` are disabled.
 
 ### Options
 
@@ -132,6 +172,8 @@ CLI arguments override config file values.
 | `--audio-mode` | Audio policy: `redirect` routes playback to a temporary RDP sink while connected, `mirror` captures the current sink audio, `off` disables RDPSND | `redirect` |
 | `--keyboard-layout-policy` | Keyboard layout policy: `client` applies the RDP client layout; `compositor` keeps the compositor/Hyprland keymap | `client` |
 | `--output` | Specific output name | _(headless)_ |
+| `--on-session-start` | Shell command run when an authenticated session starts | _(none)_ |
+| `--on-session-end` | Shell command run when the session ends | _(none)_ |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
 
 ## License

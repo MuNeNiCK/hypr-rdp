@@ -41,8 +41,11 @@ async fn main() -> Result<()> {
 
 async fn shutdown_signal() -> Result<()> {
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // Route SIGHUP through graceful shutdown so active hooks can drain.
+    let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     tokio::select! {
         _ = sigterm.recv() => tracing::info!("Received SIGTERM"),
+        _ = sighup.recv() => tracing::info!("Received SIGHUP"),
         _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT"),
     }
     Ok(())

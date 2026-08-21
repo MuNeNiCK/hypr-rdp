@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ironrdp_server::{
-    ConnectionHandler, ConnectionInfo, Credentials, RdpServer, SoundServerFactory, TlsIdentityCtx,
+    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer,
+    SoundServerFactory, TlsIdentityCtx,
 };
 
 use crate::audio::{AudioMode, HyprSoundFactory};
@@ -14,7 +16,10 @@ use crate::config::RuntimeConfig;
 use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::{ClientKeyboardLayoutSink, HyprInputHandler, SharedOutputLayout};
 
+mod session_hooks;
 mod tls;
+
+use session_hooks::{session_hooks_from_config, SessionHooks};
 
 pub struct ServerContext {
     server: RdpServer,
@@ -41,6 +46,8 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         h264_backend,
         resolution_fixed,
         output,
+        on_session_start,
+        on_session_end,
     } = config;
 
     let addr = parse_bind_addr(&bind)?;
@@ -77,6 +84,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
     let sound_factory = sound_factory_for_audio_mode(audio_mode);
+    let session_hooks = session_hooks_from_config(on_session_start, on_session_end);
 
     let builder = RdpServer::builder().with_addr(addr);
 
@@ -99,6 +107,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_display_handler(display)
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
             keyboard_layout_sink,
+            session_hooks,
         ))))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
@@ -128,20 +137,20 @@ pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
     ctx.server.run().await
 }
 
-/// Forwards per-connection client metadata to the input-layout policy.
-///
-/// IronRDP calls `on_connection_info` once after authentication and initial
-/// activation (never during reactivation); the keyboard layout is forwarded
-/// to the input module's owner-specific sink, which applies the layout policy
-/// and enqueues the keymap command on the input actor.
+/// Adapts IronRDP connection boundaries to application-owned policies.
 struct ClientConnectionHandler {
     keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>,
+    session_hooks: Option<SessionHooks>,
 }
 
 impl ClientConnectionHandler {
-    fn new(keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>) -> Self {
+    fn new(
+        keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>,
+        session_hooks: Option<SessionHooks>,
+    ) -> Self {
         Self {
             keyboard_layout_sink,
+            session_hooks,
         }
     }
 }
@@ -150,6 +159,24 @@ impl ConnectionHandler for ClientConnectionHandler {
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
         self.keyboard_layout_sink
             .set_keyboard_layout(info.keyboard_layout);
+        if let Some(hooks) = &mut self.session_hooks {
+            hooks.session_started();
+        }
+    }
+
+    /// The server calls this only from its own accept loop, so anything that
+    /// takes ownership of the loop and drives `run_connection` directly has to
+    /// invoke the session-end path itself.
+    fn on_disconnected(
+        &mut self,
+        _peer: SocketAddr,
+        _duration: Duration,
+        _error: Option<&anyhow::Error>,
+    ) -> PostConnectionAction {
+        if let Some(hooks) = &mut self.session_hooks {
+            hooks.session_ended();
+        }
+        PostConnectionAction::Continue
     }
 }
 
@@ -185,8 +212,10 @@ fn parse_bind_addr(bind: &str) -> Result<SocketAddr> {
 
 #[cfg(test)]
 mod tests {
+    use super::session_hooks::test_support::{
+        echo_start, hook_log_path, test_hooks, wait_for_log, LOG_CEILING,
+    };
     use super::*;
-    use std::time::Duration;
 
     use ironrdp_pdu::gcc::KeyboardType;
     use ironrdp_server::{
@@ -195,6 +224,38 @@ mod tests {
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
+
+    fn test_peer() -> SocketAddr {
+        "127.0.0.1:39999".parse().unwrap()
+    }
+
+    fn test_connection_info() -> ConnectionInfo {
+        ConnectionInfo::new(0x0409, KeyboardType::IBM_ENHANCED, String::new())
+    }
+
+    #[test]
+    fn connection_handler_drives_hooks_on_both_boundaries() {
+        struct NoopSink;
+        impl ClientKeyboardLayoutSink for NoopSink {
+            fn set_keyboard_layout(&self, _keyboard_layout: u32) {}
+        }
+
+        let log = hook_log_path("forwarding");
+        let hooks = test_hooks(&log, echo_start(&log, ""), true);
+        let mut handler = ClientConnectionHandler::new(Box::new(NoopSink), Some(hooks));
+
+        handler.on_connection_info(&test_connection_info());
+        assert_eq!(wait_for_log(&log, "start\n", LOG_CEILING), "start\n");
+
+        let action = handler.on_disconnected(test_peer(), Duration::from_secs(1), None);
+        assert_eq!(action, PostConnectionAction::Continue);
+
+        assert_eq!(
+            wait_for_log(&log, "start\nend\n", LOG_CEILING),
+            "start\nend\n"
+        );
+        std::fs::remove_file(&log).expect("remove hook log");
+    }
 
     #[test]
     fn on_connection_info_forwards_keyboard_layout_to_sink() {
@@ -214,7 +275,7 @@ mod tests {
         let sink = RecordingSink {
             layouts: Arc::clone(&layouts),
         };
-        let mut handler = ClientConnectionHandler::new(Box::new(sink));
+        let mut handler = ClientConnectionHandler::new(Box::new(sink), None);
 
         handler.on_connection_info(&ConnectionInfo::new(
             0x00000407,
