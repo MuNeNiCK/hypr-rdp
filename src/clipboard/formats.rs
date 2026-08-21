@@ -44,8 +44,10 @@ pub(super) fn fix_bitfields_dib(data: &[u8]) -> Option<Vec<u8>> {
 
 pub(super) fn utf16le_to_utf8(data: &[u8]) -> String {
     let u16s: Vec<u16> = data
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect();
 
     let end = u16s.iter().position(|&c| c == 0).unwrap_or(u16s.len());

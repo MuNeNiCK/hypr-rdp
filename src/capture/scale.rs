@@ -132,7 +132,7 @@ pub(super) fn presentation_frame_shape(
 }
 
 fn fill_black_bars(output: &mut [u8], pixel_format: PixelFormat) {
-    for pixel in output.chunks_exact_mut(4) {
+    for pixel in output.as_chunks_mut::<4>().0 {
         pixel[0] = 0;
         pixel[1] = 0;
         pixel[2] = 0;
