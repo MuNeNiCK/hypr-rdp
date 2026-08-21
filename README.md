@@ -160,7 +160,7 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | `--key` | TLS private key (PEM) | Auto-generated |
 | `-u`, `--username` | RDP username | _(none)_ |
 | `-p`, `--password` | RDP password | _(none)_ |
-| `--resolution`, `-r` | Fixed session resolution. When omitted for a managed headless output, the session starts at `1920x1080` and may resize to the client-requested size. | Auto client size |
+| `--resolution`, `-r` | Fixed session resolution, used as-is including above a captured output's size. When omitted for a managed headless output, the session starts at `1920x1080` and may resize to the client-requested size. | Auto client size |
 | `--capture-mode` | `wlr` or `ext` | `wlr` |
 | `--bitrate` | H.264 bitrate (bps) | `10000000` |
 | `--quality` | H.264 quality (0-51) | `23` |
@@ -171,7 +171,7 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | `--h264-backend` | H.264 backend: `auto` tries VA-API then software, `software` avoids VA-API, `vaapi` never substitutes software H.264 | `auto` |
 | `--audio-mode` | Audio policy: `redirect` routes playback to a temporary RDP sink while connected, `mirror` captures the current sink audio, `off` disables RDPSND | `redirect` |
 | `--keyboard-layout-policy` | Keyboard layout policy: `client` applies the RDP client layout; `compositor` keeps the compositor/Hyprland keymap | `client` |
-| `--output` | Specific output name | _(headless)_ |
+| `--output` | Specific output name. Automatic sizing does not magnify the captured content; one presentation axis may remain larger for letterboxing. | _(headless)_ |
 | `--on-session-start` | Shell command run when an authenticated session starts | _(none)_ |
 | `--on-session-end` | Shell command run when the session ends | _(none)_ |
 | `--config` | Config file path | `~/.config/hypr-rdp/config.toml` |
