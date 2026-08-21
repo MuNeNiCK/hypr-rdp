@@ -52,6 +52,41 @@ pub(super) enum InputCommand {
     SetInitialLayout { candidates: InitialLayoutCandidates },
 }
 
+#[derive(Default)]
+struct DepressedKeys {
+    plain: Vec<u32>,
+    modifiers: Vec<u32>,
+}
+
+impl DepressedKeys {
+    fn press(&mut self, evdev_key: u32, modifier: bool) {
+        let keys = if modifier {
+            &mut self.modifiers
+        } else {
+            &mut self.plain
+        };
+        if !keys.contains(&evdev_key) {
+            keys.push(evdev_key);
+        }
+    }
+
+    fn release(&mut self, evdev_key: u32, modifier: bool) {
+        let keys = if modifier {
+            &mut self.modifiers
+        } else {
+            &mut self.plain
+        };
+        keys.retain(|&key| key != evdev_key);
+    }
+
+    fn release_all(&mut self) -> impl Iterator<Item = u32> + '_ {
+        self.plain
+            .drain(..)
+            .rev()
+            .chain(self.modifiers.drain(..).rev())
+    }
+}
+
 /// Where the actor's virtual-keyboard requests go. The production sink wraps
 /// `zwp_virtual_keyboard_v1`; tests record the calls.
 pub(super) trait KeyboardSink: Send {
@@ -91,6 +126,7 @@ pub(super) fn run_input_actor(
     };
 
     let mut keymap_data = initial_keymap;
+    let mut depressed = DepressedKeys::default();
     if !backend.keymap(&keymap_data) {
         // Without a device keymap every further request is a protocol
         // error; stop loudly instead of running dead.
@@ -117,6 +153,7 @@ pub(super) fn run_input_actor(
                 handle_command(
                     &mut tracker,
                     &mut keymap_data,
+                    &mut depressed,
                     &mut backend,
                     &epoch,
                     command,
@@ -139,6 +176,7 @@ pub(super) fn run_input_actor(
 fn handle_command(
     tracker: &mut KeyboardStateTracker,
     keymap_data: &mut Vec<u8>,
+    depressed: &mut DepressedKeys,
     sink: &mut impl InputBackend,
     epoch: &Instant,
     command: InputCommand,
@@ -146,7 +184,7 @@ fn handle_command(
     let t = epoch.elapsed().as_millis() as u32;
 
     match command {
-        InputCommand::Keyboard(event) => handle_rdp_event(tracker, sink, t, event),
+        InputCommand::Keyboard(event) => handle_rdp_event(tracker, depressed, sink, t, event),
         InputCommand::Mouse(event) => sink.mouse(t, event),
         InputCommand::ApplyKeymap {
             keymap_data: new_keymap,
@@ -280,6 +318,7 @@ fn pick_initial_layout<'a>(
 
 fn handle_rdp_event(
     tracker: &mut KeyboardStateTracker,
+    depressed: &mut DepressedKeys,
     sink: &mut impl KeyboardSink,
     t: u32,
     event: KeyboardEvent,
@@ -288,6 +327,8 @@ fn handle_rdp_event(
         KeyboardEvent::Pressed { code, extended } => {
             if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
                 sink.key(t, evdev_key, true);
+                let modifier = is_modifier(evdev_key);
+                depressed.press(evdev_key, modifier);
                 if tracker.key(evdev_key, true) {
                     sink.modifiers(tracker.modifier_state());
                 }
@@ -299,6 +340,7 @@ fn handle_rdp_event(
         KeyboardEvent::Released { code, extended } => {
             if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
                 sink.key(t, evdev_key, false);
+                depressed.release(evdev_key, is_modifier(evdev_key));
                 if tracker.key(evdev_key, false) {
                     sink.modifiers(tracker.modifier_state());
                 }
@@ -308,7 +350,9 @@ fn handle_rdp_event(
         KeyboardEvent::Synchronize(flags) => {
             // Announce unconditionally: clients send Synchronize on focus,
             // which makes it a periodic repair point for out-of-band device
-            // resets that never fire an activelayout event.
+            // resets that never fire an activelayout event. Release any
+            // tracked key first, then apply locks to the client view.
+            release_depressed(tracker, depressed, sink, t);
             tracker.synchronize_locks(flags);
             sink.modifiers(tracker.modifier_state());
             sink.flush();
@@ -318,11 +362,13 @@ fn handle_rdp_event(
                 if mapping.needs_shift {
                     // 42 = KEY_LEFTSHIFT
                     sink.key(t, 42, true);
+                    depressed.press(42, true);
                     if tracker.key(42, true) {
                         sink.modifiers(tracker.modifier_state());
                     }
                 }
                 sink.key(t, mapping.evdev_key, true);
+                depressed.press(mapping.evdev_key, false);
                 sink.flush();
             } else {
                 tracing::trace!(code_point, "No evdev mapping for Unicode character");
@@ -331,8 +377,10 @@ fn handle_rdp_event(
         KeyboardEvent::UnicodeReleased(code_point) => {
             if let Some(mapping) = tracker.unicode_to_evdev(code_point) {
                 sink.key(t, mapping.evdev_key, false);
+                depressed.release(mapping.evdev_key, false);
                 if mapping.needs_shift {
                     sink.key(t, 42, false);
+                    depressed.release(42, true);
                     if tracker.key(42, false) {
                         sink.modifiers(tracker.modifier_state());
                     }
@@ -341,6 +389,22 @@ fn handle_rdp_event(
             }
         }
     }
+}
+
+fn release_depressed(
+    tracker: &mut KeyboardStateTracker,
+    depressed: &mut DepressedKeys,
+    sink: &mut impl KeyboardSink,
+    t: u32,
+) {
+    for evdev_key in depressed.release_all() {
+        sink.key(t, evdev_key, false);
+        tracker.key(evdev_key, false);
+    }
+}
+
+fn is_modifier(evdev_key: u32) -> bool {
+    matches!(evdev_key, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126)
 }
 
 #[cfg(test)]
@@ -450,9 +514,17 @@ mod tests {
     fn run(tracker: &mut KeyboardStateTracker, commands: Vec<InputCommand>) -> Vec<SinkCall> {
         let mut sink = TestSink::default();
         let mut keymap_data = TEST_KEYMAP.to_vec();
+        let mut depressed = DepressedKeys::default();
         let epoch = Instant::now();
         for command in commands {
-            handle_command(tracker, &mut keymap_data, &mut sink, &epoch, command);
+            handle_command(
+                tracker,
+                &mut keymap_data,
+                &mut depressed,
+                &mut sink,
+                &epoch,
+                command,
+            );
         }
         sink.calls
     }
@@ -588,6 +660,41 @@ mod tests {
     }
 
     #[test]
+    fn synchronize_releases_plain_keys_before_modifiers() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x5b,
+                    extended: true,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1e,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Synchronize(SynchronizeFlags::empty())),
+            ],
+        );
+
+        let releases: Vec<u32> = calls
+            .iter()
+            .filter_map(|call| match call {
+                SinkCall::Key {
+                    evdev_key,
+                    pressed: false,
+                } => Some(*evdev_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(releases, vec![30, 125]);
+        assert!(matches!(
+            calls.iter().rev().find(|call| matches!(call, SinkCall::Modifiers(_))),
+            Some(SinkCall::Modifiers(state)) if state.depressed == 0
+        ));
+    }
+
+    #[test]
     fn locked_layout_switch_sends_modifiers_and_composes_with_toggle() {
         let mut tracker = tracker();
         if !tracker.supports_locked_layout() {
@@ -706,10 +813,12 @@ mod tests {
 
         let mut sink = RejectingKeymapSink::default();
         let mut keymap_data = TEST_KEYMAP.to_vec();
+        let mut depressed = DepressedKeys::default();
         let epoch = Instant::now();
         handle_command(
             &mut tracker,
             &mut keymap_data,
+            &mut depressed,
             &mut sink,
             &epoch,
             InputCommand::ApplyKeymap {
