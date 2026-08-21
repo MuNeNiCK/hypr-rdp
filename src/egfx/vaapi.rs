@@ -1878,7 +1878,7 @@ mod tests {
 
         let stride = (width * 4) as usize;
         let mut frame = vec![0u8; stride * height as usize];
-        for px in frame.chunks_exact_mut(4) {
+        for px in frame.as_chunks_mut::<4>().0 {
             px[0] = 0; // B
             px[1] = 0; // G
             px[2] = 255; // R
