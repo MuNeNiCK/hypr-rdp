@@ -648,6 +648,21 @@ mod tests {
         assert_eq!(args.h264_backend.as_deref(), Some("software"));
     }
 
+    #[test]
+    fn cli_accepts_session_hook_commands() {
+        let args = Args::try_parse_from([
+            "hypr-rdp",
+            "--on-session-start",
+            "start command",
+            "--on-session-end",
+            "end command",
+        ])
+        .unwrap();
+
+        assert_eq!(args.on_session_start.as_deref(), Some("start command"));
+        assert_eq!(args.on_session_end.as_deref(), Some("end command"));
+    }
+
     proptest! {
         #[test]
         fn generated_resolution_parser_rounds_even_dimensions_or_rejects_too_small(

@@ -129,17 +129,20 @@ on_session_end = "hyprctl dispatch dpms on eDP-1"
   command. With `-u`/`-p` set the client must pass NLA first; without
   credentials there is no authentication step, so any client that completes
   the RDP handshake runs the command.
-- Commands run one at a time in session order: each waits for the previous one
-  to finish, for up to 10 seconds. Past that the previous command is left
-  running, the next one starts alongside it, and a warning is logged.
-- Stopping hypr-rdp during a session still runs the end command, so a do/undo
-  pair cannot leave its "do" applied. Shutdown waits for it within the same
-  10-second budget.
+- Configured commands run in session order: each waits for the previous one to
+  finish, for up to 10 seconds. An unconfigured boundary does not release a
+  running command, so a fast reconnect cannot overtake it. Past the deadline
+  the previous command is left running, the next one starts alongside it, and
+  a warning is logged.
+- Stopping hypr-rdp during a session attempts to run the end command and waits
+  for it within the same 10-second budget. A command that fails to start,
+  exits unsuccessfully, or outlives the deadline cannot guarantee that the
+  corresponding start action is undone.
 - Commands run through `/bin/sh -c` as the same user as hypr-rdp, with its
   environment and working directory, so `hyprctl` works but shell profiles are
   not read — use absolute paths for anything outside the inherited `PATH`.
   hypr-rdp never kills a command; one still running at exit is left to the
-  service manager.
+  service manager. Hook command text is not written to hypr-rdp's logs.
 
 Name the monitor when blanking a screen. A bare `hyprctl dispatch dpms off`
 also blanks the `hypr-rdp-*` headless output the session is rendered on, which
