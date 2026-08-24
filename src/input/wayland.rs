@@ -318,6 +318,16 @@ impl HyprInputHandler {
             ClientKeyboardLayoutHandle::new(self.keyboard_layout_policy, Arc::downgrade(commands))
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn test_handler_with_commands(commands: Arc<mpsc::Sender<InputCommand>>) -> Self {
+        Self {
+            keyboard_layout_policy: KeyboardLayoutPolicy::Client,
+            input_commands: Some(commands),
+            actor_thread: None,
+            layout_listener: None,
+        }
+    }
 }
 
 impl Drop for HyprInputHandler {
