@@ -114,7 +114,60 @@ mod tests {
     use crate::input::actor::InputCommand;
     use crate::input::keyboard::KeyboardStateTracker;
     use crate::input::rdp::ClientKeyboardLayoutSink;
+    use crate::input::wayland::HyprInputHandler;
     use crate::input::KeyboardLayoutPolicy;
+    use ironrdp_server::{KeyboardEvent, RdpServerInputHandler};
+
+    #[test]
+    fn keyboard_handler_enqueues_exact_event_order() {
+        let (commands, receiver) = mpsc::channel();
+        let mut handler = HyprInputHandler::test_handler_with_commands(Arc::new(commands));
+
+        handler.keyboard(KeyboardEvent::Pressed {
+            code: 0x5b,
+            extended: true,
+        });
+        handler.keyboard(KeyboardEvent::Pressed {
+            code: 0x5b,
+            extended: true,
+        });
+        handler.keyboard(KeyboardEvent::Released {
+            code: 0x5b,
+            extended: true,
+        });
+
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first"),
+            InputCommand::Keyboard(KeyboardEvent::Pressed {
+                code: 0x5b,
+                extended: true
+            })
+        ));
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second"),
+            InputCommand::Keyboard(KeyboardEvent::Pressed {
+                code: 0x5b,
+                extended: true
+            })
+        ));
+        assert!(matches!(
+            receiver
+                .recv_timeout(Duration::from_secs(1))
+                .expect("third"),
+            InputCommand::Keyboard(KeyboardEvent::Released {
+                code: 0x5b,
+                extended: true
+            })
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "no extra commands may be enqueued"
+        );
+    }
 
     #[test]
     fn client_keyboard_layout_generates_non_us_keymap() {

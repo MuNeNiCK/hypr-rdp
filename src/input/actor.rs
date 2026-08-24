@@ -18,6 +18,7 @@ use super::keymap;
 
 /// How long the actor waits for a command before servicing the transport.
 const SOCKET_PUMP_INTERVAL: Duration = Duration::from_secs(1);
+const LEFT_SHIFT_KEY: u32 = 42;
 
 /// Ordered initial-sync candidates from a compositor devices query:
 /// the main physical keyboard, if any, plus the remaining physical
@@ -56,9 +57,27 @@ pub(super) enum InputCommand {
 struct DepressedKeys {
     plain: Vec<u32>,
     modifiers: Vec<u32>,
+    unicode_shift_owners: Vec<u16>,
 }
 
 impl DepressedKeys {
+    fn holds_modifier(&self, evdev_key: u32) -> bool {
+        self.modifiers.contains(&evdev_key)
+    }
+
+    fn press_unicode_shift(&mut self, code_point: u16) {
+        if !self.unicode_shift_owners.contains(&code_point) {
+            self.unicode_shift_owners.push(code_point);
+        }
+    }
+
+    fn release_unicode_shift(&mut self, code_point: u16) -> bool {
+        let previous_len = self.unicode_shift_owners.len();
+        self.unicode_shift_owners
+            .retain(|&owner| owner != code_point);
+        self.unicode_shift_owners.len() != previous_len
+    }
+
     fn press(&mut self, evdev_key: u32, modifier: bool) {
         let keys = if modifier {
             &mut self.modifiers
@@ -197,6 +216,7 @@ fn handle_command(
                     tracing::warn!(keymap_source, "Keeping previous keymap");
                     return;
                 }
+                release_depressed(tracker, depressed, sink, t);
                 *tracker = new_tracker;
                 *keymap_data = new_keymap;
                 sink.modifiers(tracker.modifier_state());
@@ -326,9 +346,18 @@ fn handle_rdp_event(
     match event {
         KeyboardEvent::Pressed { code, extended } => {
             if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
-                sink.key(t, evdev_key, true);
                 let modifier = is_modifier(evdev_key);
+                if modifier && depressed.holds_modifier(evdev_key) {
+                    tracing::trace!(evdev_key, "Suppressed duplicate modifier press");
+                    return;
+                }
+                let already_active =
+                    evdev_key == LEFT_SHIFT_KEY && !depressed.unicode_shift_owners.is_empty();
                 depressed.press(evdev_key, modifier);
+                if already_active {
+                    return;
+                }
+                sink.key(t, evdev_key, true);
                 if tracker.key(evdev_key, true) {
                     sink.modifiers(tracker.modifier_state());
                 }
@@ -339,8 +368,16 @@ fn handle_rdp_event(
         }
         KeyboardEvent::Released { code, extended } => {
             if let Some(evdev_key) = keymap::xt_to_evdev(code, extended) {
+                let modifier = is_modifier(evdev_key);
+                if modifier && !depressed.holds_modifier(evdev_key) {
+                    tracing::trace!(evdev_key, "Suppressed stray modifier release");
+                    return;
+                }
+                depressed.release(evdev_key, modifier);
+                if evdev_key == LEFT_SHIFT_KEY && !depressed.unicode_shift_owners.is_empty() {
+                    return;
+                }
                 sink.key(t, evdev_key, false);
-                depressed.release(evdev_key, is_modifier(evdev_key));
                 if tracker.key(evdev_key, false) {
                     sink.modifiers(tracker.modifier_state());
                 }
@@ -360,11 +397,14 @@ fn handle_rdp_event(
         KeyboardEvent::UnicodePressed(code_point) => {
             if let Some(mapping) = tracker.unicode_to_evdev(code_point) {
                 if mapping.needs_shift {
-                    // 42 = KEY_LEFTSHIFT
-                    sink.key(t, 42, true);
-                    depressed.press(42, true);
-                    if tracker.key(42, true) {
-                        sink.modifiers(tracker.modifier_state());
+                    let shift_already_active = depressed.holds_modifier(LEFT_SHIFT_KEY)
+                        || !depressed.unicode_shift_owners.is_empty();
+                    depressed.press_unicode_shift(code_point);
+                    if !shift_already_active {
+                        sink.key(t, LEFT_SHIFT_KEY, true);
+                        if tracker.key(LEFT_SHIFT_KEY, true) {
+                            sink.modifiers(tracker.modifier_state());
+                        }
                     }
                 }
                 sink.key(t, mapping.evdev_key, true);
@@ -378,10 +418,13 @@ fn handle_rdp_event(
             if let Some(mapping) = tracker.unicode_to_evdev(code_point) {
                 sink.key(t, mapping.evdev_key, false);
                 depressed.release(mapping.evdev_key, false);
-                if mapping.needs_shift {
-                    sink.key(t, 42, false);
-                    depressed.release(42, true);
-                    if tracker.key(42, false) {
+                if mapping.needs_shift
+                    && depressed.release_unicode_shift(code_point)
+                    && depressed.unicode_shift_owners.is_empty()
+                    && !depressed.holds_modifier(LEFT_SHIFT_KEY)
+                {
+                    sink.key(t, LEFT_SHIFT_KEY, false);
+                    if tracker.key(LEFT_SHIFT_KEY, false) {
                         sink.modifiers(tracker.modifier_state());
                     }
                 }
@@ -397,14 +440,24 @@ fn release_depressed(
     sink: &mut impl KeyboardSink,
     t: u32,
 ) {
+    let unicode_shift_only =
+        !depressed.unicode_shift_owners.is_empty() && !depressed.holds_modifier(LEFT_SHIFT_KEY);
     for evdev_key in depressed.release_all() {
         sink.key(t, evdev_key, false);
         tracker.key(evdev_key, false);
     }
+    if unicode_shift_only {
+        sink.key(t, LEFT_SHIFT_KEY, false);
+        tracker.key(LEFT_SHIFT_KEY, false);
+    }
+    depressed.unicode_shift_owners.clear();
 }
 
 fn is_modifier(evdev_key: u32) -> bool {
-    matches!(evdev_key, 29 | 42 | 54 | 56 | 97 | 100 | 125 | 126)
+    matches!(
+        evdev_key,
+        29 | LEFT_SHIFT_KEY | 54 | 56 | 97 | 100 | 125 | 126
+    )
 }
 
 #[cfg(test)]
@@ -529,6 +582,16 @@ mod tests {
         sink.calls
     }
 
+    fn key_calls(calls: &[SinkCall]) -> Vec<(u32, bool)> {
+        calls
+            .iter()
+            .filter_map(|call| match call {
+                SinkCall::Key { evdev_key, pressed } => Some((*evdev_key, *pressed)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn modifier_key_sends_key_then_modifiers_then_flush() {
         let mut tracker = tracker();
@@ -550,6 +613,176 @@ mod tests {
         ));
         assert!(matches!(calls[1], SinkCall::Modifiers(state) if state.depressed != 0));
         assert_eq!(calls[2], SinkCall::Flush);
+    }
+
+    #[test]
+    fn modifier_repeat_press_is_suppressed_and_single_release_neutralizes() {
+        let mut tracker = tracker();
+        // 0x5B extended = left Super (KEY_LEFTMETA, evdev 125).
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x5b,
+                    extended: true,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x5b,
+                    extended: true,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Released {
+                    code: 0x5b,
+                    extended: true,
+                }),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(key_calls, vec![(125, true), (125, false)]);
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn ordinary_key_repeated_presses_remain_forwarded() {
+        let mut tracker = tracker();
+        // 0x1E = 'A' XT scancode -> evdev 30.
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1e,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1e,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Released {
+                    code: 0x1e,
+                    extended: false,
+                }),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(key_calls, vec![(30, true), (30, true), (30, false)]);
+    }
+
+    #[test]
+    fn stray_modifier_release_is_suppressed() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![InputCommand::Keyboard(KeyboardEvent::Released {
+                code: 0x2a,
+                extended: false,
+            })],
+        );
+
+        assert!(calls.is_empty());
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn unicode_shift_release_keeps_held_physical_shift() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x2a,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::UnicodeReleased('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::Released {
+                    code: 0x2a,
+                    extended: false,
+                }),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![(42, true), (30, true), (30, false), (42, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn physical_shift_release_keeps_unicode_owned_shift() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x2a,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::UnicodeReleased('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::Released {
+                    code: 0x2a,
+                    extended: false,
+                }),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![(42, true), (30, true), (30, false), (42, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn unicode_shift_repeat_press_single_release_neutralizes() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::UnicodeReleased('A' as u16)),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![(42, true), (30, true), (30, true), (30, false), (42, false),]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn unicode_shift_waits_for_all_distinct_owners() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('B' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::UnicodeReleased('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::UnicodeReleased('B' as u16)),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![
+                (42, true),
+                (30, true),
+                (48, true),
+                (30, false),
+                (48, false),
+                (42, false),
+            ]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
     }
 
     #[test]
@@ -692,6 +925,48 @@ mod tests {
             calls.iter().rev().find(|call| matches!(call, SinkCall::Modifiers(_))),
             Some(SinkCall::Modifiers(state)) if state.depressed == 0
         ));
+    }
+
+    #[test]
+    fn synchronize_releases_unicode_owned_shift() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::Synchronize(SynchronizeFlags::empty())),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![(42, true), (30, true), (30, false), (42, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
+    }
+
+    #[test]
+    fn synchronize_releases_shared_physical_and_unicode_shift_once() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x2a,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::Keyboard(KeyboardEvent::Synchronize(SynchronizeFlags::empty())),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![(42, true), (30, true), (30, false), (42, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
     }
 
     #[test]
@@ -1023,6 +1298,45 @@ mod tests {
         assert_eq!(calls[2], SinkCall::Flush);
         // German keymap: 'z' lives on evdev 21.
         assert_eq!(tracker.unicode_to_evdev('z' as u16).unwrap().evdev_key, 21);
+    }
+
+    #[test]
+    fn apply_keymap_releases_modifier_inventory() {
+        let mut tracker = tracker();
+        let german = generate_xkb_keymap_from_names(&XkbKeymapNames {
+            layout: Some("de".into()),
+            ..Default::default()
+        })
+        .expect("German keymap compiles");
+
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x2a,
+                    extended: false,
+                }),
+                InputCommand::ApplyKeymap {
+                    keymap_data: german,
+                    keymap_source: "rdp-client",
+                },
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x2a,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Released {
+                    code: 0x2a,
+                    extended: false,
+                }),
+            ],
+        );
+
+        let key_calls = key_calls(&calls);
+        assert_eq!(
+            key_calls,
+            vec![(42, true), (42, false), (42, true), (42, false)]
+        );
+        assert_eq!(tracker.modifier_state().depressed, 0);
     }
 
     #[test]
