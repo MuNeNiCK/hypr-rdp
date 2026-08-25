@@ -89,14 +89,12 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let clipboard_image = Arc::new(Mutex::new(None::<Vec<u8>>));
         let pending_write = Arc::new(Mutex::new(None::<PendingWrite>));
         let echo_candidate = Arc::new(Mutex::new(None::<ClipboardEchoCandidate>));
-        let suppress = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
         Box::new(HyprCliprdrBackend {
             event_sender: self.event_sender.clone(),
             remote_formats: Vec::new(),
             watcher_thread: None,
-            suppress_watcher: suppress,
             clipboard_data,
             clipboard_image,
             pending_write,
@@ -114,7 +112,6 @@ struct HyprCliprdrBackend {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     remote_formats: Vec<ClipboardFormat>,
     watcher_thread: Option<thread::JoinHandle<()>>,
-    suppress_watcher: Arc<AtomicBool>,
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>, // CF_DIB bytes
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
@@ -318,7 +315,6 @@ impl HyprCliprdrBackend {
                 match ironrdp_cliprdr_format::bitmap::dibv5_to_png(data) {
                     Ok(png_data) => {
                         tracing::trace!(len = png_data.len(), "Clipboard: converted DIBV5 to PNG");
-                        self.suppress_watcher.store(true, Ordering::SeqCst);
                         if let Ok(mut guard) = self.pending_write.lock() {
                             *guard = Some(PendingWrite::Image(png_data));
                         }
@@ -348,7 +344,6 @@ impl HyprCliprdrBackend {
                 match png_result {
                     Ok(png_data) => {
                         tracing::trace!(len = png_data.len(), "Clipboard: converted DIB to PNG");
-                        self.suppress_watcher.store(true, Ordering::SeqCst);
                         if let Ok(mut guard) = self.pending_write.lock() {
                             *guard = Some(PendingWrite::Image(png_data));
                         }
@@ -382,7 +377,6 @@ impl HyprCliprdrBackend {
                     len = normalized.len(),
                     "Clipboard: received text from RDP client"
                 );
-                self.suppress_watcher.store(true, Ordering::SeqCst);
                 if let Ok(mut guard) = self.pending_write.lock() {
                     *guard = Some(PendingWrite::Text(normalized.into_bytes()));
                 }
@@ -402,7 +396,6 @@ impl HyprCliprdrBackend {
             None => return,
         };
 
-        let suppress = Arc::clone(&self.suppress_watcher);
         let clipboard_data = Arc::clone(&self.clipboard_data);
         let clipboard_image = Arc::clone(&self.clipboard_image);
         let pending_write = Arc::clone(&self.pending_write);
@@ -414,7 +407,6 @@ impl HyprCliprdrBackend {
             .spawn(move || {
                 if let Err(e) = clipboard_thread(
                     sender,
-                    suppress,
                     clipboard_data,
                     clipboard_image,
                     pending_write,
@@ -456,7 +448,6 @@ mod tests {
                 event_sender: Some(event_tx),
                 remote_formats: Vec::new(),
                 watcher_thread: None,
-                suppress_watcher: Arc::new(AtomicBool::new(false)),
                 clipboard_data: Arc::new(Mutex::new(None)),
                 clipboard_image: Arc::new(Mutex::new(None)),
                 pending_write: Arc::new(Mutex::new(None)),
@@ -491,7 +482,6 @@ mod tests {
         );
 
         assert!(backend.pending_write.lock().unwrap().is_none());
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -529,7 +519,6 @@ mod tests {
         );
 
         assert!(backend.pending_write.lock().unwrap().is_none());
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -592,7 +581,6 @@ mod tests {
         let _ = recv_clipboard_event(&mut event_rx);
         backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[255, 0, 0, 255]);
     }
 
@@ -796,7 +784,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&[b'o', 0, b'k', 0, 0, 0]));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         let pending = backend.pending_write.lock().unwrap();
         match pending.as_ref().expect("pending write") {
             PendingWrite::Text(data) => assert_eq!(data, b"ok"),
@@ -810,7 +797,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&[b'o', 0, b'k', 0, 0, 0]));
 
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert!(backend.pending_write.lock().unwrap().is_none());
     }
 
@@ -823,7 +809,6 @@ mod tests {
         backend.on_format_data_response(FormatDataResponse::new_data(&[b'o', 0, b'k', 0, 0, 0]));
 
         assert_eq!(backend.last_requested_format, None);
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert!(backend.pending_write.lock().unwrap().is_none());
     }
 
@@ -836,7 +821,6 @@ mod tests {
 
         backend.handle_format_data_response(FormatDataResponse::new_data(&oversized), 4);
 
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         let pending = backend.pending_write.lock().unwrap();
         match pending.as_ref().expect("existing pending write remains") {
@@ -854,7 +838,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dib));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[255, 0, 0]);
     }
@@ -868,7 +851,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[255, 0, 0, 255]);
     }
@@ -883,7 +865,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[17, 34, 51, 127]);
     }
@@ -897,7 +878,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dib));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[17, 34, 51]);
     }
@@ -910,7 +890,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dib));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[255, 0, 0]);
     }
@@ -922,7 +901,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(b"not a dib"));
 
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert!(backend.pending_write.lock().unwrap().is_none());
     }
@@ -944,7 +922,6 @@ mod tests {
 
             if let Some(PendingWrite::Image(png_data)) = backend.pending_write.lock().unwrap().as_ref() {
                 let _ = decode_png(png_data);
-                prop_assert!(backend.suppress_watcher.load(Ordering::SeqCst));
             }
             prop_assert_eq!(backend.last_requested_format, None);
         }
