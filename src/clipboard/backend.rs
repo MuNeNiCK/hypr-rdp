@@ -13,7 +13,9 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::formats::{fix_bitfields_dib, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE};
+use super::formats::{
+    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE,
+};
 use super::wayland::clipboard_thread;
 
 #[derive(Clone, Debug, Default)]
@@ -250,7 +252,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             match data {
                 Some(ref data) if !data.is_empty() => {
                     let text = String::from_utf8_lossy(data);
-                    FormatDataResponse::new_unicode_string(&text).into_owned()
+                    FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
                 }
                 _ => FormatDataResponse::new_error().into_owned(),
             }
@@ -364,14 +366,15 @@ impl HyprCliprdrBackend {
                     return;
                 }
 
-                // Windows rewrites line endings to CRLF; normalize both for
-                // the echo check and for what Wayland applications paste.
-                let normalized = utf8.replace("\r\n", "\n");
+                // Both sides are compared and stored in one shape, so a line
+                // ending can never be the reason our own copy fails to be
+                // recognized coming back.
+                let normalized = normalize_lf(&utf8);
                 if echo_candidate
                     .as_ref()
                     .and_then(|candidate| candidate.text.as_deref())
                     .is_some_and(|announced| {
-                        String::from_utf8_lossy(announced).replace("\r\n", "\n") == normalized
+                        normalize_lf(&String::from_utf8_lossy(announced)) == normalized
                     })
                 {
                     tracing::debug!("Clipboard: client text echoes our own copy, ignoring");
@@ -768,6 +771,123 @@ mod tests {
 
         assert_eq!(backend.last_requested_format, None);
         assert!(event_rx.try_recv().is_err());
+    }
+
+    fn unicode_response_text(data: &[u8]) -> String {
+        let (pairs, _) = data.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let units = units.strip_suffix(&[0]).unwrap_or(&units);
+        String::from_utf16_lossy(units)
+    }
+
+    #[test]
+    fn unicode_text_response_ends_every_line_with_crlf() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        // Wayland applications hand us bare LF; CF_UNICODETEXT is defined as
+        // ending every line with CR-LF, and a Win32 edit control renders the
+        // difference as a single line.
+        *backend.clipboard_data.lock().unwrap() = Some("one\ntwo\nthree".as_bytes().to_vec());
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut event_rx) else {
+            panic!("expected SendFormatData");
+        };
+        assert_eq!(
+            unicode_response_text(response.data()),
+            "one\r\ntwo\r\nthree"
+        );
+    }
+
+    #[test]
+    fn a_client_echo_of_text_we_announced_is_still_recognized() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        // The selection carries a bare LF, as Wayland applications hand it to
+        // each other. It leaves as CRLF, and the client announces it back in
+        // that shape: both sides have to reduce to the same thing, or our own
+        // copy comes back as a foreign one and overwrites the selection we
+        // just published.
+        *backend.clipboard_data.lock().unwrap() = Some(b"first\nsecond".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        // Take the bytes we actually put on the wire rather than assuming their
+        // shape: hand-building the payload here made this test pass with the
+        // conversion reverted, which is the opposite of what it is for.
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        let ClipboardMessage::SendFormatData(sent) = recv_clipboard_event(&mut event_rx) else {
+            panic!("expected the format data response we just produced");
+        };
+        let payload = sent.data().to_vec();
+        // CR and LF as UTF-16LE code units, without the NUL terminator
+        // `utf16le` appends.
+        assert!(
+            payload.windows(4).any(|w| w == [13, 0, 10, 0]),
+            "the wire form should carry CRLF; got {payload:?}"
+        );
+
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(
+            backend.pending_write.lock().unwrap().is_none(),
+            "our own text came back and was written to Wayland as if a client had copied it"
+        );
+    }
+
+    /// Text that actually contains line endings.
+    ///
+    /// `proptest`'s `.` is `[^\n]`, so a `".*"` strategy cannot produce a bare
+    /// LF and therefore cannot produce a CRLF either -- every property about
+    /// line endings written that way passes for any implementation. Measured:
+    /// 20 000 cases of `".{0,50}"` yielded no newline at all.
+    fn text_with_line_endings() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            proptest::sample::select(vec!["a", "b", "\u{444}", " ", "\r\n", "\n", "\r", ""]),
+            0..64,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
+    proptest! {
+        #[test]
+        fn rendering_line_endings_twice_changes_nothing(text in text_with_line_endings()) {
+            prop_assert_eq!(to_crlf(&to_crlf(&text)), to_crlf(&text));
+            // Idempotence is nearly free -- an identity `to_crlf` has it too --
+            // so pin that the first pass does something as well. A bare LF is
+            // the only thing it is supposed to change; text whose LFs are
+            // already paired comes back identical, and rightly so.
+            let bare_lf = text.starts_with('\n')
+                || text
+                    .as_bytes()
+                    .windows(2)
+                    .any(|w| w[1] == b'\n' && w[0] != b'\r');
+            prop_assume!(bare_lf);
+            prop_assert_ne!(to_crlf(&text), text.clone());
+        }
+
+        #[test]
+        fn a_round_trip_through_the_client_reduces_to_the_same_text(text in text_with_line_endings()) {
+            // What we send, normalized back the way an echo is, must equal the
+            // normalized original — this is the invariant the echo check rests on.
+            prop_assert_eq!(normalize_lf(&to_crlf(&text)), normalize_lf(&text));
+            // And it has to get there *through* CRLF: without this the property
+            // degenerates to comparing one expression with itself.
+            let wire = to_crlf(&text);
+            prop_assert!(
+                !wire.as_bytes().windows(2).any(|w| w[1] == b'\n' && w[0] != b'\r')
+                    && !wire.starts_with('\n'),
+                "a bare LF survived onto the wire: {wire:?}"
+            );
+        }
     }
 
     #[test]
