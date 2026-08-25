@@ -173,6 +173,12 @@ impl ConnectionHandler for ClientConnectionHandler {
         _duration: Duration,
         _error: Option<&anyhow::Error>,
     ) -> PostConnectionAction {
+        // Queued before the hooks, since the hooks may run a command of their
+        // own into a session that may still be holding a key down. Source
+        // order is all this buys: the release goes onto the input actor's
+        // channel and the hook onto its own thread, and nothing sequences one
+        // against the other.
+        self.keyboard_layout_sink.release_held_keys();
         if let Some(hooks) = &mut self.session_hooks {
             hooks.session_ended();
         }
@@ -255,6 +261,36 @@ mod tests {
             "start\nend\n"
         );
         std::fs::remove_file(&log).expect("remove hook log");
+    }
+
+    #[test]
+    fn disconnecting_tells_the_input_actor_to_release_held_keys() {
+        use std::sync::{Arc, Mutex};
+
+        struct ReleaseRecordingSink {
+            released: Arc<Mutex<bool>>,
+        }
+
+        impl ClientKeyboardLayoutSink for ReleaseRecordingSink {
+            fn set_keyboard_layout(&self, _keyboard_layout: u32) {}
+            fn release_held_keys(&self) {
+                *self.released.lock().unwrap() = true;
+            }
+        }
+
+        let released = Arc::new(Mutex::new(false));
+        let mut handler = ClientConnectionHandler::new(
+            Box::new(ReleaseRecordingSink {
+                released: Arc::clone(&released),
+            }),
+            None,
+        );
+
+        handler.on_disconnected(test_peer(), Duration::from_secs(1), None);
+
+        // The input actor outlives the connection, so if nobody says the
+        // session ended, a key the client left down stays down.
+        assert!(*released.lock().unwrap());
     }
 
     #[test]

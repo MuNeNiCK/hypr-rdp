@@ -33,6 +33,9 @@ pub(super) enum InputCommand {
     Keyboard(KeyboardEvent),
     /// A mouse event forwarded from the RDP input handler.
     Mouse(MouseEvent),
+    /// The session ended: release anything the client left held. The actor
+    /// outlives a single connection, so nothing else would.
+    ReleaseHeldKeys,
     /// Replace the active keymap (client keyboard layout policy).
     ApplyKeymap {
         keymap_data: Vec<u8>,
@@ -61,6 +64,11 @@ struct DepressedKeys {
 }
 
 impl DepressedKeys {
+    /// Nothing is down, so there is nothing to put up.
+    fn holds_nothing(&self) -> bool {
+        self.plain.is_empty() && self.modifiers.is_empty() && self.unicode_shift_owners.is_empty()
+    }
+
     fn holds_modifier(&self, evdev_key: u32) -> bool {
         self.modifiers.contains(&evdev_key)
     }
@@ -189,6 +197,23 @@ pub(super) fn run_input_actor(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // Shutdown, rather than the end of one session: whatever is still held
+    // has no key-up coming from anywhere. The flush is not optional here --
+    // the loop that used to service the transport has just exited, so an
+    // unflushed release would sit in the buffer and die with the connection.
+    if !depressed.holds_nothing() {
+        let released = release_depressed(
+            &mut tracker,
+            &mut depressed,
+            &mut backend,
+            epoch.elapsed().as_millis() as u32,
+        );
+        backend.modifiers(tracker.modifier_state());
+        backend.flush();
+        tracing::info!(released, "Released keys still held at shutdown");
+    }
+
     tracing::debug!("Input actor stopped");
 }
 
@@ -203,6 +228,25 @@ fn handle_command(
     let t = epoch.elapsed().as_millis() as u32;
 
     match command {
+        // The session ended: whatever the client left down has no key-up
+        // coming, and the actor outlives the connection so nothing else would
+        // send one. `release_depressed` is what a keymap change already uses,
+        // including the synthetic Shift a Unicode keystroke holds.
+        //
+        // The modifier mask has to follow: `key` carries no modifier state of
+        // its own, so releasing Control without re-announcing leaves the
+        // compositor holding it while our tracker says otherwise -- and the
+        // next session's plain keystrokes arrive as Control chords.
+        InputCommand::ReleaseHeldKeys if depressed.holds_nothing() => {}
+        InputCommand::ReleaseHeldKeys => {
+            let released = release_depressed(tracker, depressed, sink, t);
+            sink.modifiers(tracker.modifier_state());
+            sink.flush();
+            // The only record that this happened. Once the session is over the
+            // server cannot read compositor key state back, so without this
+            // line neither a bug report nor we can tell the fix from a no-op.
+            tracing::info!(released, "Released keys the client left held");
+        }
         InputCommand::Keyboard(event) => handle_rdp_event(tracker, depressed, sink, t, event),
         InputCommand::Mouse(event) => sink.mouse(t, event),
         InputCommand::ApplyKeymap {
@@ -434,23 +478,29 @@ fn handle_rdp_event(
     }
 }
 
+/// Returns how many key-ups it sent, since the caller cannot count them: the
+/// synthetic Shift a Unicode keystroke holds is not in `plain` or `modifiers`.
 fn release_depressed(
     tracker: &mut KeyboardStateTracker,
     depressed: &mut DepressedKeys,
     sink: &mut impl KeyboardSink,
     t: u32,
-) {
+) -> usize {
     let unicode_shift_only =
         !depressed.unicode_shift_owners.is_empty() && !depressed.holds_modifier(LEFT_SHIFT_KEY);
+    let mut released = 0;
     for evdev_key in depressed.release_all() {
         sink.key(t, evdev_key, false);
         tracker.key(evdev_key, false);
+        released += 1;
     }
     if unicode_shift_only {
         sink.key(t, LEFT_SHIFT_KEY, false);
         tracker.key(LEFT_SHIFT_KEY, false);
+        released += 1;
     }
     depressed.unicode_shift_owners.clear();
+    released
 }
 
 fn is_modifier(evdev_key: u32) -> bool {
@@ -502,6 +552,324 @@ mod tests {
         fn mouse(&mut self, _time: u32, _event: MouseEvent) {
             self.calls.push(SinkCall::Mouse);
         }
+    }
+
+    /// Records into a handle the test keeps after the actor consumes the sink.
+    struct SharedSink {
+        calls: Arc<std::sync::Mutex<Vec<SinkCall>>>,
+    }
+
+    impl KeyboardSink for SharedSink {
+        fn key(&mut self, _time: u32, evdev_key: u32, pressed: bool) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(SinkCall::Key { evdev_key, pressed });
+        }
+        fn modifiers(&mut self, state: KeyboardModifierState) {
+            self.calls.lock().unwrap().push(SinkCall::Modifiers(state));
+        }
+        fn keymap(&mut self, keymap_data: &[u8]) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(SinkCall::Keymap(keymap_data.len()));
+            true
+        }
+        fn flush(&mut self) {
+            self.calls.lock().unwrap().push(SinkCall::Flush);
+        }
+    }
+
+    impl InputBackend for SharedSink {
+        fn mouse(&mut self, _time: u32, _event: MouseEvent) {
+            self.calls.lock().unwrap().push(SinkCall::Mouse);
+        }
+    }
+
+    /// The count in the log line has to include the synthetic Shift a Unicode
+    /// keystroke holds: it lives in `unicode_shift_owners`, not in `plain` or
+    /// `modifiers`, so counting the tracked sets instead under-reports by one.
+    #[test]
+    fn the_release_count_is_the_number_of_key_ups_sent() {
+        let cases: Vec<Vec<KeyboardEvent>> = vec![
+            vec![KeyboardEvent::Pressed {
+                code: 0x1c,
+                extended: false,
+            }],
+            vec![KeyboardEvent::UnicodePressed('A' as u16)],
+            vec![
+                KeyboardEvent::Pressed {
+                    code: 0x1d,
+                    extended: false,
+                },
+                KeyboardEvent::UnicodePressed('A' as u16),
+            ],
+        ];
+
+        for events in cases {
+            let mut tracker = tracker();
+            let mut depressed = DepressedKeys::default();
+            let mut sink = TestSink::default();
+            for event in events {
+                handle_rdp_event(&mut tracker, &mut depressed, &mut sink, 0, event);
+            }
+            sink.calls.clear();
+
+            let released = release_depressed(&mut tracker, &mut depressed, &mut sink, 0);
+
+            let ups = sink
+                .calls
+                .iter()
+                .filter(|call| matches!(call, SinkCall::Key { pressed: false, .. }))
+                .count();
+            assert_eq!(released, ups);
+            assert!(released > 0);
+        }
+    }
+
+    #[test]
+    fn the_session_ending_releases_what_the_client_left_held() {
+        let mut tracker = tracker();
+        // Enter down, then the session ends without its key-up.
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1c,
+                    extended: false,
+                }),
+                InputCommand::ReleaseHeldKeys,
+            ],
+        );
+
+        // 0x1C is Enter's XT scancode; evdev calls it 28.
+        assert!(
+            calls.contains(&SinkCall::Key {
+                evdev_key: 28,
+                pressed: false
+            }),
+            "the actor outlives the connection, so nothing else would release \
+             it and whatever has focus keeps repeating it: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn releasing_a_modifier_re_announces_the_modifier_mask() {
+        let mut tracker = tracker();
+        // 0x1D = Left Control. `key` carries no modifier state, so a release
+        // without a following `modifiers` leaves the compositor holding
+        // Control while our tracker says it is up -- and the next session's
+        // plain keystrokes land as Control chords.
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1d,
+                    extended: false,
+                }),
+                InputCommand::ReleaseHeldKeys,
+            ],
+        );
+
+        let last_mask = calls
+            .iter()
+            .rev()
+            .find_map(|call| match call {
+                SinkCall::Modifiers(state) => Some(*state),
+                _ => None,
+            })
+            .expect("a modifier mask should have been announced");
+        assert_eq!(
+            last_mask,
+            KeyboardModifierState::default(),
+            "the mask announced after the release still holds a modifier: {calls:?}"
+        );
+        assert!(
+            matches!(calls.last(), Some(SinkCall::Flush)),
+            "the release has to reach the compositor, not sit in the buffer: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_unicode_keystroke_does_not_leave_shift_held_at_session_end() {
+        let mut tracker = tracker();
+        // A capital letter is sent as a Unicode keystroke, and the Shift it
+        // needs is held by the actor rather than by the client -- it lives in
+        // `unicode_shift_owners`, not in `plain` or `modifiers`, so draining
+        // those alone leaves it down.
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::ReleaseHeldKeys,
+            ],
+        );
+
+        assert!(
+            calls.contains(&SinkCall::Key {
+                evdev_key: LEFT_SHIFT_KEY,
+                pressed: true
+            }),
+            "the capital should have pressed Shift: {calls:?}"
+        );
+        assert!(
+            calls.contains(&SinkCall::Key {
+                evdev_key: LEFT_SHIFT_KEY,
+                pressed: false
+            }),
+            "and the session ending must let it go again: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_connection_that_held_nothing_says_nothing_to_the_compositor() {
+        let mut tracker = tracker();
+        // Every accepted connection reaches the session-end path, including a
+        // port scan or a failed login that never pressed a key. Announcing a
+        // modifier mask at the compositor for those is noise at best.
+        let calls = run(&mut tracker, vec![InputCommand::ReleaseHeldKeys]);
+
+        assert!(
+            calls.is_empty(),
+            "an empty release still touched the compositor: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_release_signal_touches_the_compositor_not_at_all() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1c,
+                    extended: false,
+                }),
+                InputCommand::ReleaseHeldKeys,
+                InputCommand::ReleaseHeldKeys,
+            ],
+        );
+
+        // Two signals, one release: counting only key-ups would let the second
+        // signal announce a mask and flush unnoticed, which is what the guard
+        // is for.
+        let count = |want: fn(&SinkCall) -> bool| calls.iter().filter(|c| want(c)).count();
+        assert_eq!(
+            count(|c| matches!(c, SinkCall::Key { pressed: false, .. })),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(
+            count(|c| matches!(c, SinkCall::Modifiers(_))),
+            1,
+            "the second signal announced a mask of its own: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn a_shutdown_with_nothing_held_says_nothing_to_the_compositor() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames::default())
+            .expect("default keymap compiles");
+        let (commands, receiver) = mpsc::channel();
+        drop(commands);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_input_actor(
+            receiver,
+            keymap,
+            "test",
+            Instant::now(),
+            SharedSink {
+                calls: Arc::clone(&calls),
+            },
+        );
+
+        // The same guard the session-end path has. A server that stops without
+        // a client ever pressing anything has nothing to put up.
+        // The actor announces one mask and flushes at startup and nothing else
+        // happens here, so those counts are the whole trace. Without the guard
+        // the shutdown adds a second mask and a second flush.
+        let calls = calls.lock().unwrap();
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, SinkCall::Key { .. })),
+            "an empty shutdown released something: {calls:?}"
+        );
+        let count = |want: fn(&SinkCall) -> bool| calls.iter().filter(|c| want(c)).count();
+        assert_eq!(
+            count(|c| matches!(c, SinkCall::Modifiers(_))),
+            1,
+            "{calls:?}"
+        );
+        assert_eq!(count(|c| matches!(c, SinkCall::Flush)), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn a_key_still_held_when_the_client_goes_away_is_released() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames::default())
+            .expect("default keymap compiles");
+        let (commands, receiver) = mpsc::channel();
+        // Enter goes down and the client disappears before its key-up: exactly
+        // what happens when the keystroke is what ended the session.
+        commands
+            .send(InputCommand::Keyboard(KeyboardEvent::Pressed {
+                code: 0x1c,
+                extended: false,
+            }))
+            .unwrap();
+        drop(commands);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_input_actor(
+            receiver,
+            keymap,
+            "test",
+            Instant::now(),
+            SharedSink {
+                calls: Arc::clone(&calls),
+            },
+        );
+
+        // 0x1C is Enter's XT scancode; evdev calls it 28.
+        let calls = calls.lock().unwrap();
+        assert!(
+            calls.contains(&SinkCall::Key {
+                evdev_key: 28,
+                pressed: true
+            }),
+            "the press itself should have reached the compositor: {calls:?}"
+        );
+        assert!(
+            calls.contains(&SinkCall::Key {
+                evdev_key: 28,
+                pressed: false
+            }),
+            "a key left down when the session ends keeps repeating in the \
+             client that has focus until something releases it: {calls:?}"
+        );
+        // The loop that serviced the transport has exited by now, so an
+        // unflushed release would sit in the buffer and die with the
+        // connection -- "sent" and "queued" are not the same thing here.
+        assert!(
+            matches!(calls.last(), Some(SinkCall::Flush)),
+            "the release must be flushed on the way out: {calls:?}"
+        );
+        // And the mask has to follow the release here too, for the same reason
+        // it does on the session-end path: `key` carries no modifier state.
+        // Position, not presence -- the actor announces a mask at startup as
+        // well, so merely finding one proves nothing.
+        let last_release = calls
+            .iter()
+            .rposition(|call| matches!(call, SinkCall::Key { pressed: false, .. }));
+        let last_mask = calls
+            .iter()
+            .rposition(|call| matches!(call, SinkCall::Modifiers(_)));
+        assert!(
+            last_mask > last_release,
+            "the mask announced last predates the release: {calls:?}"
+        );
     }
 
     /// A backend whose device rejects every keymap announcement.

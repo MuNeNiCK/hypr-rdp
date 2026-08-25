@@ -25,6 +25,11 @@ impl RdpServerInputHandler for HyprInputHandler {
 /// command; the connection layer must not depend on `InputCommand`.
 pub(crate) trait ClientKeyboardLayoutSink: Send {
     fn set_keyboard_layout(&self, keyboard_layout: u32);
+
+    /// The session ended: release anything the client left held. The input
+    /// actor outlives a single connection, so its own shutdown release comes
+    /// far too late for this. Default is a no-op so test sinks need not care.
+    fn release_held_keys(&self) {}
 }
 
 /// Production `ClientKeyboardLayoutSink` owned by the input module: applies
@@ -48,6 +53,15 @@ impl ClientKeyboardLayoutHandle {
 }
 
 impl ClientKeyboardLayoutSink for ClientKeyboardLayoutHandle {
+    fn release_held_keys(&self) {
+        let Some(commands) = self.commands.upgrade() else {
+            return;
+        };
+        if commands.send(InputCommand::ReleaseHeldKeys).is_err() {
+            tracing::warn!("Input actor is gone; keys held at session end stay held");
+        }
+    }
+
     fn set_keyboard_layout(&self, keyboard_layout: u32) {
         let Some(keymap_data) =
             client_keymap_from_keyboard_layout(self.keyboard_layout_policy, keyboard_layout)
@@ -192,6 +206,40 @@ mod tests {
             client_keymap_from_keyboard_layout(KeyboardLayoutPolicy::Compositor, 0x00000407,)
                 .is_none()
         );
+    }
+
+    #[test]
+    fn client_keyboard_layout_handle_sends_release_held_keys() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle = ClientKeyboardLayoutHandle::new(
+            KeyboardLayoutPolicy::Client,
+            Arc::downgrade(&commands),
+        );
+
+        handle.release_held_keys();
+
+        // The trait supplies a do-nothing default, so an override that never
+        // reached the channel would compile and look invoked from the
+        // connection handler's side while releasing nothing at all.
+        let command = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the end of a session must reach the input actor");
+        assert!(matches!(command, InputCommand::ReleaseHeldKeys));
+    }
+
+    #[test]
+    fn release_held_keys_does_not_keep_the_input_actor_alive() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle = ClientKeyboardLayoutHandle::new(
+            KeyboardLayoutPolicy::Client,
+            Arc::downgrade(&commands),
+        );
+        drop(commands);
+        drop(receiver);
+
+        handle.release_held_keys();
     }
 
     #[test]
