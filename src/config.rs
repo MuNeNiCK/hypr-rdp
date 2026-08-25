@@ -188,6 +188,57 @@ pub struct RuntimeConfig {
     pub on_session_end: Option<String>,
 }
 
+/// What the operator should be told about this configuration at startup.
+#[derive(Debug, PartialEq, Eq)]
+enum StartupWarning {
+    /// Nothing authenticates the client.
+    AuthenticationOff,
+    /// Listening somewhere other than this machine with an empty password,
+    /// whether or not a username is set.
+    ReachableBeyondLoopback,
+    /// A username without a password, or the other way round.
+    HalfCredentials,
+}
+
+/// Decide what to warn about, using the same rule the server uses to decide
+/// whether it authenticates at all.
+///
+/// The server treats credentials as configured unless *both* halves are empty
+/// (`credentials_from_config`), so a username with no password does enable
+/// NLA — matching an empty password. Warning "no credentials set" there said
+/// the opposite of what the server was about to do.
+///
+/// Exposure is about reachability rather than a wildcard address: `0.0.0.0`,
+/// `[::]`, an IPv4-mapped wildcard and a plain LAN address are all reachable by
+/// somebody else, and only loopback is not. An address that does not parse is
+/// reported for real when the server binds it.
+///
+/// Exposure follows the empty *password*, not the missing pair. A username with
+/// no password is treated as configured, so `security_mode_for_credentials`
+/// picks Hybrid and the server runs NLA against a blank secret -- reachable
+/// from the LAN, that is the same exposure as no credentials at all, with a
+/// username in front of it. The other half-set shape is not: an empty username
+/// with a password set still has a secret to guess.
+fn startup_warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
+    let mut warnings = Vec::new();
+    let authenticates = !(username.is_empty() && password.is_empty());
+
+    if !authenticates {
+        warnings.push(StartupWarning::AuthenticationOff);
+    } else if username.is_empty() || password.is_empty() {
+        warnings.push(StartupWarning::HalfCredentials);
+    }
+
+    let beyond_loopback = bind
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|addr| !addr.ip().is_loopback());
+    if password.is_empty() && beyond_loopback {
+        warnings.push(StartupWarning::ReachableBeyondLoopback);
+    }
+
+    warnings
+}
+
 impl RuntimeConfig {
     pub fn load() -> anyhow::Result<Self> {
         let args = Args::parse();
@@ -202,12 +253,18 @@ impl RuntimeConfig {
         let username = args.username.or(config.username).unwrap_or_default();
         let password = args.password.or(config.password).unwrap_or_default();
 
-        if username.is_empty() || password.is_empty() {
-            tracing::warn!(
-                "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
-            );
-            if bind.starts_with("0.0.0.0") {
-                tracing::warn!("Binding to all interfaces without credentials is a security risk.");
+        for warning in startup_warnings(&username, &password, &bind) {
+            match warning {
+                StartupWarning::AuthenticationOff => tracing::warn!(
+                    "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
+                ),
+                StartupWarning::ReachableBeyondLoopback => tracing::warn!(
+                    bind = %bind,
+                    "Reachable beyond loopback with an empty password: the only thing between the port and the session is the username."
+                ),
+                StartupWarning::HalfCredentials => tracing::warn!(
+                    "Only one half of the credentials is set; the other one is matched as empty."
+                ),
             }
         }
 
@@ -424,6 +481,79 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+
+    use StartupWarning::*;
+
+    #[test]
+    fn without_credentials_reachability_decides_the_second_warning() {
+        // Every one of these is reachable by somebody else, wildcard or not —
+        // the IPv4-mapped wildcard is the one a prefix test misses.
+        for bind in [
+            "0.0.0.0:3389",
+            "[::]:3389",
+            "[::ffff:0.0.0.0]:3389",
+            "192.168.1.5:3389",
+        ] {
+            assert_eq!(
+                startup_warnings("", "", bind),
+                vec![AuthenticationOff, ReachableBeyondLoopback],
+                "{bind} is reachable from outside this machine"
+            );
+        }
+
+        for bind in ["127.0.0.1:3389", "[::1]:3389"] {
+            assert_eq!(
+                startup_warnings("", "", bind),
+                vec![AuthenticationOff],
+                "{bind} is this machine only"
+            );
+        }
+    }
+
+    #[test]
+    fn half_the_credentials_is_reported_as_such_not_as_none() {
+        // The server enables NLA whenever either half is set and matches the
+        // missing one as empty, so "no credentials set" would say the opposite
+        // of what it is about to do.
+        //
+        // The two shapes are not equally exposed, and the difference is the
+        // password. A username with none is NLA against a blank secret: on a
+        // wildcard bind that is the same open port as no credentials at all,
+        // so it earns the exposure warning too. An empty username with a
+        // password set still has a secret in front of it, and does not.
+        assert_eq!(
+            startup_warnings("user", "", "0.0.0.0:3389"),
+            vec![HalfCredentials, ReachableBeyondLoopback]
+        );
+        assert_eq!(
+            startup_warnings("", "secret", "0.0.0.0:3389"),
+            vec![HalfCredentials]
+        );
+    }
+
+    /// The exposure warning follows the empty password, not the missing pair.
+    /// Bound to loopback the same blank secret is not reachable by anyone else,
+    /// so only the half-set warning is due.
+    #[test]
+    fn an_empty_password_on_loopback_is_not_reported_as_exposure() {
+        assert_eq!(
+            startup_warnings("user", "", "127.0.0.1:3389"),
+            vec![HalfCredentials]
+        );
+    }
+
+    #[test]
+    fn a_configured_pair_warns_about_nothing() {
+        assert!(startup_warnings("user", "secret", "0.0.0.0:3389").is_empty());
+    }
+
+    #[test]
+    fn an_unparsable_bind_is_left_to_the_server_to_report() {
+        assert_eq!(
+            startup_warnings("", "", "not an address"),
+            vec![AuthenticationOff]
+        );
+    }
     use super::*;
     use proptest::prelude::*;
     use std::fs;
