@@ -40,6 +40,35 @@ pub(crate) struct VppDmaBufInfo {
 /// moved would go unnoticed. This is checked when this crate compiles.
 const _: () = assert!(std::mem::size_of::<va::VAProcPipelineParameterBuffer>() == 224);
 
+/// Terminates a VA display unless the converter it belongs to is built.
+///
+/// `vaInitialize` has to be paired with `vaTerminate`, and `VppConverter::drop`
+/// only runs once `Self` exists -- so every `?` on the way there used to leave a
+/// display behind. A DMA-BUF setup failure falls back to SHM for the rest of
+/// that capture run rather than retrying, so the leak was one display per
+/// capture-session start that reached this path: a new client, or a session the
+/// supervisor restarts for a geometry change.
+struct VaDisplayGuard(VADisplay);
+
+impl VaDisplayGuard {
+    /// Hand the display to whoever will terminate it from now on.
+    ///
+    /// The only way to get the display back out, so the success path cannot
+    /// forget to disarm the guard and the guard cannot be disarmed without
+    /// somewhere for the display to go.
+    fn into_display(self) -> VADisplay {
+        let display = self.0;
+        std::mem::forget(self);
+        display
+    }
+}
+
+impl Drop for VaDisplayGuard {
+    fn drop(&mut self) {
+        unsafe { va::vaTerminate(self.0) };
+    }
+}
+
 /// VA-API VPP color converter: XRGB DMA-BUF -> NV12 DMA-BUF.
 pub struct VppConverter {
     va_display: VADisplay,
@@ -69,6 +98,11 @@ impl VppConverter {
         if va_display.is_null() {
             bail!("vaGetDisplayDRM returned NULL for VPP");
         }
+        // From here, not from after vaInitialize: a display that fails to
+        // initialize still has to be terminated, and on a node with no usable
+        // driver that is the failure that recurs.
+        let display_guard = VaDisplayGuard(va_display);
+
         let mut major = 0i32;
         let mut minor = 0i32;
         va_check(
@@ -146,7 +180,9 @@ impl VppConverter {
         );
 
         Ok(Self {
-            va_display,
+            // The converter owns the display from here; its own Drop
+            // terminates it.
+            va_display: display_guard.into_display(),
             config_id,
             context_id,
             input_surfaces: Vec::new(),
