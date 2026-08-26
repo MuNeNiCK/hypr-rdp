@@ -22,9 +22,8 @@ pub(super) struct ClipboardEchoCandidate {
     cf_dib: Option<Vec<u8>>,
 }
 
-/// Sends one locally originated format list and snapshots the exact data it
-/// advertised. The snapshot is eligible for only the next remote copy, which
-/// keeps content-based echo detection from overriding later ownership changes.
+/// Sends one locally originated format list and snapshots its advertised data.
+/// The snapshot is eligible for the next remote paste request only.
 pub(super) fn announce_local_formats(
     event_sender: &mpsc::UnboundedSender<ServerEvent>,
     echo_candidate: &Arc<Mutex<Option<ClipboardEchoCandidate>>>,
@@ -206,7 +205,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
-        self.pending_echo_candidate = self
+        let echo_candidate = self
             .echo_candidate
             .lock()
             .ok()
@@ -233,14 +232,24 @@ impl CliprdrBackend for HyprCliprdrBackend {
             None
         };
 
-        self.last_requested_format = format;
+        let Some(format) = format else {
+            self.last_requested_format = None;
+            self.pending_echo_candidate = None;
+            return;
+        };
 
-        if let Some(fmt) = format {
-            if let Some(ref sender) = self.event_sender {
-                let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
-                    fmt,
-                )));
-            }
+        // Format Data Responses carry no request ID. Keep one request state for
+        // repeated announcements that select the same format.
+        if self.last_requested_format == Some(format) {
+            return;
+        }
+
+        self.last_requested_format = Some(format);
+        self.pending_echo_candidate = echo_candidate;
+        if let Some(ref sender) = self.event_sender {
+            let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                format,
+            )));
         }
     }
 
@@ -492,6 +501,63 @@ mod tests {
 
         assert!(backend.pending_write.lock().unwrap().is_none());
         assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn a_format_list_we_do_not_request_does_not_strand_the_candidate() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::new(0x8000))]);
+
+        assert!(backend.pending_echo_candidate.is_none());
+        assert!(backend.last_requested_format.is_none());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn duplicate_format_list_reuses_the_outstanding_echo_request() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            recv_clipboard_event(&mut event_rx),
+            ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+        ));
+
+        backend.on_remote_copy(&formats);
+        assert!(event_rx.try_recv().is_err());
+
+        let payload = utf16le("hello\r\nworld");
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(backend.pending_write.lock().unwrap().is_none());
+        assert!(backend.last_requested_format.is_none());
+        assert!(backend.pending_echo_candidate.is_none());
+
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            recv_clipboard_event(&mut event_rx),
+            ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+        ));
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(matches!(
+            backend.pending_write.lock().unwrap().as_ref(),
+            Some(PendingWrite::Text(text)) if text == b"hello\nworld"
+        ));
     }
 
     #[test]
