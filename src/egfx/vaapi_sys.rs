@@ -9,7 +9,7 @@ use libva_sys::va_display_drm as va;
 
 pub(crate) use va::{
     VABufferID, VAConfigAttrib, VAConfigID, VAContextID, VADisplay, VAEntrypoint, VAImage,
-    VAImageFormat, VAProfile, VARectangle, VAStatus, VASurfaceAttrib, VASurfaceID,
+    VAImageFormat, VAProfile, VAStatus, VASurfaceAttrib, VASurfaceID,
 };
 
 #[repr(C)]
