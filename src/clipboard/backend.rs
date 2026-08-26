@@ -23,8 +23,16 @@ pub(super) struct ClipboardEchoCandidate {
 }
 
 /// Sends one locally originated format list and snapshots the exact data it
-/// advertised. The snapshot is eligible for only the next remote copy, which
-/// keeps content-based echo detection from overriding later ownership changes.
+/// advertised.
+///
+/// The snapshot lives no longer than a data request that is still outstanding:
+/// it survives further format lists for the same copy -- a clipboard manager
+/// that re-takes the selection makes one copy announce twice, and the client
+/// answers each announcement -- but it is dropped the moment a format list
+/// arrives that we do not request data for, since nothing would come back to
+/// consume it. That bound replaces the one this comment used to promise --
+/// eligibility for only the next remote copy -- which a clipboard manager's
+/// second announcement broke.
 pub(super) fn announce_local_formats(
     event_sender: &mpsc::UnboundedSender<ServerEvent>,
     echo_candidate: &Arc<Mutex<Option<ClipboardEchoCandidate>>>,
@@ -206,11 +214,22 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
-        self.pending_echo_candidate = self
+        // Take the armed candidate, but never overwrite one we are still
+        // holding with nothing. One local copy commonly produces more than one
+        // announcement -- a clipboard manager that re-takes ownership of the
+        // selection is enough -- and the client answers each with its own
+        // format list. The first of those moves the candidate here; assigning
+        // unconditionally let the second replace it with None, so the data
+        // response that followed had nothing to compare against and our own
+        // text came back around as if the client had typed it.
+        if let Some(candidate) = self
             .echo_candidate
             .lock()
             .ok()
-            .and_then(|mut candidate| candidate.take());
+            .and_then(|mut candidate| candidate.take())
+        {
+            self.pending_echo_candidate = Some(candidate);
+        }
 
         let has_unicode = available_formats
             .iter()
@@ -241,6 +260,12 @@ impl CliprdrBackend for HyprCliprdrBackend {
                     fmt,
                 )));
             }
+        } else {
+            // Nothing was requested, so no response is coming to consume the
+            // candidate. Holding it would let it outlive the copy it belongs
+            // to -- a file list from the client is enough -- and swallow a
+            // genuinely new copy of the same text much later.
+            self.pending_echo_candidate = None;
         }
     }
 
@@ -492,6 +517,90 @@ mod tests {
 
         assert!(backend.pending_write.lock().unwrap().is_none());
         assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
+    }
+
+    /// The candidate and `last_requested_format` name the same outstanding
+    /// request, so neither may be armed without the other. That equivalence is
+    /// the bound: the response takes both, and a format list we request nothing
+    /// for clears both. Drift either way strands one of them.
+    #[test]
+    fn the_candidate_is_armed_exactly_when_a_request_is_outstanding() {
+        let cases: Vec<Vec<u16>> = vec![
+            vec![0x000D],         // CF_UNICODETEXT
+            vec![0x0011],         // CF_DIBV5
+            vec![0x0008],         // CF_DIB
+            vec![0x8000],         // a file list: we request none of it
+            vec![0x8000, 0x8001], // several, still none of them ours
+            vec![],
+        ];
+
+        for ids in cases {
+            let (mut backend, mut event_rx) = backend_with_events();
+            *backend.clipboard_data.lock().unwrap() = Some(b"hello".to_vec());
+            backend.on_request_format_list();
+            let _ = recv_clipboard_event(&mut event_rx);
+
+            // Twice, because one local copy commonly announces more than once
+            // and the second answer is what used to clear the candidate.
+            let list: Vec<ClipboardFormat> = ids
+                .iter()
+                .map(|id| ClipboardFormat::new(ClipboardFormatId::new(*id as u32)))
+                .collect();
+            backend.on_remote_copy(&list);
+            backend.on_remote_copy(&list);
+
+            assert_eq!(
+                backend.pending_echo_candidate.is_some(),
+                backend.last_requested_format.is_some(),
+                "candidate and outstanding request disagree for formats {ids:04x?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_list_we_do_not_request_does_not_strand_the_candidate() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        // A file list, say. We request none of these, so no data response is
+        // coming -- and a candidate kept past this point outlives its copy and
+        // discards a genuinely new client copy of the same text later on.
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::new(0x8000))]);
+
+        assert!(backend.pending_echo_candidate.is_none());
+    }
+
+    #[test]
+    fn a_second_format_list_does_not_disarm_the_echo_candidate() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        // One local copy commonly announces more than once -- a clipboard
+        // manager that re-takes ownership of the selection is enough -- and the
+        // client answers every announcement with a format list of its own. The
+        // first of those takes the candidate; the second must not replace it
+        // with nothing, or the data response that follows has nothing to
+        // compare against.
+        for _ in 0..2 {
+            backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
+            let _ = recv_clipboard_event(&mut event_rx);
+        }
+
+        let payload = utf16le("hello\r\nworld");
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(
+            backend.pending_write.lock().unwrap().is_none(),
+            "our own text came back around and was written to Wayland as though \
+             the client had copied it"
+        );
     }
 
     #[test]
