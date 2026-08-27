@@ -12,7 +12,7 @@ use ironrdp_server::{
 use crate::audio::{AudioMode, HyprSoundFactory};
 use crate::capture::{HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
-use crate::config::RuntimeConfig;
+use crate::config::{ConfigCredentials, RuntimeConfig};
 use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::{HyprInputHandler, RdpInputSessionSink, SharedOutputLayout};
 
@@ -31,8 +31,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         bind,
         cert,
         key,
-        username,
-        password,
+        credentials,
         resolution,
         capture_mode,
         bitrate,
@@ -50,7 +49,6 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         on_session_end,
     } = config;
 
-    let addr = parse_bind_addr(&bind)?;
     let egfx_shared = Arc::new(EgfxShared::with_codec_policy(
         max_frames_in_flight,
         egfx_codec,
@@ -86,7 +84,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let sound_factory = sound_factory_for_audio_mode(audio_mode);
     let session_hooks = session_hooks_from_config(on_session_start, on_session_end);
 
-    let builder = RdpServer::builder().with_addr(addr);
+    let builder = RdpServer::builder().with_addr(bind);
 
     let (cert_path, key_path) = tls::resolve_tls_paths(cert.as_deref(), key.as_deref())?;
 
@@ -96,7 +94,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .make_acceptor()
         .context("failed to create TLS acceptor")?;
 
-    let credentials = credentials_from_config(&username, &password);
+    let credentials = ironrdp_credentials(credentials);
     let secured_builder = match security_mode_for_credentials(&credentials) {
         ServerSecurityMode::Tls => builder.with_tls(acceptor),
         ServerSecurityMode::Hybrid => builder.with_hybrid(acceptor, tls_ctx.pub_key),
@@ -116,7 +114,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
 
     server.set_credentials(credentials);
 
-    tracing::info!("RDP server configured for {}", addr);
+    tracing::info!("RDP server configured for {}", bind);
 
     Ok(ServerContext {
         server,
@@ -181,16 +179,12 @@ impl ConnectionHandler for ClientConnectionHandler {
     }
 }
 
-fn credentials_from_config(username: &str, password: &str) -> Option<Credentials> {
-    if username.is_empty() && password.is_empty() {
-        None
-    } else {
-        Some(Credentials {
-            username: username.to_string(),
-            password: password.to_string(),
-            domain: None,
-        })
-    }
+fn ironrdp_credentials(credentials: Option<ConfigCredentials>) -> Option<Credentials> {
+    credentials.map(|credentials| Credentials {
+        username: credentials.username,
+        password: credentials.password,
+        domain: None,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,10 +199,6 @@ fn security_mode_for_credentials(credentials: &Option<Credentials>) -> ServerSec
     } else {
         ServerSecurityMode::Tls
     }
-}
-
-fn parse_bind_addr(bind: &str) -> Result<SocketAddr> {
-    bind.parse().context("invalid bind address")
 }
 
 #[cfg(test)]
@@ -318,44 +308,27 @@ mod tests {
     }
 
     #[test]
-    fn empty_username_and_password_disable_authentication() {
-        assert!(credentials_from_config("", "").is_none());
-    }
-
-    #[test]
-    fn non_empty_username_or_password_enables_authentication() {
-        let with_both = credentials_from_config("user", "pass").expect("credentials");
-        assert_eq!(with_both.username, "user");
-        assert_eq!(with_both.password, "pass");
-        assert_eq!(with_both.domain, None);
-
-        let with_username = credentials_from_config("user", "").expect("credentials");
-        assert_eq!(with_username.username, "user");
-        assert_eq!(with_username.password, "");
-
-        let with_password = credentials_from_config("", "pass").expect("credentials");
-        assert_eq!(with_password.username, "");
-        assert_eq!(with_password.password, "pass");
-    }
-
-    #[test]
-    fn server_security_mode_uses_hybrid_only_when_credentials_are_configured() {
+    fn server_maps_config_credentials_without_reclassifying_them() {
         assert_eq!(
-            security_mode_for_credentials(&credentials_from_config("", "")),
+            security_mode_for_credentials(&None),
             ServerSecurityMode::Tls
         );
-        assert_eq!(
-            security_mode_for_credentials(&credentials_from_config("user", "pass")),
-            ServerSecurityMode::Hybrid
-        );
-        assert_eq!(
-            security_mode_for_credentials(&credentials_from_config("user", "")),
-            ServerSecurityMode::Hybrid
-        );
-        assert_eq!(
-            security_mode_for_credentials(&credentials_from_config("", "pass")),
-            ServerSecurityMode::Hybrid
-        );
+
+        for (username, password) in [("user", "pass"), ("user", ""), ("", "pass")] {
+            let credentials = ironrdp_credentials(Some(ConfigCredentials {
+                username: username.into(),
+                password: password.into(),
+            }));
+            assert_eq!(
+                security_mode_for_credentials(&credentials),
+                ServerSecurityMode::Hybrid
+            );
+            let credentials = credentials.as_ref().expect("configured credentials");
+
+            assert_eq!(credentials.username, username);
+            assert_eq!(credentials.password, password);
+            assert_eq!(credentials.domain, None);
+        }
     }
 
     #[test]
@@ -363,13 +336,6 @@ mod tests {
         assert!(sound_factory_for_audio_mode(AudioMode::Mirror).is_some());
         assert!(sound_factory_for_audio_mode(AudioMode::Redirect).is_some());
         assert!(sound_factory_for_audio_mode(AudioMode::Off).is_none());
-    }
-
-    #[test]
-    fn invalid_bind_address_is_rejected_before_server_setup() {
-        let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
-
-        assert!(format!("{error:#}").contains("invalid bind address"));
     }
 
     #[tokio::test]

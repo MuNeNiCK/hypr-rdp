@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -166,11 +167,10 @@ impl ConfigFile {
 }
 
 pub struct RuntimeConfig {
-    pub bind: String,
+    pub bind: SocketAddr,
     pub cert: Option<String>,
     pub key: Option<String>,
-    pub username: String,
-    pub password: String,
+    pub credentials: Option<ConfigCredentials>,
     pub resolution: (u32, u32),
     pub capture_mode: CaptureMode,
     pub bitrate: u32,
@@ -188,51 +188,45 @@ pub struct RuntimeConfig {
     pub on_session_end: Option<String>,
 }
 
-/// What the operator should be told about this configuration at startup.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ConfigCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl ConfigCredentials {
+    fn from_parts(username: String, password: String) -> Option<Self> {
+        if username.is_empty() && password.is_empty() {
+            None
+        } else {
+            Some(Self { username, password })
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum StartupWarning {
-    /// Nothing authenticates the client.
     AuthenticationOff,
-    /// Listening somewhere other than this machine with an empty password,
-    /// whether or not a username is set.
     ReachableBeyondLoopback,
-    /// A username without a password, or the other way round.
     HalfCredentials,
 }
 
-/// Decide what to warn about, using the same rule the server uses to decide
-/// whether it authenticates at all.
-///
-/// The server treats credentials as configured unless *both* halves are empty
-/// (`credentials_from_config`), so a username with no password does enable
-/// NLA — matching an empty password. Warning "no credentials set" there said
-/// the opposite of what the server was about to do.
-///
-/// Exposure is about reachability rather than a wildcard address: `0.0.0.0`,
-/// `[::]`, an IPv4-mapped wildcard and a plain LAN address are all reachable by
-/// somebody else, and only loopback is not. An address that does not parse is
-/// reported for real when the server binds it.
-///
-/// Exposure follows the empty *password*, not the missing pair. A username with
-/// no password is treated as configured, so `security_mode_for_credentials`
-/// picks Hybrid and the server runs NLA against a blank secret -- reachable
-/// from the LAN, that is the same exposure as no credentials at all, with a
-/// username in front of it. The other half-set shape is not: an empty username
-/// with a password set still has a secret to guess.
-fn startup_warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
+fn startup_warnings(
+    credentials: Option<&ConfigCredentials>,
+    bind: SocketAddr,
+) -> Vec<StartupWarning> {
     let mut warnings = Vec::new();
-    let authenticates = !(username.is_empty() && password.is_empty());
 
-    if !authenticates {
+    if credentials.is_none() {
         warnings.push(StartupWarning::AuthenticationOff);
-    } else if username.is_empty() || password.is_empty() {
+    } else if credentials
+        .is_some_and(|value| value.username.is_empty() || value.password.is_empty())
+    {
         warnings.push(StartupWarning::HalfCredentials);
     }
 
-    let beyond_loopback = bind
-        .parse::<std::net::SocketAddr>()
-        .is_ok_and(|addr| !addr.ip().is_loopback());
-    if password.is_empty() && beyond_loopback {
+    let password_is_empty = credentials.is_none_or(|value| value.password.is_empty());
+    if password_is_empty && !bind.ip().to_canonical().is_loopback() {
         warnings.push(StartupWarning::ReachableBeyondLoopback);
     }
 
@@ -248,19 +242,21 @@ impl RuntimeConfig {
             .bind
             .or(config.bind)
             .unwrap_or_else(|| "127.0.0.1:3389".into());
+        let bind = parse_bind_addr(&bind)?;
         let cert = args.cert.or(config.cert);
         let key = args.key.or(config.key);
         let username = args.username.or(config.username).unwrap_or_default();
         let password = args.password.or(config.password).unwrap_or_default();
+        let credentials = ConfigCredentials::from_parts(username, password);
 
-        for warning in startup_warnings(&username, &password, &bind) {
+        for warning in startup_warnings(credentials.as_ref(), bind) {
             match warning {
                 StartupWarning::AuthenticationOff => tracing::warn!(
                     "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
                 ),
                 StartupWarning::ReachableBeyondLoopback => tracing::warn!(
                     bind = %bind,
-                    "Reachable beyond loopback with an empty password: the only thing between the port and the session is the username."
+                    "RDP is reachable beyond loopback without a password."
                 ),
                 StartupWarning::HalfCredentials => tracing::warn!(
                     "Only one half of the credentials is set; the other one is matched as empty."
@@ -317,8 +313,7 @@ impl RuntimeConfig {
             bind,
             cert,
             key,
-            username,
-            password,
+            credentials,
             resolution,
             capture_mode,
             bitrate,
@@ -336,6 +331,11 @@ impl RuntimeConfig {
             on_session_end,
         })
     }
+}
+
+fn parse_bind_addr(bind: &str) -> anyhow::Result<SocketAddr> {
+    bind.parse()
+        .map_err(|error| anyhow::anyhow!("invalid bind address: {error}"))
 }
 
 fn parse_h264_backend_policy(s: &str) -> anyhow::Result<H264BackendPolicy> {
@@ -481,13 +481,30 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-
+    use super::*;
+    use proptest::prelude::*;
+    use std::fs;
     use StartupWarning::*;
 
+    fn warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
+        let credentials = ConfigCredentials::from_parts(username.to_owned(), password.to_owned());
+        startup_warnings(credentials.as_ref(), parse_bind_addr(bind).unwrap())
+    }
+
     #[test]
-    fn without_credentials_reachability_decides_the_second_warning() {
-        // Every one of these is reachable by somebody else, wildcard or not —
-        // the IPv4-mapped wildcard is the one a prefix test misses.
+    fn credential_classification_preserves_every_configured_shape() {
+        assert!(ConfigCredentials::from_parts(String::new(), String::new()).is_none());
+
+        for (username, password) in [("user", "secret"), ("user", ""), ("", "secret")] {
+            let credentials =
+                ConfigCredentials::from_parts(username.to_owned(), password.to_owned()).unwrap();
+            assert_eq!(credentials.username, username);
+            assert_eq!(credentials.password, password);
+        }
+    }
+
+    #[test]
+    fn no_password_warns_only_beyond_canonical_loopback() {
         for bind in [
             "0.0.0.0:3389",
             "[::]:3389",
@@ -495,68 +512,39 @@ mod tests {
             "192.168.1.5:3389",
         ] {
             assert_eq!(
-                startup_warnings("", "", bind),
+                warnings("", "", bind),
                 vec![AuthenticationOff, ReachableBeyondLoopback],
-                "{bind} is reachable from outside this machine"
+                "{bind}"
             );
         }
 
-        for bind in ["127.0.0.1:3389", "[::1]:3389"] {
-            assert_eq!(
-                startup_warnings("", "", bind),
-                vec![AuthenticationOff],
-                "{bind} is this machine only"
-            );
+        for bind in ["127.0.0.1:3389", "[::1]:3389", "[::ffff:127.0.0.1]:3389"] {
+            assert_eq!(warnings("", "", bind), vec![AuthenticationOff], "{bind}");
         }
     }
 
     #[test]
-    fn half_the_credentials_is_reported_as_such_not_as_none() {
-        // The server enables NLA whenever either half is set and matches the
-        // missing one as empty, so "no credentials set" would say the opposite
-        // of what it is about to do.
-        //
-        // The two shapes are not equally exposed, and the difference is the
-        // password. A username with none is NLA against a blank secret: on a
-        // wildcard bind that is the same open port as no credentials at all,
-        // so it earns the exposure warning too. An empty username with a
-        // password set still has a secret in front of it, and does not.
+    fn half_credentials_follow_the_actual_empty_secret() {
         assert_eq!(
-            startup_warnings("user", "", "0.0.0.0:3389"),
+            warnings("user", "", "0.0.0.0:3389"),
             vec![HalfCredentials, ReachableBeyondLoopback]
         );
         assert_eq!(
-            startup_warnings("", "secret", "0.0.0.0:3389"),
+            warnings("", "secret", "0.0.0.0:3389"),
             vec![HalfCredentials]
         );
-    }
-
-    /// The exposure warning follows the empty password, not the missing pair.
-    /// Bound to loopback the same blank secret is not reachable by anyone else,
-    /// so only the half-set warning is due.
-    #[test]
-    fn an_empty_password_on_loopback_is_not_reported_as_exposure() {
         assert_eq!(
-            startup_warnings("user", "", "127.0.0.1:3389"),
+            warnings("user", "", "127.0.0.1:3389"),
             vec![HalfCredentials]
         );
+        assert!(warnings("user", "secret", "0.0.0.0:3389").is_empty());
     }
 
     #[test]
-    fn a_configured_pair_warns_about_nothing() {
-        assert!(startup_warnings("user", "secret", "0.0.0.0:3389").is_empty());
+    fn invalid_bind_address_is_rejected_by_config() {
+        let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
+        assert!(format!("{error:#}").contains("invalid bind address"));
     }
-
-    #[test]
-    fn an_unparsable_bind_is_left_to_the_server_to_report() {
-        assert_eq!(
-            startup_warnings("", "", "not an address"),
-            vec![AuthenticationOff]
-        );
-    }
-    use super::*;
-    use proptest::prelude::*;
-    use std::fs;
 
     fn temp_config_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
