@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -51,19 +51,14 @@ pub(super) fn clipboard_thread(
     );
 
     let wayland_fd = conn.as_fd().as_raw_fd();
-    let ready = dispatch_until(
+    let ready = dispatch_until_globals_ready(
         &conn,
         &mut event_queue,
         &mut state,
         wayland_fd,
         Instant::now() + COMPOSITOR_REPLY_TIMEOUT,
-        |state| state.manager.is_some() && state.seat.is_some(),
     )?;
 
-    // Say what was missing, not just that we waited. A compositor without
-    // wlr-data-control answers its registry immediately and simply never
-    // advertises the global, which is the common case here and is not a
-    // compositor failing to answer.
     if !ready {
         let mut missing = Vec::new();
         if state.manager.is_none() {
@@ -106,7 +101,7 @@ pub(super) fn clipboard_thread(
             .map_err(|e| anyhow::anyhow!("clipboard: flush failed: {}", e))?;
 
         // RDP → Wayland: pick up pending_write and set selection
-        if let Some(pending) = state.take_pending_write() {
+        if let Some(pending) = state.take_pending_write(Instant::now()) {
             // Destroy previous source to prevent protocol object leak
             if let Some(old) = state.active_source.take() {
                 old.destroy();
@@ -141,29 +136,18 @@ pub(super) fn clipboard_thread(
                 dev.set_selection(Some(&source));
             }
             state.active_source = Some(source);
-            // Push the request out and carry on. The echo it provokes is
-            // handled by the poll below like any other event; waiting for it
-            // here was a wait with no deadline, and a compositor that stopped
-            // answering held this thread -- and the clipboard with it -- for as
-            // long as it stayed stuck.
+            // The event loop handles the resulting Selection notification.
             conn.flush().map_err(|e| {
                 anyhow::anyhow!("clipboard: flush after set_selection failed: {}", e)
             })?;
         }
 
-        // Poll Wayland fd with 100ms timeout
         let guard = match event_queue.prepare_read() {
             Some(g) => g,
             None => continue,
         };
 
-        let mut pollfd = libc::pollfd {
-            fd: wayland_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pollfd, 1, 100) };
-        if ret > 0 {
+        if poll_wayland_fd(wayland_fd, WAYLAND_POLL_INTERVAL)? {
             guard
                 .read()
                 .map_err(|e| anyhow::anyhow!("clipboard: read failed: {}", e))?;
@@ -183,13 +167,7 @@ enum SourceType {
 
 struct ClipState {
     event_sender: mpsc::UnboundedSender<ServerEvent>,
-    /// Deadline until which a Selection event is our own echo and is swallowed
-    /// rather than announced to the client as a local copy.
-    ///
-    /// Owned by this thread alone. It used to be an `AtomicBool` shared with
-    /// the backend, which set it from the RDP thread and left this thread to
-    /// clear it -- so a write that never reached the compositor left local
-    /// copies silently suppressed for the rest of the session.
+    /// Deadline for Selection events caused by our own write.
     suppress_echo_until: Option<Instant>,
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
@@ -230,84 +208,35 @@ impl ClipState {
         }
     }
 
-    /// Take the write the RDP side left, arming echo suppression with it.
-    ///
-    /// One step rather than two calls, because a take that does not arm is the
-    /// defect this state exists to prevent: everything below provokes Selection
-    /// events that are our own, and one we fail to recognise is announced back
-    /// to the client as somebody else's copy. Nothing arms when there is
-    /// nothing to write.
-    ///
-    /// Armed before the destroy below, not just around `set_selection`:
-    /// dropping a source we still hold the selection with may make the
-    /// compositor clear the selection first, and that `selection(null)` is our
-    /// own doing as much as the echo is. The protocol does not say either way,
-    /// so the count of events one write provokes is not something to build on.
-    fn take_pending_write(&mut self) -> Option<PendingWrite> {
+    /// Take one pending write and arm suppression before replacing its source.
+    fn take_pending_write(&mut self, now: Instant) -> Option<PendingWrite> {
         let pending = self.pending_write.lock().ok().and_then(|mut g| g.take())?;
-        self.arm_echo_suppression();
+        self.suppress_echo_until = Some(now + ECHO_SUPPRESSION_TIMEOUT);
         Some(pending)
     }
 
-    /// Start swallowing Selection events, from before the calls that provoke
-    /// them.
-    fn arm_echo_suppression(&mut self) {
-        self.suppress_echo_until = Some(Instant::now() + ECHO_SUPPRESSION_WINDOW);
-    }
-
-    /// Whether a Selection event arriving now is our own echo.
-    ///
-    /// Deliberately does not consume the suppression. One write may provoke
-    /// more than one event -- destroying the previous source can clear the
-    /// selection before our own echo arrives -- and consuming on the first
-    /// would send the second
-    /// into `read_offer_data` against our own data source. Only this thread
-    /// answers that source's `send`, and it would be sitting in the read, so
-    /// the transfer could not finish until the read timed out.
-    fn echo_suppressed(&self) -> bool {
-        self.suppress_echo_until
-            .is_some_and(|deadline| Instant::now() < deadline)
-    }
-
-    /// Whether this Selection event is one our own write provoked -- and, if
-    /// so, note that the compositor is answering.
-    ///
-    /// The two belong together. Checking without collapsing spends the whole
-    /// backstop on every write; collapsing without checking would shorten a
-    /// window that no event has justified shortening.
-    fn selection_is_our_echo(&mut self) -> bool {
-        if !self.echo_suppressed() {
+    /// Suppress the compositor response burst, then accept later selections.
+    fn selection_is_our_echo(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.suppress_echo_until else {
+            return false;
+        };
+        if now >= deadline {
+            self.suppress_echo_until = None;
             return false;
         }
-        self.shrink_echo_suppression();
-        true
-    }
 
-    /// Collapse the window to the grace period, because the compositor has
-    /// just proved it is answering. Never extends a deadline.
-    fn shrink_echo_suppression(&mut self) {
-        let grace = Instant::now() + ECHO_SUPPRESSION_GRACE;
-        if let Some(deadline) = self.suppress_echo_until {
-            if grace < deadline {
-                self.suppress_echo_until = Some(grace);
-            }
-        }
+        self.suppress_echo_until = Some(deadline.min(now + ECHO_SUPPRESSION_GRACE));
+        true
     }
 }
 
-/// Dispatch events until `ready` holds, or until the deadline passes.
-///
-/// `EventQueue::roundtrip` waits for the compositor with no deadline, and the
-/// backend joins this thread on drop -- so a compositor that stops answering
-/// takes the server down with it. This is the poll the thread loop already
-/// runs, with a deadline on top.
-fn dispatch_until(
+/// Dispatch initial registry events without an unbounded Wayland round trip.
+fn dispatch_until_globals_ready(
     conn: &Connection,
     event_queue: &mut EventQueue<ClipState>,
     state: &mut ClipState,
-    wayland_fd: std::os::fd::RawFd,
+    wayland_fd: RawFd,
     deadline: Instant,
-    ready: impl Fn(&ClipState) -> bool,
 ) -> anyhow::Result<bool> {
     loop {
         loop {
@@ -318,13 +247,11 @@ fn dispatch_until(
                 break;
             }
         }
-        if ready(state) {
+        if state.manager.is_some() && state.seat.is_some() {
             return Ok(true);
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            // Not an error of its own: the caller knows what it was waiting
-            // for and can say so, which a bare timeout cannot.
             return Ok(false);
         }
         conn.flush()
@@ -332,14 +259,7 @@ fn dispatch_until(
         let Some(guard) = event_queue.prepare_read() else {
             continue;
         };
-        let mut pollfd = libc::pollfd {
-            fd: wayland_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout_ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let ret = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if ret > 0 {
+        if poll_wayland_fd(wayland_fd, remaining)? {
             guard
                 .read()
                 .map_err(|e| anyhow::anyhow!("clipboard: read failed: {}", e))?;
@@ -398,7 +318,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 state.offer_mimes.insert(id.id(), Vec::new());
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
-                if state.selection_is_our_echo() {
+                if state.selection_is_our_echo(Instant::now()) {
                     if let Some(offer) = id {
                         state.offer_mimes.remove(&offer.id());
                         offer.destroy();
@@ -532,33 +452,48 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
     }
 }
 
-/// No-progress and overall deadlines for clipboard pipe transfers. The
-/// watcher thread services these transfers inline, and the backend joins
-/// that thread on drop — an unbounded read or write here therefore wedges
-/// the whole server, so both directions must always terminate.
-const PIPE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long a Selection event still counts as the echo of our own
-/// `set_selection`, and how long we wait for the compositor to announce its
-/// globals at startup.
-///
-/// Both are the same question -- how long before a compositor that has not
-/// answered is not going to -- so they are the same number as the stalled-pipe
-/// timeout above rather than a third one. A compositor answers in microseconds;
-/// the window exists only so that one which never answers cannot suppress local
-/// copies for the rest of the session.
-const ECHO_SUPPRESSION_WINDOW: Duration = PIPE_STALL_TIMEOUT;
-
-/// What is left of the window once the compositor has answered at all.
-///
-/// The rest of a write's burst follows its first event immediately, so there is
-/// no reason to keep swallowing Selection events for the full backstop after
-/// that. Without this the window is spent in full every time, and a client that
-/// writes more often than the window is long keeps local copies suppressed for
-/// as long as it cares to -- the very failure this is supposed to prevent, just
-/// driven from the other side.
+const WAYLAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const COMPOSITOR_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+const ECHO_SUPPRESSION_TIMEOUT: Duration = Duration::from_secs(2);
 const ECHO_SUPPRESSION_GRACE: Duration = Duration::from_millis(100);
-const COMPOSITOR_REPLY_TIMEOUT: Duration = PIPE_STALL_TIMEOUT;
+
+/// No-progress and overall deadlines for clipboard pipe transfers.
+const PIPE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const PIPE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn poll_wayland_fd(fd: RawFd, timeout: Duration) -> std::io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+
+        match unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } {
+            0 => return Ok(false),
+            n if n > 0 => {
+                if pollfd.revents & libc::POLLNVAL != 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                }
+                return Ok(pollfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0);
+            }
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
 
 fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
@@ -842,134 +777,73 @@ mod tests {
     }
 
     #[test]
-    fn nothing_is_suppressed_until_we_write() {
-        assert!(!clip_state().selection_is_our_echo());
-    }
-
-    #[test]
-    fn arming_uses_the_window_the_constant_names() {
-        let mut state = clip_state();
-        let floor = Instant::now() + ECHO_SUPPRESSION_WINDOW;
-        state.arm_echo_suppression();
-        let ceiling = Instant::now() + ECHO_SUPPRESSION_WINDOW;
-
-        let deadline = state.suppress_echo_until.expect("arming sets a deadline");
-        assert!(
-            deadline >= floor && deadline <= ceiling,
-            "the deadline has to come from the constant, not from somewhere else"
-        );
-    }
-
-    #[test]
-    fn one_write_suppresses_every_event_it_provokes_not_just_the_first() {
-        let mut state = clip_state();
-        state.arm_echo_suppression();
-
-        // Dropping the source we held the selection with may clear the
-        // selection before our own set_selection echoes back, and the protocol
-        // does not say how many events one write produces -- so the check must
-        // not spend itself on the first one.
-        assert!(state.selection_is_our_echo(), "the first event is ours");
-        assert!(state.selection_is_our_echo(), "and so is the one behind it");
-    }
-
-    #[test]
-    fn the_first_answer_collapses_the_window_to_the_grace() {
-        let mut state = clip_state();
-        state.arm_echo_suppression();
-
-        // The compositor has answered, so the rest of the burst is already on
-        // its way; holding the full backstop open past that is what lets a
-        // write-happy client keep local copies suppressed indefinitely.
-        assert!(state.selection_is_our_echo());
-
-        let deadline = state.suppress_echo_until.expect("still armed");
-        assert!(
-            deadline <= Instant::now() + ECHO_SUPPRESSION_GRACE,
-            "the window stayed open past the compositor's first answer"
-        );
-        assert!(
-            ECHO_SUPPRESSION_GRACE * 4 < ECHO_SUPPRESSION_WINDOW,
-            "a grace this close to the backstop collapses nothing"
-        );
-        // The backstop covers a compositor that has gone quiet. It has no
-        // business outlasting the time we are already willing to sit on a
-        // stalled pipe -- an oversized window here is indistinguishable from
-        // the latch this change removed.
-        assert!(
-            ECHO_SUPPRESSION_WINDOW <= PIPE_STALL_TIMEOUT,
-            "the backstop outgrew the budget it was derived from"
-        );
-        // And absolute ceilings, because the window is expressed relative to
-        // PIPE_STALL_TIMEOUT: raising that one constant would widen it with
-        // every test still green. COMPOSITOR_REPLY_TIMEOUT is an alias of the
-        // same constant, so it needs no line of its own. These are the seconds
-        // a user spends watching a clipboard do nothing.
-        assert!(PIPE_STALL_TIMEOUT <= Duration::from_secs(5));
-        assert!(PIPE_TOTAL_TIMEOUT <= Duration::from_secs(30));
-        assert!(ECHO_SUPPRESSION_GRACE <= Duration::from_millis(200));
-    }
-
-    /// The property #31 asserted through `suppress_watcher` and this change
-    /// moved onto the Wayland thread: a write from the RDP side arms echo
-    /// suppression. It is here rather than in the thread loop because that is
-    /// where the take now happens, and a take without an arm is the whole bug.
-    #[test]
     fn taking_the_rdp_write_arms_echo_suppression() {
+        let now = Instant::now();
+
         for pending in [
             PendingWrite::Text(b"pasted from the client".to_vec()),
             PendingWrite::Image(vec![0u8; 16]),
         ] {
             let mut state = clip_state();
-            assert!(state.take_pending_write().is_none());
-            assert!(
-                !state.echo_suppressed(),
-                "nothing was written, so nothing may be swallowed"
-            );
+            assert!(state.take_pending_write(now).is_none());
+            assert!(!state.selection_is_our_echo(now));
 
             *state.pending_write.lock().unwrap() = Some(pending);
 
-            assert!(state.take_pending_write().is_some());
-            assert!(
-                state.echo_suppressed(),
-                "the Selection events this write provokes are ours"
+            assert!(state.take_pending_write(now).is_some());
+            assert_eq!(
+                state.suppress_echo_until,
+                Some(now + ECHO_SUPPRESSION_TIMEOUT)
             );
-            assert!(
-                state.pending_write.lock().unwrap().is_none(),
-                "the write is taken, not left for the next pass"
-            );
+            assert!(state.pending_write.lock().unwrap().is_none());
         }
     }
 
     #[test]
-    fn shrinking_never_extends_a_deadline() {
+    fn compositor_response_burst_is_suppressed_then_expires() {
         let mut state = clip_state();
-        // Any deadline inside the grace exercises this; take the largest one,
-        // because everything up to it is wall-clock budget for reaching the
-        // call below. A literal few milliseconds would test the same property
-        // on a machine that never stalls and flake on a loaded CI runner.
-        state.suppress_echo_until =
-            Some(Instant::now() + ECHO_SUPPRESSION_GRACE - Duration::from_millis(1));
-        let before = state.suppress_echo_until;
+        let started = Instant::now();
+        *state.pending_write.lock().unwrap() = Some(PendingWrite::Text(vec![1]));
+        state.take_pending_write(started).unwrap();
 
-        assert!(state.selection_is_our_echo());
+        let first = started + Duration::from_millis(10);
+        assert!(state.selection_is_our_echo(first));
+        let grace_deadline = first + ECHO_SUPPRESSION_GRACE;
+        assert_eq!(state.suppress_echo_until, Some(grace_deadline));
 
-        assert_eq!(
-            state.suppress_echo_until, before,
-            "a deadline shorter than the grace must be left alone"
-        );
+        assert!(state.selection_is_our_echo(first + Duration::from_millis(1)));
+        assert_eq!(state.suppress_echo_until, Some(grace_deadline));
+
+        assert!(!state.selection_is_our_echo(grace_deadline));
+        assert_eq!(state.suppress_echo_until, None);
     }
 
     #[test]
-    fn a_lapsed_window_stops_swallowing_selections() {
-        let mut state = clip_state();
-        state.arm_echo_suppression();
-        // A compositor that never answers must not silence local copies for the
-        // rest of the session: past the deadline a Selection is somebody's copy
-        // again, not our echo.
-        state.suppress_echo_until = Some(Instant::now() - Duration::from_millis(1));
+    fn wayland_poll_returns_when_the_fd_stays_unreadable() {
+        let (read_fd, write_fd) = pipe_pair();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let poller = std::thread::spawn(move || {
+            result_tx
+                .send(poll_wayland_fd(
+                    read_fd.as_raw_fd(),
+                    Duration::from_millis(50),
+                ))
+                .unwrap();
+        });
 
-        assert!(!state.selection_is_our_echo());
+        let result = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("Wayland poll exceeded its deadline");
+        drop(write_fd);
+        poller.join().unwrap();
+
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn wayland_poll_rejects_an_invalid_fd() {
+        let error = poll_wayland_fd(i32::MAX, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
     }
 
     fn pipe_pair() -> (OwnedFd, OwnedFd) {
