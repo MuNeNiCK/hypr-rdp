@@ -24,7 +24,7 @@ use super::keyboard::{
     KeyboardStateTracker, XkbKeymapNames,
 };
 use super::layout::{OutputLayoutSnapshot, SharedOutputLayout};
-use super::rdp::ClientKeyboardLayoutHandle;
+use super::rdp::RdpInputSessionHandle;
 use super::virtual_keyboard::{ZwpVirtualKeyboardManagerV1, ZwpVirtualKeyboardV1};
 use super::{keymap, KeyboardLayoutPolicy};
 
@@ -310,12 +310,9 @@ impl HyprInputHandler {
         }
     }
 
-    /// Owner-specific handle for the server connection layer: forwards
-    /// client keyboard-layout metadata to the input-layout policy without
-    /// exposing `InputCommand`.
-    pub(crate) fn client_keyboard_layout_handle(&self) -> Option<ClientKeyboardLayoutHandle> {
+    pub(crate) fn rdp_input_session_handle(&self) -> Option<RdpInputSessionHandle> {
         self.input_commands.as_ref().map(|commands| {
-            ClientKeyboardLayoutHandle::new(self.keyboard_layout_policy, Arc::downgrade(commands))
+            RdpInputSessionHandle::new(self.keyboard_layout_policy, Arc::downgrade(commands))
         })
     }
 
