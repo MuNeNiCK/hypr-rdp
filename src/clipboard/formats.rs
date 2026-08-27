@@ -5,52 +5,43 @@ pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
 pub(super) const IMAGE_PNG_MIME: &str = "image/png";
 
-/// Collapse CR-LF to a single LF, and leave everything else exactly as it came.
-///
-/// Wayland applications hand each other bare LF, and that is the shape the
-/// write to Wayland and the echo comparison work in.
-///
-/// A lone CR is not a line ending here. It is left as it came: it is a byte
-/// somebody put in their clipboard -- a progress bar redrawn over itself, a
-/// file that predates both conventions -- and rewriting it into a newline
-/// would hand back text the user did not copy.
-///
-/// Which is why this is `str::replace` and not a hand-written scan: it is the
-/// same expression the two call sites used before they were merged into one
-/// rule, and merging them was not a licence to start editing content.
+/// Normalize CR, LF, and CRLF line endings to Wayland's LF form.
 pub(super) fn normalize_lf(text: &str) -> String {
-    text.replace("\r\n", "\n")
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let (mut start, mut i) = (0, 0);
+
+    while i < bytes.len() {
+        if bytes[i] != b'\r' {
+            i += 1;
+            continue;
+        }
+
+        out.push_str(&text[start..i]);
+        out.push('\n');
+        i += usize::from(bytes.get(i + 1) == Some(&b'\n')) + 1;
+        start = i;
+    }
+
+    out.push_str(&text[start..]);
+    out
 }
 
-/// Render every line ending as CRLF.
-///
-/// [Standard Clipboard Formats] defines `CF_UNICODETEXT` as ending every line
-/// with a carriage return/linefeed pair, so text that leaves for the client has
-/// to be in that shape: without it a multi-line paste arrives in a Win32 edit
-/// control as one line.
+/// Normalize CR, LF, and CRLF line endings to the CRLF form required by
+/// `CF_UNICODETEXT`.
 ///
 /// [Standard Clipboard Formats]: https://learn.microsoft.com/en-us/windows/win32/dataxchg/standard-clipboard-formats
 pub(super) fn to_crlf(text: &str) -> String {
-    // One pass, one allocation, copying whole runs between line endings rather
-    // than character by character: the clipboard accepts up to
-    // MAX_CLIPBOARD_SIZE, and `normalize_lf(text).replace(..)` walked all of it
-    // twice and allocated it twice on the way out to the client.
-    //
-    // Scanning bytes is safe here because CR and LF are ASCII, and an ASCII
-    // byte never appears inside a multi-byte UTF-8 sequence -- so every index
-    // this finds is a character boundary.
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(bytes.len() + bytes.len() / 32 + 2);
     let (mut start, mut i) = (0, 0);
+
     while i < bytes.len() {
         match bytes[i] {
-            // A CR-LF pair is one line ending; a bare LF becomes one. A lone
-            // CR is content, not a line ending, and is copied through with
-            // everything else.
-            b'\r' if bytes.get(i + 1) == Some(&b'\n') => {
+            b'\r' => {
                 out.push_str(&text[start..i]);
                 out.push_str("\r\n");
-                i += 2;
+                i += usize::from(bytes.get(i + 1) == Some(&b'\n')) + 1;
                 start = i;
             }
             b'\n' => {
@@ -190,25 +181,13 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_carriage_return_is_content_not_a_line_ending() {
-        // A CR that is not part of a pair is a byte somebody copied -- a
-        // progress bar redrawn over itself, a file older than either
-        // convention. Rewriting it into a newline hands back text the user did
-        // not copy, in both directions.
-        assert_eq!(to_crlf("done\rdone\rdone"), "done\rdone\rdone");
-        assert_eq!(normalize_lf("done\rdone\rdone"), "done\rdone\rdone");
+    fn line_endings_are_normalized_at_both_boundaries() {
+        let text = "\nA\rB\r\nЖ\n";
 
-        // And it survives the round trip intact alongside real line endings.
-        assert_eq!(to_crlf("a\rb\nc"), "a\rb\r\nc");
-        assert_eq!(normalize_lf(&to_crlf("a\rb\nc")), "a\rb\nc");
+        assert_eq!(normalize_lf(text), "\nA\nB\nЖ\n");
+        assert_eq!(to_crlf(text), "\r\nA\r\nB\r\nЖ\r\n");
     }
 
-    /// Text that actually contains line endings.
-    ///
-    /// `proptest`'s `.` is `[^\n]`, so a `".*"` strategy cannot produce a bare
-    /// LF and therefore cannot produce a CRLF either -- every property about
-    /// line endings written that way passes for any implementation. Measured:
-    /// 20 000 cases of `".{0,50}"` yielded no newline at all.
     fn text_with_line_endings() -> impl Strategy<Value = String> {
         proptest::collection::vec(
             proptest::sample::select(vec!["a", "b", "\u{444}", " ", "\r\n", "\n", "\r", ""]),
@@ -218,29 +197,22 @@ mod tests {
     }
 
     proptest! {
-        /// The one-pass rendering must agree with the obvious two-pass one it
-        /// replaced. The rewrite exists for speed and memory, not behaviour.
         #[test]
-        fn one_pass_rendering_agrees_with_the_obvious_one(text in text_with_line_endings()) {
-            prop_assert_eq!(
-                to_crlf(&text),
-                normalize_lf(&text).replace('\n', "\r\n")
-            );
-        }
+        fn generated_line_endings_round_trip(text in text_with_line_endings()) {
+            let wire = to_crlf(&text);
+            prop_assert_eq!(normalize_lf(&wire), normalize_lf(&text));
 
-        /// Line endings mixed in one buffer, which a plain `.*` rarely produces.
-        #[test]
-        fn one_pass_rendering_agrees_on_mixed_line_endings(
-            parts in proptest::collection::vec(
-                proptest::sample::select(vec!["a", "\r\n", "\n", "\r", "\u{444}", ""]),
-                0..64,
-            ),
-        ) {
-            let text = parts.concat();
-            prop_assert_eq!(
-                to_crlf(&text),
-                normalize_lf(&text).replace('\n', "\r\n")
-            );
+            let mut i = 0;
+            while i < wire.len() {
+                match wire.as_bytes()[i] {
+                    b'\r' => {
+                        prop_assert_eq!(wire.as_bytes().get(i + 1), Some(&b'\n'));
+                        i += 2;
+                    }
+                    b'\n' => prop_assert!(false, "bare LF in CF_UNICODETEXT input"),
+                    _ => i += 1,
+                }
+            }
         }
 
         #[test]
