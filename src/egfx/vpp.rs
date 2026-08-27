@@ -2,13 +2,14 @@
 //!
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 use libva_sys::va_display_drm as va;
 
 use super::vaapi_sys::{
     self as sys, va_check, VABufferID, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
-    VADisplay, VASurfaceAttrib, VASurfaceID,
+    VASurfaceAttrib, VASurfaceID,
 };
 
 // Constants from VA-API headers
@@ -32,90 +33,37 @@ pub(crate) struct VppDmaBufInfo {
     pub(crate) uv_offset: u32,
 }
 
-/// The size libva declares for the pipeline buffer.
-///
-/// libva-sys ships a generated layout test for this, but it is a `#[test]` in
-/// a dependency and never runs here, and the binding is vendored rather than
-/// regenerated against the installed headers -- so a crate update whose layout
-/// moved would go unnoticed. This is checked when this crate compiles.
-const _: () = assert!(std::mem::size_of::<va::VAProcPipelineParameterBuffer>() == 224);
-
-/// Terminates a VA display unless the converter it belongs to is built.
-///
-/// `vaInitialize` has to be paired with `vaTerminate`, and `VppConverter::drop`
-/// only runs once `Self` exists -- so every `?` on the way there used to leave a
-/// display behind. A DMA-BUF setup failure falls back to SHM for the rest of
-/// that capture run rather than retrying, so the leak was one display per
-/// capture-session start that reached this path: a new client, or a session the
-/// supervisor restarts for a geometry change.
-struct VaDisplayGuard(VADisplay);
-
-impl VaDisplayGuard {
-    /// Hand the display to whoever will terminate it from now on.
-    ///
-    /// The only way to get the display back out, so the success path cannot
-    /// forget to disarm the guard and the guard cannot be disarmed without
-    /// somewhere for the display to go.
-    fn into_display(self) -> VADisplay {
-        let display = self.0;
-        std::mem::forget(self);
-        display
-    }
-}
-
-impl Drop for VaDisplayGuard {
-    fn drop(&mut self) {
-        unsafe { va::vaTerminate(self.0) };
-    }
-}
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = {
+    assert!(std::mem::size_of::<va::VAProcPipelineParameterBuffer>() == 224);
+    assert!(std::mem::offset_of!(va::VAProcPipelineParameterBuffer, output_hdr_metadata) == 152);
+    assert!(std::mem::offset_of!(va::VAProcPipelineParameterBuffer, va_reserved) == 160);
+};
 
 /// VA-API VPP color converter: XRGB DMA-BUF -> NV12 DMA-BUF.
 pub struct VppConverter {
-    va_display: VADisplay,
+    va_display: Rc<sys::VaDisplay>,
     config_id: VAConfigID,
     context_id: VAContextID,
     input_surfaces: Vec<VASurfaceID>,
     output_surface: VASurfaceID,
     width: u32,
     height: u32,
-    _drm_fd: OwnedFd,
     nv12_export_fd: Option<OwnedFd>,
 }
 
 impl VppConverter {
     /// Create a VPP converter using the given DRM device.
     pub fn new(drm_device_path: &Path, width: u32, height: u32) -> Result<Self> {
-        let drm_fd = {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(drm_device_path)
-                .context("failed to open DRM device for VPP")?;
-            OwnedFd::from(file)
-        };
-
-        let va_display = unsafe { va::vaGetDisplayDRM(drm_fd.as_raw_fd()) };
-        if va_display.is_null() {
-            bail!("vaGetDisplayDRM returned NULL for VPP");
-        }
-        // From here, not from after vaInitialize: a display that fails to
-        // initialize still has to be terminated, and on a node with no usable
-        // driver that is the failure that recurs.
-        let display_guard = VaDisplayGuard(va_display);
-
-        let mut major = 0i32;
-        let mut minor = 0i32;
-        va_check(
-            unsafe { va::vaInitialize(va_display, &mut major, &mut minor) },
-            "vaInitialize (VPP)",
-        )?;
+        let va_display = sys::VaDisplay::open_drm(drm_device_path)?;
+        let display = va_display.raw();
 
         // Create VPP config: VAProfileNone + VAEntrypointVideoProc
         let mut config_id: VAConfigID = 0;
         va_check(
             unsafe {
                 va::vaCreateConfig(
-                    va_display,
+                    display,
                     sys::VA_PROFILE_NONE,
                     sys::VA_ENTRYPOINT_VIDEO_PROC,
                     std::ptr::null_mut(),
@@ -141,7 +89,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateSurfaces(
-                    va_display,
+                    display,
                     VA_RT_FORMAT_YUV420,
                     width,
                     height,
@@ -159,7 +107,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateContext(
-                    va_display,
+                    display,
                     config_id,
                     width as i32,
                     height as i32,
@@ -180,16 +128,13 @@ impl VppConverter {
         );
 
         Ok(Self {
-            // The converter owns the display from here; its own Drop
-            // terminates it.
-            va_display: display_guard.into_display(),
+            va_display,
             config_id,
             context_id,
             input_surfaces: Vec::new(),
             output_surface,
             width,
             height,
-            _drm_fd: drm_fd,
             nv12_export_fd: None,
         })
     }
@@ -244,7 +189,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateSurfaces(
-                    self.va_display,
+                    self.va_display.raw(),
                     rt_format,
                     width,
                     height,
@@ -274,7 +219,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaExportSurfaceHandle(
-                    self.va_display,
+                    self.va_display.raw(),
                     self.output_surface,
                     VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                     VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
@@ -324,16 +269,8 @@ impl VppConverter {
             .get(input_surface_idx)
             .context("invalid VPP input surface index")?;
 
-        // Build VPP pipeline parameter buffer
-        // Zeroed rather than built from a literal. The struct has padding
-        // holes a literal does not write, and the whole thing is handed to
-        // vaCreateBuffer, which copies all 224 bytes -- so a literal puts
-        // whatever the stack held into a driver-visible buffer. The mirror
-        // that used to stand here wrote its padding out as named fields; the
-        // binding has no such fields, and this is what replaces them.
-        //
-        // SAFETY: every field is an integer, a raw pointer or an array of
-        // those, so all-zero is a valid value for the whole struct.
+        // vaCreateBuffer copies the full struct, including reserved bytes and padding.
+        // SAFETY: the binding contains only integers, raw pointers, and arrays thereof.
         let mut pipeline_param: va::VAProcPipelineParameterBuffer = unsafe { std::mem::zeroed() };
         pipeline_param.surface = input_surface;
 
@@ -341,7 +278,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateBuffer(
-                    self.va_display,
+                    self.va_display.raw(),
                     self.context_id,
                     va::VABufferType_VAProcPipelineParameterBufferType,
                     std::mem::size_of::<va::VAProcPipelineParameterBuffer>() as u32,
@@ -356,27 +293,29 @@ impl VppConverter {
         let result = (|| -> Result<()> {
             va_check(
                 unsafe {
-                    va::vaBeginPicture(self.va_display, self.context_id, self.output_surface)
+                    va::vaBeginPicture(self.va_display.raw(), self.context_id, self.output_surface)
                 },
                 "vaBeginPicture (VPP)",
             )?;
             va_check(
-                unsafe { va::vaRenderPicture(self.va_display, self.context_id, &mut buffer_id, 1) },
+                unsafe {
+                    va::vaRenderPicture(self.va_display.raw(), self.context_id, &mut buffer_id, 1)
+                },
                 "vaRenderPicture (VPP)",
             )?;
             va_check(
-                unsafe { va::vaEndPicture(self.va_display, self.context_id) },
+                unsafe { va::vaEndPicture(self.va_display.raw(), self.context_id) },
                 "vaEndPicture (VPP)",
             )?;
             va_check(
-                unsafe { va::vaSyncSurface(self.va_display, self.output_surface) },
+                unsafe { va::vaSyncSurface(self.va_display.raw(), self.output_surface) },
                 "vaSyncSurface (VPP output)",
             )?;
             Ok(())
         })();
 
         unsafe {
-            va::vaDestroyBuffer(self.va_display, buffer_id);
+            va::vaDestroyBuffer(self.va_display.raw(), buffer_id);
         }
 
         result
@@ -399,12 +338,11 @@ impl Drop for VppConverter {
     fn drop(&mut self) {
         unsafe {
             for surface_id in &mut self.input_surfaces {
-                va::vaDestroySurfaces(self.va_display, surface_id, 1);
+                va::vaDestroySurfaces(self.va_display.raw(), surface_id, 1);
             }
-            va::vaDestroySurfaces(self.va_display, &mut self.output_surface, 1);
-            va::vaDestroyContext(self.va_display, self.context_id);
-            va::vaDestroyConfig(self.va_display, self.config_id);
-            va::vaTerminate(self.va_display);
+            va::vaDestroySurfaces(self.va_display.raw(), &mut self.output_surface, 1);
+            va::vaDestroyContext(self.va_display.raw(), self.context_id);
+            va::vaDestroyConfig(self.va_display.raw(), self.config_id);
         }
     }
 }
