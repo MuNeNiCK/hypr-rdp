@@ -225,9 +225,7 @@ fn setup_dmabuf_inner(
     format: u32,
     modifiers: &[u64],
 ) -> Result<DmaBufCaptureContext> {
-    use crate::capture::dmabuf::{
-        drm_device_from_devt, open_drm_device, GbmBo, GbmDevice, DRM_FORMAT_MOD_INVALID,
-    };
+    use crate::capture::dmabuf::{drm_device_from_devt, open_drm_device, GbmBo, GbmDevice};
 
     // Find DRM device path from dev_t
     let drm_device_path =
@@ -238,80 +236,42 @@ fn setup_dmabuf_inner(
     let drm_fd = open_drm_device(&drm_device_path)?;
     let gbm_device = GbmDevice::new(drm_fd)?;
 
-    // Filter out invalid modifiers
-    let valid_modifiers: Vec<u64> = modifiers
-        .iter()
-        .copied()
-        .filter(|m| *m != DRM_FORMAT_MOD_INVALID)
-        .collect();
-
     // Allocate 2 GBM buffer objects (double-buffered capture)
     let mut gbm_bos = Vec::with_capacity(2);
     let mut wl_buffers = Vec::with_capacity(2);
     let mut dmabuf_infos = Vec::with_capacity(2);
 
-    // Ask which modifiers describe a single plane before allocating anything.
-    // Everything downstream describes exactly one plane -- the single
-    // `params.add` below, the one fd in `DmaBufInfo`, `num_planes = 1` on the
-    // VA-API surface -- and a compressing layout carries a metadata plane
-    // beside the pixels. Handing GBM the whole advertised list and hoping is
-    // not a plan: `create_immed` counts a plane count that does not match the
-    // format among its argument errors, and the compositor may answer it by
-    // terminating us.
-    let plan = crate::capture::dmabuf::plan_allocation(&valid_modifiers, |modifier| {
+    let plan = crate::capture::dmabuf::plan_allocation(modifiers, |modifier| {
         gbm_device.format_modifier_plane_count(format, modifier)
     });
-    let single_plane = match plan {
-        Allocation::WithModifiers(ref modifiers) => {
-            if modifiers.len() != valid_modifiers.len() {
-                tracing::debug!(
-                    offered = valid_modifiers.len(),
-                    usable = modifiers.len(),
-                    "DMA-BUF: dropped modifiers the driver would not describe as single-plane"
-                );
-            }
-            Some(modifiers)
-        }
-        // Nothing to honour, so the driver picks -- what this path did before
-        // the filter existed, and still the only case that reaches it.
-        Allocation::ImplicitModifier => None,
-        // Every modifier the compositor offered needs more than one plane.
-        // Allocating without one anyway would send `create_immed` a modifier
-        // that was never advertised, and a version-4 compositor answers that
-        // by ending the connection; this bail ends only the DMA-BUF path.
-        Allocation::Refuse => anyhow::bail!(
+    if plan == Allocation::Refuse {
+        anyhow::bail!(
             "none of the {} modifiers the compositor advertised for format {:#010x} describes a \
              single plane; the capture path can only describe one",
-            valid_modifiers.len(),
+            modifiers.len(),
             format
-        ),
-    };
+        );
+    }
 
     for i in 0..2 {
-        let mut bo = match single_plane {
-            Some(modifiers) => {
-                GbmBo::create_with_modifiers(&gbm_device, width, height, format, modifiers)
-                    .or_else(|_| GbmBo::create(&gbm_device, width, height, format))
+        let mut bo = match &plan {
+            Allocation::WithModifiers {
+                modifiers,
+                allow_implicit_fallback,
+            } => {
+                let explicit =
+                    GbmBo::create_with_modifiers(&gbm_device, width, height, format, modifiers);
+                if *allow_implicit_fallback {
+                    explicit.or_else(|_| GbmBo::create(&gbm_device, width, height, format))
+                } else {
+                    explicit
+                }
             }
-            None => GbmBo::create(&gbm_device, width, height, format),
+            Allocation::ImplicitModifier => GbmBo::create(&gbm_device, width, height, format),
+            Allocation::Refuse => unreachable!("refused allocation was handled above"),
         }
         .with_context(|| format!("failed to allocate GBM buffer {}", i))?;
 
-        // The plane count we actually got, since the filter covers only the
-        // path that goes through it. The modifier is not checked against the
-        // advertised set: `bo.modifier()` goes into `params.add` verbatim, and
-        // after an allocation with no modifier that is whatever the driver
-        // reports -- DRM_FORMAT_MOD_INVALID on Mesa here, a concrete modifier
-        // on other backends. Either way it is a value the compositor never
-        // advertised.
-        // A version-4 compositor answers that with `invalid_format` on
-        // `create_immed`, which unlike the bail below is fatal to the whole
-        // connection rather than a fall back to SHM. `Allocation::Refuse`
-        // closes the case where the compositor offered modifiers and none of
-        // them was single-plane. What stays open is the compositor that
-        // offered none at all, where there is no advertised set to violate,
-        // and the `or_else` above, which allocates without a modifier when the
-        // filtered list fails -- both paths predate this change.
         anyhow::ensure!(
             bo.plane_count() == 1,
             "GBM returned a {}-plane buffer for modifier {:#018x}; the capture path can only \
