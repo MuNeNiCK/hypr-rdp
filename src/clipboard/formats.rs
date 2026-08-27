@@ -5,6 +5,58 @@ pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
 pub(super) const IMAGE_PNG_MIME: &str = "image/png";
 
+/// Normalize CR, LF, and CRLF line endings to Wayland's LF form.
+pub(super) fn normalize_lf(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len());
+    let (mut start, mut i) = (0, 0);
+
+    while i < bytes.len() {
+        if bytes[i] != b'\r' {
+            i += 1;
+            continue;
+        }
+
+        out.push_str(&text[start..i]);
+        out.push('\n');
+        i += usize::from(bytes.get(i + 1) == Some(&b'\n')) + 1;
+        start = i;
+    }
+
+    out.push_str(&text[start..]);
+    out
+}
+
+/// Normalize CR, LF, and CRLF line endings to the CRLF form required by
+/// `CF_UNICODETEXT`.
+///
+/// [Standard Clipboard Formats]: https://learn.microsoft.com/en-us/windows/win32/dataxchg/standard-clipboard-formats
+pub(super) fn to_crlf(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 32 + 2);
+    let (mut start, mut i) = (0, 0);
+
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\r' => {
+                out.push_str(&text[start..i]);
+                out.push_str("\r\n");
+                i += usize::from(bytes.get(i + 1) == Some(&b'\n')) + 1;
+                start = i;
+            }
+            b'\n' => {
+                out.push_str(&text[start..i]);
+                out.push_str("\r\n");
+                i += 1;
+                start = i;
+            }
+            _ => i += 1,
+        }
+    }
+    out.push_str(&text[start..]);
+    out
+}
+
 /// Data pending write to Wayland clipboard (from RDP client).
 pub(super) enum PendingWrite {
     Text(Vec<u8>),
@@ -128,7 +180,41 @@ mod tests {
         assert_eq!(fix_bitfields_dib(&not_bitfields), None);
     }
 
+    #[test]
+    fn line_endings_are_normalized_at_both_boundaries() {
+        let text = "\nA\rB\r\nЖ\n";
+
+        assert_eq!(normalize_lf(text), "\nA\nB\nЖ\n");
+        assert_eq!(to_crlf(text), "\r\nA\r\nB\r\nЖ\r\n");
+    }
+
+    fn text_with_line_endings() -> impl Strategy<Value = String> {
+        proptest::collection::vec(
+            proptest::sample::select(vec!["a", "b", "\u{444}", " ", "\r\n", "\n", "\r", ""]),
+            0..64,
+        )
+        .prop_map(|parts| parts.concat())
+    }
+
     proptest! {
+        #[test]
+        fn generated_line_endings_round_trip(text in text_with_line_endings()) {
+            let wire = to_crlf(&text);
+            prop_assert_eq!(normalize_lf(&wire), normalize_lf(&text));
+
+            let mut i = 0;
+            while i < wire.len() {
+                match wire.as_bytes()[i] {
+                    b'\r' => {
+                        prop_assert_eq!(wire.as_bytes().get(i + 1), Some(&b'\n'));
+                        i += 2;
+                    }
+                    b'\n' => prop_assert!(false, "bare LF in CF_UNICODETEXT input"),
+                    _ => i += 1,
+                }
+            }
+        }
+
         #[test]
         fn generated_utf16le_conversion_stops_at_first_nul(
             before in proptest::collection::vec(1u16..=0xd7ff, 0..32),

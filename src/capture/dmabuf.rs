@@ -45,8 +45,12 @@ extern "C" {
     fn gbm_bo_get_stride(bo: *mut gbm_bo) -> u32;
     fn gbm_bo_get_offset(bo: *mut gbm_bo, plane: libc::c_int) -> u32;
     fn gbm_bo_get_modifier(bo: *mut gbm_bo) -> u64;
-    #[allow(dead_code)]
     fn gbm_bo_get_plane_count(bo: *mut gbm_bo) -> libc::c_int;
+    fn gbm_device_get_format_modifier_plane_count(
+        gbm: *mut gbm_device,
+        format: u32,
+        modifier: u64,
+    ) -> libc::c_int;
     #[allow(dead_code)]
     fn gbm_bo_get_fd_for_plane(bo: *mut gbm_bo, plane: libc::c_int) -> libc::c_int;
     #[allow(dead_code)]
@@ -75,7 +79,46 @@ pub struct GbmDevice {
     _drm_fd: OwnedFd,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum Allocation {
+    WithModifiers {
+        modifiers: Vec<u64>,
+        allow_implicit_fallback: bool,
+    },
+    ImplicitModifier,
+    Refuse,
+}
+
+fn single_plane_modifiers(modifiers: &[u64], plane_count: impl Fn(u64) -> i32) -> Vec<u64> {
+    modifiers
+        .iter()
+        .copied()
+        .filter(|modifier| *modifier != DRM_FORMAT_MOD_INVALID && plane_count(*modifier) == 1)
+        .collect()
+}
+
+pub fn plan_allocation(modifiers: &[u64], plane_count: impl Fn(u64) -> i32) -> Allocation {
+    let allow_implicit_fallback =
+        modifiers.is_empty() || modifiers.contains(&DRM_FORMAT_MOD_INVALID);
+    let single_plane = single_plane_modifiers(modifiers, plane_count);
+    if !single_plane.is_empty() {
+        Allocation::WithModifiers {
+            modifiers: single_plane,
+            allow_implicit_fallback,
+        }
+    } else if allow_implicit_fallback {
+        Allocation::ImplicitModifier
+    } else {
+        Allocation::Refuse
+    }
+}
+
 impl GbmDevice {
+    /// How many planes this format and modifier need, without allocating.
+    pub fn format_modifier_plane_count(&self, format: u32, modifier: u64) -> i32 {
+        unsafe { gbm_device_get_format_modifier_plane_count(self.ptr, format, modifier) }
+    }
+
     pub fn new(drm_fd: OwnedFd) -> Result<Self> {
         use std::os::unix::io::AsRawFd;
         let ptr = unsafe { gbm_create_device(drm_fd.as_raw_fd()) };
@@ -245,4 +288,50 @@ pub fn open_drm_device(path: &Path) -> Result<OwnedFd> {
         .write(true)
         .open(path)?;
     Ok(OwnedFd::from(file))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{plan_allocation, Allocation, DRM_FORMAT_MOD_INVALID};
+
+    const LINEAR: u64 = 0;
+    const AMD_DCC: u64 = 0x0200_0000_0056_bb03;
+
+    #[test]
+    fn allocation_plan_preserves_implicit_modifier_support() {
+        assert_eq!(
+            plan_allocation(&[], |_| unreachable!("no modifier to ask about")),
+            Allocation::ImplicitModifier
+        );
+        assert_eq!(
+            plan_allocation(&[DRM_FORMAT_MOD_INVALID], |_| {
+                panic!("implicit modifier must not be queried")
+            }),
+            Allocation::ImplicitModifier
+        );
+        assert_eq!(
+            plan_allocation(&[LINEAR], |_| 1),
+            Allocation::WithModifiers {
+                modifiers: vec![LINEAR],
+                allow_implicit_fallback: false,
+            }
+        );
+        assert_eq!(
+            plan_allocation(&[LINEAR, DRM_FORMAT_MOD_INVALID], |_| 1),
+            Allocation::WithModifiers {
+                modifiers: vec![LINEAR],
+                allow_implicit_fallback: true,
+            }
+        );
+    }
+
+    #[test]
+    fn allocation_plan_refuses_unusable_explicit_modifiers() {
+        assert_eq!(plan_allocation(&[AMD_DCC], |_| 2), Allocation::Refuse);
+        assert_eq!(plan_allocation(&[AMD_DCC], |_| -1), Allocation::Refuse);
+        assert_eq!(
+            plan_allocation(&[AMD_DCC, DRM_FORMAT_MOD_INVALID], |_| 2),
+            Allocation::ImplicitModifier
+        );
+    }
 }

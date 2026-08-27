@@ -13,7 +13,9 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::formats::{fix_bitfields_dib, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE};
+use super::formats::{
+    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE,
+};
 use super::wayland::clipboard_thread;
 
 #[derive(Clone, Debug, Default)]
@@ -22,9 +24,8 @@ pub(super) struct ClipboardEchoCandidate {
     cf_dib: Option<Vec<u8>>,
 }
 
-/// Sends one locally originated format list and snapshots the exact data it
-/// advertised. The snapshot is eligible for only the next remote copy, which
-/// keeps content-based echo detection from overriding later ownership changes.
+/// Sends one locally originated format list and snapshots its advertised data.
+/// The snapshot is eligible for the next remote paste request only.
 pub(super) fn announce_local_formats(
     event_sender: &mpsc::UnboundedSender<ServerEvent>,
     echo_candidate: &Arc<Mutex<Option<ClipboardEchoCandidate>>>,
@@ -89,14 +90,12 @@ impl CliprdrBackendFactory for HyprCliprdrFactory {
         let clipboard_image = Arc::new(Mutex::new(None::<Vec<u8>>));
         let pending_write = Arc::new(Mutex::new(None::<PendingWrite>));
         let echo_candidate = Arc::new(Mutex::new(None::<ClipboardEchoCandidate>));
-        let suppress = Arc::new(AtomicBool::new(false));
         let running = Arc::new(AtomicBool::new(true));
 
         Box::new(HyprCliprdrBackend {
             event_sender: self.event_sender.clone(),
             remote_formats: Vec::new(),
             watcher_thread: None,
-            suppress_watcher: suppress,
             clipboard_data,
             clipboard_image,
             pending_write,
@@ -114,7 +113,6 @@ struct HyprCliprdrBackend {
     event_sender: Option<mpsc::UnboundedSender<ServerEvent>>,
     remote_formats: Vec<ClipboardFormat>,
     watcher_thread: Option<thread::JoinHandle<()>>,
-    suppress_watcher: Arc<AtomicBool>,
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>, // CF_DIB bytes
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
@@ -206,7 +204,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             "Clipboard: remote clipboard updated"
         );
         self.remote_formats = available_formats.to_vec();
-        self.pending_echo_candidate = self
+        let echo_candidate = self
             .echo_candidate
             .lock()
             .ok()
@@ -233,14 +231,24 @@ impl CliprdrBackend for HyprCliprdrBackend {
             None
         };
 
-        self.last_requested_format = format;
+        let Some(format) = format else {
+            self.last_requested_format = None;
+            self.pending_echo_candidate = None;
+            return;
+        };
 
-        if let Some(fmt) = format {
-            if let Some(ref sender) = self.event_sender {
-                let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
-                    fmt,
-                )));
-            }
+        // Format Data Responses carry no request ID. Keep one request state for
+        // repeated announcements that select the same format.
+        if self.last_requested_format == Some(format) {
+            return;
+        }
+
+        self.last_requested_format = Some(format);
+        self.pending_echo_candidate = echo_candidate;
+        if let Some(ref sender) = self.event_sender {
+            let _ = sender.send(ServerEvent::Clipboard(ClipboardMessage::SendInitiatePaste(
+                format,
+            )));
         }
     }
 
@@ -250,7 +258,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             match data {
                 Some(ref data) if !data.is_empty() => {
                     let text = String::from_utf8_lossy(data);
-                    FormatDataResponse::new_unicode_string(&text).into_owned()
+                    FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
                 }
                 _ => FormatDataResponse::new_error().into_owned(),
             }
@@ -318,7 +326,6 @@ impl HyprCliprdrBackend {
                 match ironrdp_cliprdr_format::bitmap::dibv5_to_png(data) {
                     Ok(png_data) => {
                         tracing::trace!(len = png_data.len(), "Clipboard: converted DIBV5 to PNG");
-                        self.suppress_watcher.store(true, Ordering::SeqCst);
                         if let Ok(mut guard) = self.pending_write.lock() {
                             *guard = Some(PendingWrite::Image(png_data));
                         }
@@ -348,7 +355,6 @@ impl HyprCliprdrBackend {
                 match png_result {
                     Ok(png_data) => {
                         tracing::trace!(len = png_data.len(), "Clipboard: converted DIB to PNG");
-                        self.suppress_watcher.store(true, Ordering::SeqCst);
                         if let Ok(mut guard) = self.pending_write.lock() {
                             *guard = Some(PendingWrite::Image(png_data));
                         }
@@ -364,14 +370,12 @@ impl HyprCliprdrBackend {
                     return;
                 }
 
-                // Windows rewrites line endings to CRLF; normalize both for
-                // the echo check and for what Wayland applications paste.
-                let normalized = utf8.replace("\r\n", "\n");
+                let normalized = normalize_lf(&utf8);
                 if echo_candidate
                     .as_ref()
                     .and_then(|candidate| candidate.text.as_deref())
                     .is_some_and(|announced| {
-                        String::from_utf8_lossy(announced).replace("\r\n", "\n") == normalized
+                        normalize_lf(&String::from_utf8_lossy(announced)) == normalized
                     })
                 {
                     tracing::debug!("Clipboard: client text echoes our own copy, ignoring");
@@ -382,7 +386,6 @@ impl HyprCliprdrBackend {
                     len = normalized.len(),
                     "Clipboard: received text from RDP client"
                 );
-                self.suppress_watcher.store(true, Ordering::SeqCst);
                 if let Ok(mut guard) = self.pending_write.lock() {
                     *guard = Some(PendingWrite::Text(normalized.into_bytes()));
                 }
@@ -402,7 +405,6 @@ impl HyprCliprdrBackend {
             None => return,
         };
 
-        let suppress = Arc::clone(&self.suppress_watcher);
         let clipboard_data = Arc::clone(&self.clipboard_data);
         let clipboard_image = Arc::clone(&self.clipboard_image);
         let pending_write = Arc::clone(&self.pending_write);
@@ -414,7 +416,6 @@ impl HyprCliprdrBackend {
             .spawn(move || {
                 if let Err(e) = clipboard_thread(
                     sender,
-                    suppress,
                     clipboard_data,
                     clipboard_image,
                     pending_write,
@@ -456,7 +457,6 @@ mod tests {
                 event_sender: Some(event_tx),
                 remote_formats: Vec::new(),
                 watcher_thread: None,
-                suppress_watcher: Arc::new(AtomicBool::new(false)),
                 clipboard_data: Arc::new(Mutex::new(None)),
                 clipboard_image: Arc::new(Mutex::new(None)),
                 pending_write: Arc::new(Mutex::new(None)),
@@ -478,11 +478,57 @@ mod tests {
     #[test]
     fn client_text_echo_of_our_copy_keeps_wayland_selection() {
         let (mut backend, mut event_rx) = backend_with_events();
-        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld\rend".to_vec());
         backend.on_request_format_list();
         let _ = recv_clipboard_event(&mut event_rx);
         backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
         let _ = recv_clipboard_event(&mut event_rx);
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut event_rx) else {
+            panic!("expected SendFormatData");
+        };
+        let payload = response.data().to_vec();
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(backend.pending_write.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn a_format_list_we_do_not_request_does_not_strand_the_candidate() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::new(0x8000))]);
+
+        assert!(backend.pending_echo_candidate.is_none());
+        assert!(backend.last_requested_format.is_none());
+        assert!(event_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn duplicate_format_list_reuses_the_outstanding_echo_request() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+        backend.on_request_format_list();
+        let _ = recv_clipboard_event(&mut event_rx);
+
+        let formats = [ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)];
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            recv_clipboard_event(&mut event_rx),
+            ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+        ));
+
+        backend.on_remote_copy(&formats);
+        assert!(event_rx.try_recv().is_err());
 
         let payload = utf16le("hello\r\nworld");
         backend.handle_format_data_response(
@@ -491,7 +537,23 @@ mod tests {
         );
 
         assert!(backend.pending_write.lock().unwrap().is_none());
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
+        assert!(backend.last_requested_format.is_none());
+        assert!(backend.pending_echo_candidate.is_none());
+
+        backend.on_remote_copy(&formats);
+        assert!(matches!(
+            recv_clipboard_event(&mut event_rx),
+            ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+        ));
+        backend.handle_format_data_response(
+            FormatDataResponse::new_data(payload.as_slice()),
+            MAX_CLIPBOARD_SIZE,
+        );
+
+        assert!(matches!(
+            backend.pending_write.lock().unwrap().as_ref(),
+            Some(PendingWrite::Text(text)) if text == b"hello\nworld"
+        ));
     }
 
     #[test]
@@ -499,7 +561,7 @@ mod tests {
         let (mut backend, _rx) = backend_with_events();
         backend.last_requested_format = Some(ClipboardFormatId::CF_UNICODETEXT);
 
-        let payload = utf16le("from\r\nclient");
+        let payload = utf16le("from\rclient\r\nnext");
         backend.handle_format_data_response(
             FormatDataResponse::new_data(payload.as_slice()),
             MAX_CLIPBOARD_SIZE,
@@ -509,7 +571,7 @@ mod tests {
         let Some(PendingWrite::Text(text)) = pending.as_ref() else {
             panic!("expected text pending write");
         };
-        assert_eq!(text.as_slice(), b"from\nclient");
+        assert_eq!(text.as_slice(), b"from\nclient\nnext");
     }
 
     #[test]
@@ -529,7 +591,6 @@ mod tests {
         );
 
         assert!(backend.pending_write.lock().unwrap().is_none());
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
     }
 
     #[test]
@@ -592,7 +653,6 @@ mod tests {
         let _ = recv_clipboard_event(&mut event_rx);
         backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[255, 0, 0, 255]);
     }
 
@@ -770,6 +830,31 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
     }
 
+    fn unicode_response_text(data: &[u8]) -> String {
+        let (pairs, _) = data.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let units = units.strip_suffix(&[0]).unwrap_or(&units);
+        String::from_utf16_lossy(units)
+    }
+
+    #[test]
+    fn unicode_text_response_ends_every_line_with_crlf() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some("\none\rtwo\r\n四".as_bytes().to_vec());
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut event_rx) else {
+            panic!("expected SendFormatData");
+        };
+        assert_eq!(
+            unicode_response_text(response.data()),
+            "\r\none\r\ntwo\r\n四"
+        );
+    }
+
     #[test]
     fn format_data_request_returns_unicode_text_response() {
         let (mut backend, mut event_rx) = backend_with_events();
@@ -796,7 +881,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&[b'o', 0, b'k', 0, 0, 0]));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         let pending = backend.pending_write.lock().unwrap();
         match pending.as_ref().expect("pending write") {
             PendingWrite::Text(data) => assert_eq!(data, b"ok"),
@@ -810,7 +894,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&[b'o', 0, b'k', 0, 0, 0]));
 
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert!(backend.pending_write.lock().unwrap().is_none());
     }
 
@@ -823,7 +906,6 @@ mod tests {
         backend.on_format_data_response(FormatDataResponse::new_data(&[b'o', 0, b'k', 0, 0, 0]));
 
         assert_eq!(backend.last_requested_format, None);
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert!(backend.pending_write.lock().unwrap().is_none());
     }
 
@@ -836,7 +918,6 @@ mod tests {
 
         backend.handle_format_data_response(FormatDataResponse::new_data(&oversized), 4);
 
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         let pending = backend.pending_write.lock().unwrap();
         match pending.as_ref().expect("existing pending write remains") {
@@ -854,7 +935,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dib));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[255, 0, 0]);
     }
@@ -868,7 +948,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[255, 0, 0, 255]);
     }
@@ -883,7 +962,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dibv5));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgba, &[17, 34, 51, 127]);
     }
@@ -897,7 +975,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dib));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[17, 34, 51]);
     }
@@ -910,7 +987,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(&dib));
 
-        assert!(backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert_pending_image_pixel(&backend, png::ColorType::Rgb, &[255, 0, 0]);
     }
@@ -922,7 +998,6 @@ mod tests {
 
         backend.on_format_data_response(FormatDataResponse::new_data(b"not a dib"));
 
-        assert!(!backend.suppress_watcher.load(Ordering::SeqCst));
         assert_eq!(backend.last_requested_format, None);
         assert!(backend.pending_write.lock().unwrap().is_none());
     }
@@ -944,7 +1019,6 @@ mod tests {
 
             if let Some(PendingWrite::Image(png_data)) = backend.pending_write.lock().unwrap().as_ref() {
                 let _ = decode_png(png_data);
-                prop_assert!(backend.suppress_watcher.load(Ordering::SeqCst));
             }
             prop_assert_eq!(backend.last_requested_format, None);
         }
