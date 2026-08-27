@@ -13,7 +13,9 @@ use ironrdp_pdu::IntoOwned;
 use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
-use super::formats::{fix_bitfields_dib, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE};
+use super::formats::{
+    fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, MAX_CLIPBOARD_SIZE,
+};
 use super::wayland::clipboard_thread;
 
 #[derive(Clone, Debug, Default)]
@@ -259,7 +261,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             match data {
                 Some(ref data) if !data.is_empty() => {
                     let text = String::from_utf8_lossy(data);
-                    FormatDataResponse::new_unicode_string(&text).into_owned()
+                    FormatDataResponse::new_unicode_string(&to_crlf(&text)).into_owned()
                 }
                 _ => FormatDataResponse::new_error().into_owned(),
             }
@@ -373,14 +375,12 @@ impl HyprCliprdrBackend {
                     return;
                 }
 
-                // Windows rewrites line endings to CRLF; normalize both for
-                // the echo check and for what Wayland applications paste.
-                let normalized = utf8.replace("\r\n", "\n");
+                let normalized = normalize_lf(&utf8);
                 if echo_candidate
                     .as_ref()
                     .and_then(|candidate| candidate.text.as_deref())
                     .is_some_and(|announced| {
-                        String::from_utf8_lossy(announced).replace("\r\n", "\n") == normalized
+                        normalize_lf(&String::from_utf8_lossy(announced)) == normalized
                     })
                 {
                     tracing::debug!("Clipboard: client text echoes our own copy, ignoring");
@@ -487,13 +487,19 @@ mod tests {
     #[test]
     fn client_text_echo_of_our_copy_keeps_wayland_selection() {
         let (mut backend, mut event_rx) = backend_with_events();
-        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld".to_vec());
+        *backend.clipboard_data.lock().unwrap() = Some(b"hello\nworld\rend".to_vec());
         backend.on_request_format_list();
         let _ = recv_clipboard_event(&mut event_rx);
         backend.on_remote_copy(&[ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT)]);
         let _ = recv_clipboard_event(&mut event_rx);
 
-        let payload = utf16le("hello\r\nworld");
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut event_rx) else {
+            panic!("expected SendFormatData");
+        };
+        let payload = response.data().to_vec();
         backend.handle_format_data_response(
             FormatDataResponse::new_data(payload.as_slice()),
             MAX_CLIPBOARD_SIZE,
@@ -565,7 +571,7 @@ mod tests {
         let (mut backend, _rx) = backend_with_events();
         backend.last_requested_format = Some(ClipboardFormatId::CF_UNICODETEXT);
 
-        let payload = utf16le("from\r\nclient");
+        let payload = utf16le("from\rclient\r\nnext");
         backend.handle_format_data_response(
             FormatDataResponse::new_data(payload.as_slice()),
             MAX_CLIPBOARD_SIZE,
@@ -575,7 +581,7 @@ mod tests {
         let Some(PendingWrite::Text(text)) = pending.as_ref() else {
             panic!("expected text pending write");
         };
-        assert_eq!(text.as_slice(), b"from\nclient");
+        assert_eq!(text.as_slice(), b"from\nclient\nnext");
     }
 
     #[test]
@@ -834,6 +840,31 @@ mod tests {
 
         assert_eq!(backend.last_requested_format, None);
         assert!(event_rx.try_recv().is_err());
+    }
+
+    fn unicode_response_text(data: &[u8]) -> String {
+        let (pairs, _) = data.as_chunks::<2>();
+        let units: Vec<u16> = pairs.iter().map(|c| u16::from_le_bytes(*c)).collect();
+        let units = units.strip_suffix(&[0]).unwrap_or(&units);
+        String::from_utf16_lossy(units)
+    }
+
+    #[test]
+    fn unicode_text_response_ends_every_line_with_crlf() {
+        let (mut backend, mut event_rx) = backend_with_events();
+        *backend.clipboard_data.lock().unwrap() = Some("\none\rtwo\r\n四".as_bytes().to_vec());
+
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut event_rx) else {
+            panic!("expected SendFormatData");
+        };
+        assert_eq!(
+            unicode_response_text(response.data()),
+            "\r\none\r\ntwo\r\n四"
+        );
     }
 
     #[test]
