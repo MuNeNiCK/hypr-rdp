@@ -1,15 +1,15 @@
 use std::collections::HashMap;
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ironrdp_cliprdr::pdu::{ClipboardFormat, ClipboardFormatId};
 use ironrdp_server::ServerEvent;
 use tokio::sync::mpsc;
 use wayland_client::backend::ObjectId;
 use wayland_client::protocol::{wl_registry, wl_seat};
-use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, Proxy, QueueHandle};
 use wayland_protocols_wlr::data_control::v1::client::{
     zwlr_data_control_device_v1, zwlr_data_control_manager_v1, zwlr_data_control_offer_v1,
     zwlr_data_control_source_v1,
@@ -28,7 +28,6 @@ fn data_control_manager_version(advertised_version: u32) -> u32 {
 
 pub(super) fn clipboard_thread(
     event_sender: mpsc::UnboundedSender<ServerEvent>,
-    suppress: Arc<AtomicBool>,
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
@@ -45,35 +44,44 @@ pub(super) fn clipboard_thread(
 
     let mut state = ClipState::new(
         event_sender,
-        suppress,
         clipboard_data,
         clipboard_image,
         pending_write,
         echo_candidate,
     );
 
-    event_queue
-        .roundtrip(&mut state)
-        .map_err(|e| anyhow::anyhow!("clipboard: Wayland roundtrip failed: {}", e))?;
+    let wayland_fd = conn.as_fd().as_raw_fd();
+    let ready = dispatch_until_globals_ready(
+        &conn,
+        &mut event_queue,
+        &mut state,
+        wayland_fd,
+        Instant::now() + COMPOSITOR_REPLY_TIMEOUT,
+    )?;
 
-    let manager = state
-        .manager
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("zwlr_data_control_manager_v1 not available"))?
-        .clone();
+    if !ready {
+        let mut missing = Vec::new();
+        if state.manager.is_none() {
+            missing.push("zwlr_data_control_manager_v1");
+        }
+        if state.seat.is_none() {
+            missing.push("wl_seat");
+        }
+        anyhow::bail!(
+            "clipboard: {} not advertised within {:?}",
+            missing.join(" and "),
+            COMPOSITOR_REPLY_TIMEOUT
+        );
+    }
 
-    let seat = state
-        .seat
-        .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("wl_seat not available"))?
-        .clone();
+    let manager = state.manager.as_ref().expect("checked above").clone();
+
+    let seat = state.seat.as_ref().expect("checked above").clone();
 
     let device = manager.get_data_device(&seat, &qh, ());
     state.device = Some(device);
 
     tracing::info!("Clipboard: wlr-data-control-v1 device bound");
-
-    let wayland_fd = conn.as_fd().as_raw_fd();
 
     loop {
         if !running.load(Ordering::Relaxed) {
@@ -93,7 +101,7 @@ pub(super) fn clipboard_thread(
             .map_err(|e| anyhow::anyhow!("clipboard: flush failed: {}", e))?;
 
         // RDP → Wayland: pick up pending_write and set selection
-        if let Some(pending) = state.pending_write.lock().ok().and_then(|mut g| g.take()) {
+        if let Some(pending) = state.take_pending_write(Instant::now()) {
             // Destroy previous source to prevent protocol object leak
             if let Some(old) = state.active_source.take() {
                 old.destroy();
@@ -128,27 +136,18 @@ pub(super) fn clipboard_thread(
                 dev.set_selection(Some(&source));
             }
             state.active_source = Some(source);
-            // Roundtrip processes any echo Selection event while suppress is true
-            event_queue
-                .roundtrip(&mut state)
-                .map_err(|e| anyhow::anyhow!("clipboard: roundtrip failed: {}", e))?;
-            // Clear suppress after roundtrip — echo event already handled
-            state.suppress.store(false, Ordering::SeqCst);
+            // The event loop handles the resulting Selection notification.
+            conn.flush().map_err(|e| {
+                anyhow::anyhow!("clipboard: flush after set_selection failed: {}", e)
+            })?;
         }
 
-        // Poll Wayland fd with 100ms timeout
         let guard = match event_queue.prepare_read() {
             Some(g) => g,
             None => continue,
         };
 
-        let mut pollfd = libc::pollfd {
-            fd: wayland_fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let ret = unsafe { libc::poll(&mut pollfd, 1, 100) };
-        if ret > 0 {
+        if poll_wayland_fd(wayland_fd, WAYLAND_POLL_INTERVAL)? {
             guard
                 .read()
                 .map_err(|e| anyhow::anyhow!("clipboard: read failed: {}", e))?;
@@ -168,7 +167,8 @@ enum SourceType {
 
 struct ClipState {
     event_sender: mpsc::UnboundedSender<ServerEvent>,
-    suppress: Arc<AtomicBool>,
+    /// Deadline for Selection events caused by our own write.
+    suppress_echo_until: Option<Instant>,
     clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
     pending_write: Arc<Mutex<Option<PendingWrite>>>,
@@ -186,7 +186,6 @@ struct ClipState {
 impl ClipState {
     fn new(
         event_sender: mpsc::UnboundedSender<ServerEvent>,
-        suppress: Arc<AtomicBool>,
         clipboard_data: Arc<Mutex<Option<Vec<u8>>>>,
         clipboard_image: Arc<Mutex<Option<Vec<u8>>>>,
         pending_write: Arc<Mutex<Option<PendingWrite>>>,
@@ -194,7 +193,7 @@ impl ClipState {
     ) -> Self {
         Self {
             event_sender,
-            suppress,
+            suppress_echo_until: None,
             clipboard_data,
             clipboard_image,
             pending_write,
@@ -206,6 +205,66 @@ impl ClipState {
             source_data: Arc::new(Mutex::new(None)),
             source_mime: Arc::new(Mutex::new(SourceType::Text)),
             active_source: None,
+        }
+    }
+
+    /// Take one pending write and arm suppression before replacing its source.
+    fn take_pending_write(&mut self, now: Instant) -> Option<PendingWrite> {
+        let pending = self.pending_write.lock().ok().and_then(|mut g| g.take())?;
+        self.suppress_echo_until = Some(now + ECHO_SUPPRESSION_TIMEOUT);
+        Some(pending)
+    }
+
+    /// Suppress the compositor response burst, then accept later selections.
+    fn selection_is_our_echo(&mut self, now: Instant) -> bool {
+        let Some(deadline) = self.suppress_echo_until else {
+            return false;
+        };
+        if now >= deadline {
+            self.suppress_echo_until = None;
+            return false;
+        }
+
+        self.suppress_echo_until = Some(deadline.min(now + ECHO_SUPPRESSION_GRACE));
+        true
+    }
+}
+
+/// Dispatch initial registry events without an unbounded Wayland round trip.
+fn dispatch_until_globals_ready(
+    conn: &Connection,
+    event_queue: &mut EventQueue<ClipState>,
+    state: &mut ClipState,
+    wayland_fd: RawFd,
+    deadline: Instant,
+) -> anyhow::Result<bool> {
+    loop {
+        loop {
+            let n = event_queue
+                .dispatch_pending(state)
+                .map_err(|e| anyhow::anyhow!("clipboard: dispatch_pending failed: {}", e))?;
+            if n == 0 {
+                break;
+            }
+        }
+        if state.manager.is_some() && state.seat.is_some() {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        conn.flush()
+            .map_err(|e| anyhow::anyhow!("clipboard: flush failed: {}", e))?;
+        let Some(guard) = event_queue.prepare_read() else {
+            continue;
+        };
+        if poll_wayland_fd(wayland_fd, remaining)? {
+            guard
+                .read()
+                .map_err(|e| anyhow::anyhow!("clipboard: read failed: {}", e))?;
+        } else {
+            drop(guard);
         }
     }
 }
@@ -259,7 +318,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 state.offer_mimes.insert(id.id(), Vec::new());
             }
             zwlr_data_control_device_v1::Event::Selection { id } => {
-                if state.suppress.load(Ordering::SeqCst) {
+                if state.selection_is_our_echo(Instant::now()) {
                     if let Some(offer) = id {
                         state.offer_mimes.remove(&offer.id());
                         offer.destroy();
@@ -393,12 +452,48 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
     }
 }
 
-/// No-progress and overall deadlines for clipboard pipe transfers. The
-/// watcher thread services these transfers inline, and the backend joins
-/// that thread on drop — an unbounded read or write here therefore wedges
-/// the whole server, so both directions must always terminate.
+const WAYLAND_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const COMPOSITOR_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
+const ECHO_SUPPRESSION_TIMEOUT: Duration = Duration::from_secs(2);
+const ECHO_SUPPRESSION_GRACE: Duration = Duration::from_millis(100);
+
+/// No-progress and overall deadlines for clipboard pipe transfers.
 const PIPE_STALL_TIMEOUT: Duration = Duration::from_secs(2);
 const PIPE_TOTAL_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn poll_wayland_fd(fd: RawFd, timeout: Duration) -> std::io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as libc::c_int;
+
+        match unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } {
+            0 => return Ok(false),
+            n if n > 0 => {
+                if pollfd.revents & libc::POLLNVAL != 0 {
+                    return Err(std::io::Error::from_raw_os_error(libc::EBADF));
+                }
+                return Ok(pollfd.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0);
+            }
+            _ => {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
 
 fn pipe_cloexec() -> std::io::Result<(OwnedFd, OwnedFd)> {
     let mut fds = [0i32; 2];
@@ -669,6 +764,87 @@ mod tests {
 
     const FAST_STALL: Duration = Duration::from_millis(300);
     const FAST_TOTAL: Duration = Duration::from_secs(3);
+
+    fn clip_state() -> ClipState {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        ClipState::new(
+            event_tx,
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+        )
+    }
+
+    #[test]
+    fn taking_the_rdp_write_arms_echo_suppression() {
+        let now = Instant::now();
+
+        for pending in [
+            PendingWrite::Text(b"pasted from the client".to_vec()),
+            PendingWrite::Image(vec![0u8; 16]),
+        ] {
+            let mut state = clip_state();
+            assert!(state.take_pending_write(now).is_none());
+            assert!(!state.selection_is_our_echo(now));
+
+            *state.pending_write.lock().unwrap() = Some(pending);
+
+            assert!(state.take_pending_write(now).is_some());
+            assert_eq!(
+                state.suppress_echo_until,
+                Some(now + ECHO_SUPPRESSION_TIMEOUT)
+            );
+            assert!(state.pending_write.lock().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn compositor_response_burst_is_suppressed_then_expires() {
+        let mut state = clip_state();
+        let started = Instant::now();
+        *state.pending_write.lock().unwrap() = Some(PendingWrite::Text(vec![1]));
+        state.take_pending_write(started).unwrap();
+
+        let first = started + Duration::from_millis(10);
+        assert!(state.selection_is_our_echo(first));
+        let grace_deadline = first + ECHO_SUPPRESSION_GRACE;
+        assert_eq!(state.suppress_echo_until, Some(grace_deadline));
+
+        assert!(state.selection_is_our_echo(first + Duration::from_millis(1)));
+        assert_eq!(state.suppress_echo_until, Some(grace_deadline));
+
+        assert!(!state.selection_is_our_echo(grace_deadline));
+        assert_eq!(state.suppress_echo_until, None);
+    }
+
+    #[test]
+    fn wayland_poll_returns_when_the_fd_stays_unreadable() {
+        let (read_fd, write_fd) = pipe_pair();
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        let poller = std::thread::spawn(move || {
+            result_tx
+                .send(poll_wayland_fd(
+                    read_fd.as_raw_fd(),
+                    Duration::from_millis(50),
+                ))
+                .unwrap();
+        });
+
+        let result = result_rx
+            .recv_timeout(Duration::from_millis(500))
+            .expect("Wayland poll exceeded its deadline");
+        drop(write_fd);
+        poller.join().unwrap();
+
+        assert!(!result.unwrap());
+    }
+
+    #[test]
+    fn wayland_poll_rejects_an_invalid_fd() {
+        let error = poll_wayland_fd(i32::MAX, Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EBADF));
+    }
 
     fn pipe_pair() -> (OwnedFd, OwnedFd) {
         pipe_cloexec().unwrap()
