@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -166,11 +167,10 @@ impl ConfigFile {
 }
 
 pub struct RuntimeConfig {
-    pub bind: String,
+    pub bind: SocketAddr,
     pub cert: Option<String>,
     pub key: Option<String>,
-    pub username: String,
-    pub password: String,
+    pub credentials: Option<ConfigCredentials>,
     pub resolution: (u32, u32),
     pub capture_mode: CaptureMode,
     pub bitrate: u32,
@@ -188,6 +188,51 @@ pub struct RuntimeConfig {
     pub on_session_end: Option<String>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct ConfigCredentials {
+    pub username: String,
+    pub password: String,
+}
+
+impl ConfigCredentials {
+    fn from_parts(username: String, password: String) -> Option<Self> {
+        if username.is_empty() && password.is_empty() {
+            None
+        } else {
+            Some(Self { username, password })
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StartupWarning {
+    AuthenticationOff,
+    ReachableBeyondLoopback,
+    HalfCredentials,
+}
+
+fn startup_warnings(
+    credentials: Option<&ConfigCredentials>,
+    bind: SocketAddr,
+) -> Vec<StartupWarning> {
+    let mut warnings = Vec::new();
+
+    if credentials.is_none() {
+        warnings.push(StartupWarning::AuthenticationOff);
+    } else if credentials
+        .is_some_and(|value| value.username.is_empty() || value.password.is_empty())
+    {
+        warnings.push(StartupWarning::HalfCredentials);
+    }
+
+    let password_is_empty = credentials.is_none_or(|value| value.password.is_empty());
+    if password_is_empty && !bind.ip().to_canonical().is_loopback() {
+        warnings.push(StartupWarning::ReachableBeyondLoopback);
+    }
+
+    warnings
+}
+
 impl RuntimeConfig {
     pub fn load() -> anyhow::Result<Self> {
         let args = Args::parse();
@@ -197,17 +242,25 @@ impl RuntimeConfig {
             .bind
             .or(config.bind)
             .unwrap_or_else(|| "127.0.0.1:3389".into());
+        let bind = parse_bind_addr(&bind)?;
         let cert = args.cert.or(config.cert);
         let key = args.key.or(config.key);
         let username = args.username.or(config.username).unwrap_or_default();
         let password = args.password.or(config.password).unwrap_or_default();
+        let credentials = ConfigCredentials::from_parts(username, password);
 
-        if username.is_empty() || password.is_empty() {
-            tracing::warn!(
-                "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
-            );
-            if bind.starts_with("0.0.0.0") {
-                tracing::warn!("Binding to all interfaces without credentials is a security risk.");
+        for warning in startup_warnings(credentials.as_ref(), bind) {
+            match warning {
+                StartupWarning::AuthenticationOff => tracing::warn!(
+                    "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
+                ),
+                StartupWarning::ReachableBeyondLoopback => tracing::warn!(
+                    bind = %bind,
+                    "RDP is reachable beyond loopback without a password."
+                ),
+                StartupWarning::HalfCredentials => tracing::warn!(
+                    "Only one half of the credentials is set; the other one is matched as empty."
+                ),
             }
         }
 
@@ -260,8 +313,7 @@ impl RuntimeConfig {
             bind,
             cert,
             key,
-            username,
-            password,
+            credentials,
             resolution,
             capture_mode,
             bitrate,
@@ -279,6 +331,11 @@ impl RuntimeConfig {
             on_session_end,
         })
     }
+}
+
+fn parse_bind_addr(bind: &str) -> anyhow::Result<SocketAddr> {
+    bind.parse()
+        .map_err(|error| anyhow::anyhow!("invalid bind address: {error}"))
 }
 
 fn parse_h264_backend_policy(s: &str) -> anyhow::Result<H264BackendPolicy> {
@@ -427,6 +484,67 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
     use std::fs;
+    use StartupWarning::*;
+
+    fn warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
+        let credentials = ConfigCredentials::from_parts(username.to_owned(), password.to_owned());
+        startup_warnings(credentials.as_ref(), parse_bind_addr(bind).unwrap())
+    }
+
+    #[test]
+    fn credential_classification_preserves_every_configured_shape() {
+        assert!(ConfigCredentials::from_parts(String::new(), String::new()).is_none());
+
+        for (username, password) in [("user", "secret"), ("user", ""), ("", "secret")] {
+            let credentials =
+                ConfigCredentials::from_parts(username.to_owned(), password.to_owned()).unwrap();
+            assert_eq!(credentials.username, username);
+            assert_eq!(credentials.password, password);
+        }
+    }
+
+    #[test]
+    fn no_password_warns_only_beyond_canonical_loopback() {
+        for bind in [
+            "0.0.0.0:3389",
+            "[::]:3389",
+            "[::ffff:0.0.0.0]:3389",
+            "192.168.1.5:3389",
+        ] {
+            assert_eq!(
+                warnings("", "", bind),
+                vec![AuthenticationOff, ReachableBeyondLoopback],
+                "{bind}"
+            );
+        }
+
+        for bind in ["127.0.0.1:3389", "[::1]:3389", "[::ffff:127.0.0.1]:3389"] {
+            assert_eq!(warnings("", "", bind), vec![AuthenticationOff], "{bind}");
+        }
+    }
+
+    #[test]
+    fn half_credentials_follow_the_actual_empty_secret() {
+        assert_eq!(
+            warnings("user", "", "0.0.0.0:3389"),
+            vec![HalfCredentials, ReachableBeyondLoopback]
+        );
+        assert_eq!(
+            warnings("", "secret", "0.0.0.0:3389"),
+            vec![HalfCredentials]
+        );
+        assert_eq!(
+            warnings("user", "", "127.0.0.1:3389"),
+            vec![HalfCredentials]
+        );
+        assert!(warnings("user", "secret", "0.0.0.0:3389").is_empty());
+    }
+
+    #[test]
+    fn invalid_bind_address_is_rejected_by_config() {
+        let error = parse_bind_addr("not an address").expect_err("invalid bind must fail");
+        assert!(format!("{error:#}").contains("invalid bind address"));
+    }
 
     fn temp_config_path(name: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
