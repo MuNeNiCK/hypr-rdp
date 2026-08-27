@@ -14,7 +14,7 @@ use crate::capture::{HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
 use crate::config::RuntimeConfig;
 use crate::egfx::{EgfxShared, HyprGfxFactory};
-use crate::input::{ClientKeyboardLayoutSink, HyprInputHandler, SharedOutputLayout};
+use crate::input::{HyprInputHandler, RdpInputSessionSink, SharedOutputLayout};
 
 mod session_hooks;
 mod tls;
@@ -76,10 +76,10 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let input_handler =
         HyprInputHandler::new(rdp_width, rdp_height, output_layout, keyboard_layout_policy)
             .context("failed to initialize input handler")?;
-    let keyboard_layout_sink = input_handler
-        .client_keyboard_layout_handle()
+    let input_session_sink = input_handler
+        .rdp_input_session_handle()
         .context("input handler has no command channel")?;
-    let keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink> = Box::new(keyboard_layout_sink);
+    let input_session_sink: Box<dyn RdpInputSessionSink> = Box::new(input_session_sink);
 
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
@@ -106,7 +106,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
-            keyboard_layout_sink,
+            input_session_sink,
             session_hooks,
         ))))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
@@ -139,17 +139,17 @@ pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
 
 /// Adapts IronRDP connection boundaries to application-owned policies.
 struct ClientConnectionHandler {
-    keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>,
+    input_session_sink: Box<dyn RdpInputSessionSink>,
     session_hooks: Option<SessionHooks>,
 }
 
 impl ClientConnectionHandler {
     fn new(
-        keyboard_layout_sink: Box<dyn ClientKeyboardLayoutSink>,
+        input_session_sink: Box<dyn RdpInputSessionSink>,
         session_hooks: Option<SessionHooks>,
     ) -> Self {
         Self {
-            keyboard_layout_sink,
+            input_session_sink,
             session_hooks,
         }
     }
@@ -157,7 +157,7 @@ impl ClientConnectionHandler {
 
 impl ConnectionHandler for ClientConnectionHandler {
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
-        self.keyboard_layout_sink
+        self.input_session_sink
             .set_keyboard_layout(info.keyboard_layout);
         if let Some(hooks) = &mut self.session_hooks {
             hooks.session_started();
@@ -173,6 +173,7 @@ impl ConnectionHandler for ClientConnectionHandler {
         _duration: Duration,
         _error: Option<&anyhow::Error>,
     ) -> PostConnectionAction {
+        self.input_session_sink.session_ended();
         if let Some(hooks) = &mut self.session_hooks {
             hooks.session_ended();
         }
@@ -236,8 +237,9 @@ mod tests {
     #[test]
     fn connection_handler_drives_hooks_on_both_boundaries() {
         struct NoopSink;
-        impl ClientKeyboardLayoutSink for NoopSink {
+        impl RdpInputSessionSink for NoopSink {
             fn set_keyboard_layout(&self, _keyboard_layout: u32) {}
+            fn session_ended(&self) {}
         }
 
         let log = hook_log_path("forwarding");
@@ -258,6 +260,34 @@ mod tests {
     }
 
     #[test]
+    fn disconnecting_notifies_the_input_session_sink() {
+        use std::sync::{Arc, Mutex};
+
+        struct ReleaseRecordingSink {
+            released: Arc<Mutex<bool>>,
+        }
+
+        impl RdpInputSessionSink for ReleaseRecordingSink {
+            fn set_keyboard_layout(&self, _keyboard_layout: u32) {}
+            fn session_ended(&self) {
+                *self.released.lock().unwrap() = true;
+            }
+        }
+
+        let released = Arc::new(Mutex::new(false));
+        let mut handler = ClientConnectionHandler::new(
+            Box::new(ReleaseRecordingSink {
+                released: Arc::clone(&released),
+            }),
+            None,
+        );
+
+        handler.on_disconnected(test_peer(), Duration::from_secs(1), None);
+
+        assert!(*released.lock().unwrap());
+    }
+
+    #[test]
     fn on_connection_info_forwards_keyboard_layout_to_sink() {
         use std::sync::{Arc, Mutex};
 
@@ -265,10 +295,11 @@ mod tests {
             layouts: Arc<Mutex<Vec<u32>>>,
         }
 
-        impl ClientKeyboardLayoutSink for RecordingSink {
+        impl RdpInputSessionSink for RecordingSink {
             fn set_keyboard_layout(&self, keyboard_layout: u32) {
                 self.layouts.lock().unwrap().push(keyboard_layout);
             }
+            fn session_ended(&self) {}
         }
 
         let layouts = Arc::new(Mutex::new(Vec::new()));

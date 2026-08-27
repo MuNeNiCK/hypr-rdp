@@ -17,25 +17,18 @@ impl RdpServerInputHandler for HyprInputHandler {
     }
 }
 
-/// Owner-specific sink for client keyboard-layout metadata.
-///
-/// The server connection layer forwards `ConnectionInfo.keyboard_layout`
-/// (MS-RDPBCGR 2.2.1.3.2 Client Core Data) here after authentication. The
-/// input module owns the policy that turns the HKL into an XKB keymap
-/// command; the connection layer must not depend on `InputCommand`.
-pub(crate) trait ClientKeyboardLayoutSink: Send {
+/// Input-owned adapter for RDP session metadata and lifecycle events.
+pub(crate) trait RdpInputSessionSink: Send {
     fn set_keyboard_layout(&self, keyboard_layout: u32);
+    fn session_ended(&self);
 }
 
-/// Production `ClientKeyboardLayoutSink` owned by the input module: applies
-/// the layout policy and enqueues an `ApplyKeymap` command on the input
-/// actor's channel.
-pub(crate) struct ClientKeyboardLayoutHandle {
+pub(crate) struct RdpInputSessionHandle {
     keyboard_layout_policy: KeyboardLayoutPolicy,
     commands: Weak<mpsc::Sender<InputCommand>>,
 }
 
-impl ClientKeyboardLayoutHandle {
+impl RdpInputSessionHandle {
     pub(super) fn new(
         keyboard_layout_policy: KeyboardLayoutPolicy,
         commands: Weak<mpsc::Sender<InputCommand>>,
@@ -47,7 +40,16 @@ impl ClientKeyboardLayoutHandle {
     }
 }
 
-impl ClientKeyboardLayoutSink for ClientKeyboardLayoutHandle {
+impl RdpInputSessionSink for RdpInputSessionHandle {
+    fn session_ended(&self) {
+        let Some(commands) = self.commands.upgrade() else {
+            return;
+        };
+        if commands.send(InputCommand::ReleaseHeldKeys).is_err() {
+            tracing::warn!("Input actor is gone; keys held at session end stay held");
+        }
+    }
+
     fn set_keyboard_layout(&self, keyboard_layout: u32) {
         let Some(keymap_data) =
             client_keymap_from_keyboard_layout(self.keyboard_layout_policy, keyboard_layout)
@@ -110,10 +112,10 @@ mod tests {
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
-    use super::{client_keymap_from_keyboard_layout, ClientKeyboardLayoutHandle};
+    use super::{client_keymap_from_keyboard_layout, RdpInputSessionHandle};
     use crate::input::actor::InputCommand;
     use crate::input::keyboard::KeyboardStateTracker;
-    use crate::input::rdp::ClientKeyboardLayoutSink;
+    use crate::input::rdp::RdpInputSessionSink;
     use crate::input::wayland::HyprInputHandler;
     use crate::input::KeyboardLayoutPolicy;
     use ironrdp_server::{KeyboardEvent, RdpServerInputHandler};
@@ -195,13 +197,26 @@ mod tests {
     }
 
     #[test]
-    fn client_keyboard_layout_handle_sends_apply_keymap_for_supported_layout() {
+    fn rdp_input_session_handle_enqueues_session_end() {
         let (commands, receiver) = mpsc::channel();
         let commands = Arc::new(commands);
-        let handle = ClientKeyboardLayoutHandle::new(
-            KeyboardLayoutPolicy::Client,
-            Arc::downgrade(&commands),
-        );
+        let handle =
+            RdpInputSessionHandle::new(KeyboardLayoutPolicy::Client, Arc::downgrade(&commands));
+
+        handle.session_ended();
+
+        let command = receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the end of a session must reach the input actor");
+        assert!(matches!(command, InputCommand::ReleaseHeldKeys));
+    }
+
+    #[test]
+    fn rdp_input_session_handle_sends_apply_keymap_for_supported_layout() {
+        let (commands, receiver) = mpsc::channel();
+        let commands = Arc::new(commands);
+        let handle =
+            RdpInputSessionHandle::new(KeyboardLayoutPolicy::Client, Arc::downgrade(&commands));
 
         handle.set_keyboard_layout(0x00000407);
 
@@ -221,13 +236,11 @@ mod tests {
     }
 
     #[test]
-    fn client_keyboard_layout_handle_keeps_existing_keymap_when_unknown() {
+    fn rdp_input_session_handle_keeps_existing_keymap_when_unknown() {
         let (commands, receiver) = mpsc::channel();
         let commands = Arc::new(commands);
-        let handle = ClientKeyboardLayoutHandle::new(
-            KeyboardLayoutPolicy::Client,
-            Arc::downgrade(&commands),
-        );
+        let handle =
+            RdpInputSessionHandle::new(KeyboardLayoutPolicy::Client, Arc::downgrade(&commands));
 
         handle.set_keyboard_layout(0x0000ffff);
 
@@ -238,13 +251,11 @@ mod tests {
     }
 
     #[test]
-    fn compositor_keyboard_layout_handle_ignores_supported_client_layout() {
+    fn compositor_policy_ignores_supported_client_layout() {
         let (commands, receiver) = mpsc::channel();
         let commands = Arc::new(commands);
-        let handle = ClientKeyboardLayoutHandle::new(
-            KeyboardLayoutPolicy::Compositor,
-            Arc::downgrade(&commands),
-        );
+        let handle =
+            RdpInputSessionHandle::new(KeyboardLayoutPolicy::Compositor, Arc::downgrade(&commands));
 
         handle.set_keyboard_layout(0x00000407);
 
@@ -255,13 +266,11 @@ mod tests {
     }
 
     #[test]
-    fn client_keyboard_layout_handle_does_not_keep_input_actor_alive() {
+    fn rdp_input_session_handle_does_not_keep_input_actor_alive() {
         let (commands, receiver) = mpsc::channel();
         let commands = Arc::new(commands);
-        let handle = ClientKeyboardLayoutHandle::new(
-            KeyboardLayoutPolicy::Client,
-            Arc::downgrade(&commands),
-        );
+        let handle =
+            RdpInputSessionHandle::new(KeyboardLayoutPolicy::Client, Arc::downgrade(&commands));
 
         drop(commands);
 

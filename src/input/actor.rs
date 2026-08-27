@@ -33,6 +33,9 @@ pub(super) enum InputCommand {
     Keyboard(KeyboardEvent),
     /// A mouse event forwarded from the RDP input handler.
     Mouse(MouseEvent),
+    /// The session ended: release anything the client left held. The actor
+    /// outlives a single connection, so nothing else would.
+    ReleaseHeldKeys,
     /// Replace the active keymap (client keyboard layout policy).
     ApplyKeymap {
         keymap_data: Vec<u8>,
@@ -61,6 +64,10 @@ struct DepressedKeys {
 }
 
 impl DepressedKeys {
+    fn is_empty(&self) -> bool {
+        self.plain.is_empty() && self.modifiers.is_empty() && self.unicode_shift_owners.is_empty()
+    }
+
     fn holds_modifier(&self, evdev_key: u32) -> bool {
         self.modifiers.contains(&evdev_key)
     }
@@ -189,6 +196,15 @@ pub(super) fn run_input_actor(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    release_held_keys(
+        &mut tracker,
+        &mut depressed,
+        &mut backend,
+        epoch.elapsed().as_millis() as u32,
+        "shutdown",
+    );
+
     tracing::debug!("Input actor stopped");
 }
 
@@ -203,6 +219,9 @@ fn handle_command(
     let t = epoch.elapsed().as_millis() as u32;
 
     match command {
+        InputCommand::ReleaseHeldKeys => {
+            release_held_keys(tracker, depressed, sink, t, "session-end")
+        }
         InputCommand::Keyboard(event) => handle_rdp_event(tracker, depressed, sink, t, event),
         InputCommand::Mouse(event) => sink.mouse(t, event),
         InputCommand::ApplyKeymap {
@@ -439,18 +458,39 @@ fn release_depressed(
     depressed: &mut DepressedKeys,
     sink: &mut impl KeyboardSink,
     t: u32,
-) {
+) -> usize {
     let unicode_shift_only =
         !depressed.unicode_shift_owners.is_empty() && !depressed.holds_modifier(LEFT_SHIFT_KEY);
+    let mut released = 0;
     for evdev_key in depressed.release_all() {
         sink.key(t, evdev_key, false);
         tracker.key(evdev_key, false);
+        released += 1;
     }
     if unicode_shift_only {
         sink.key(t, LEFT_SHIFT_KEY, false);
         tracker.key(LEFT_SHIFT_KEY, false);
+        released += 1;
     }
     depressed.unicode_shift_owners.clear();
+    released
+}
+
+fn release_held_keys(
+    tracker: &mut KeyboardStateTracker,
+    depressed: &mut DepressedKeys,
+    sink: &mut impl KeyboardSink,
+    t: u32,
+    reason: &'static str,
+) {
+    if depressed.is_empty() {
+        return;
+    }
+
+    let released = release_depressed(tracker, depressed, sink, t);
+    sink.modifiers(tracker.modifier_state());
+    sink.flush();
+    tracing::info!(released, reason, "Released held keys");
 }
 
 fn is_modifier(evdev_key: u32) -> bool {
@@ -502,6 +542,127 @@ mod tests {
         fn mouse(&mut self, _time: u32, _event: MouseEvent) {
             self.calls.push(SinkCall::Mouse);
         }
+    }
+
+    struct SharedSink {
+        calls: Arc<std::sync::Mutex<Vec<SinkCall>>>,
+    }
+
+    impl KeyboardSink for SharedSink {
+        fn key(&mut self, _time: u32, evdev_key: u32, pressed: bool) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(SinkCall::Key { evdev_key, pressed });
+        }
+        fn modifiers(&mut self, state: KeyboardModifierState) {
+            self.calls.lock().unwrap().push(SinkCall::Modifiers(state));
+        }
+        fn keymap(&mut self, keymap_data: &[u8]) -> bool {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(SinkCall::Keymap(keymap_data.len()));
+            true
+        }
+        fn flush(&mut self) {
+            self.calls.lock().unwrap().push(SinkCall::Flush);
+        }
+    }
+
+    impl InputBackend for SharedSink {
+        fn mouse(&mut self, _time: u32, _event: MouseEvent) {
+            self.calls.lock().unwrap().push(SinkCall::Mouse);
+        }
+    }
+
+    #[test]
+    fn session_end_releases_all_key_owners_and_flushes() {
+        let mut tracker = tracker();
+        let calls = run(
+            &mut tracker,
+            vec![
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1c,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::Pressed {
+                    code: 0x1d,
+                    extended: false,
+                }),
+                InputCommand::Keyboard(KeyboardEvent::UnicodePressed('A' as u16)),
+                InputCommand::ReleaseHeldKeys,
+            ],
+        );
+
+        let release_suffix = &calls[calls.len() - 6..];
+        assert_eq!(
+            release_suffix,
+            [
+                SinkCall::Key {
+                    evdev_key: 30,
+                    pressed: false,
+                },
+                SinkCall::Key {
+                    evdev_key: 28,
+                    pressed: false,
+                },
+                SinkCall::Key {
+                    evdev_key: 29,
+                    pressed: false,
+                },
+                SinkCall::Key {
+                    evdev_key: LEFT_SHIFT_KEY,
+                    pressed: false,
+                },
+                SinkCall::Modifiers(KeyboardModifierState::default()),
+                SinkCall::Flush,
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_session_end_is_a_noop() {
+        let mut tracker = tracker();
+        assert!(run(&mut tracker, vec![InputCommand::ReleaseHeldKeys]).is_empty());
+    }
+
+    #[test]
+    fn actor_shutdown_releases_held_keys_and_flushes() {
+        let keymap = generate_xkb_keymap_from_names(&XkbKeymapNames::default())
+            .expect("default keymap compiles");
+        let (commands, receiver) = mpsc::channel();
+        commands
+            .send(InputCommand::Keyboard(KeyboardEvent::Pressed {
+                code: 0x1c,
+                extended: false,
+            }))
+            .unwrap();
+        drop(commands);
+
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        run_input_actor(
+            receiver,
+            keymap,
+            "test",
+            Instant::now(),
+            SharedSink {
+                calls: Arc::clone(&calls),
+            },
+        );
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(
+            &calls[calls.len() - 3..],
+            [
+                SinkCall::Key {
+                    evdev_key: 28,
+                    pressed: false,
+                },
+                SinkCall::Modifiers(KeyboardModifierState::default()),
+                SinkCall::Flush,
+            ]
+        );
     }
 
     /// A backend whose device rejects every keymap announcement.
