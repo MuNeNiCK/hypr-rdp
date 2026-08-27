@@ -9,7 +9,7 @@ use libva_sys::va_display_drm as va;
 
 pub(crate) use va::{
     VABufferID, VAConfigAttrib, VAConfigID, VAContextID, VADisplay, VAEntrypoint, VAImage,
-    VAImageFormat, VAProfile, VARectangle, VAStatus, VASurfaceAttrib, VASurfaceID,
+    VAImageFormat, VAProfile, VAStatus, VASurfaceAttrib, VASurfaceID,
 };
 
 #[repr(C)]
@@ -82,6 +82,24 @@ pub(crate) struct VaDisplay {
     _fd: OwnedFd,
 }
 
+struct PendingVaDisplay(VADisplay);
+
+impl PendingVaDisplay {
+    fn into_raw(self) -> VADisplay {
+        let raw = self.0;
+        mem::forget(self);
+        raw
+    }
+}
+
+impl Drop for PendingVaDisplay {
+    fn drop(&mut self) {
+        unsafe {
+            va::vaTerminate(self.0);
+        }
+    }
+}
+
 impl VaDisplay {
     pub(crate) fn open_drm(path: &Path) -> Result<Rc<Self>> {
         let file = std::fs::OpenOptions::new()
@@ -95,6 +113,7 @@ impl VaDisplay {
         if raw.is_null() {
             bail!("vaGetDisplayDRM returned NULL for {}", path.display());
         }
+        let pending = PendingVaDisplay(raw);
 
         let mut major = 0;
         let mut minor = 0;
@@ -103,7 +122,14 @@ impl VaDisplay {
             "vaInitialize",
         )?;
 
-        Ok(Rc::new(Self { raw, _fd: fd }))
+        Ok(Rc::new(Self {
+            raw: pending.into_raw(),
+            _fd: fd,
+        }))
+    }
+
+    pub(super) fn raw(&self) -> VADisplay {
+        self.raw
     }
 
     pub(crate) fn query_vendor_string(&self) -> Result<String> {

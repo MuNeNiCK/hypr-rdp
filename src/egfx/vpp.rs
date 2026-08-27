@@ -2,13 +2,14 @@
 //!
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 use libva_sys::va_display_drm as va;
 
 use super::vaapi_sys::{
     self as sys, va_check, VABufferID, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
-    VADisplay, VARectangle, VASurfaceAttrib, VASurfaceID,
+    VASurfaceAttrib, VASurfaceID,
 };
 
 // Constants from VA-API headers
@@ -32,87 +33,37 @@ pub(crate) struct VppDmaBufInfo {
     pub(crate) uv_offset: u32,
 }
 
-/// Local VAProcPipelineParameterBuffer definition for bindings that omit it.
-/// Layout verified against C sizeof on x86_64 (224 bytes).
-#[repr(C)]
-struct VAProcPipelineParameterBuffer {
-    surface: VASurfaceID,
-    _pad0: u32,
-    surface_region: *const VARectangle,
-    surface_color_standard: u32,
-    _pad1: u32,
-    output_region: *const VARectangle,
-    output_background_color: u32,
-    output_color_standard: u32,
-    pipeline_flags: u32,
-    filter_flags: u32,
-    filters: *const VABufferID,
-    num_filters: u32,
-    _pad2: u32,
-    forward_references: *const VASurfaceID,
-    num_forward_references: u32,
-    _pad3: u32,
-    backward_references: *const VASurfaceID,
-    num_backward_references: u32,
-    rotation_state: u32,
-    blend_state: *const std::ffi::c_void,
-    mirror_state: u32,
-    _pad4: u32,
-    additional_outputs: *const VASurfaceID,
-    num_additional_outputs: u32,
-    input_surface_flag: u32,
-    output_surface_flag: u32,
-    input_color_properties: [u32; 2],
-    output_color_properties: [u32; 2],
-    processing_mode: u32,
-    _pad5: u32,
-    output_hdr_metadata: *const std::ffi::c_void,
-    va_reserved: [u32; 16],
-}
+#[cfg(all(target_arch = "x86_64", target_pointer_width = "64"))]
+const _: () = {
+    assert!(std::mem::size_of::<va::VAProcPipelineParameterBuffer>() == 224);
+    assert!(std::mem::offset_of!(va::VAProcPipelineParameterBuffer, output_hdr_metadata) == 152);
+    assert!(std::mem::offset_of!(va::VAProcPipelineParameterBuffer, va_reserved) == 160);
+};
 
 /// VA-API VPP color converter: XRGB DMA-BUF -> NV12 DMA-BUF.
 pub struct VppConverter {
-    va_display: VADisplay,
+    va_display: Rc<sys::VaDisplay>,
     config_id: VAConfigID,
     context_id: VAContextID,
     input_surfaces: Vec<VASurfaceID>,
     output_surface: VASurfaceID,
     width: u32,
     height: u32,
-    _drm_fd: OwnedFd,
     nv12_export_fd: Option<OwnedFd>,
 }
 
 impl VppConverter {
     /// Create a VPP converter using the given DRM device.
     pub fn new(drm_device_path: &Path, width: u32, height: u32) -> Result<Self> {
-        let drm_fd = {
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(drm_device_path)
-                .context("failed to open DRM device for VPP")?;
-            OwnedFd::from(file)
-        };
-
-        let va_display = unsafe { va::vaGetDisplayDRM(drm_fd.as_raw_fd()) };
-        if va_display.is_null() {
-            bail!("vaGetDisplayDRM returned NULL for VPP");
-        }
-
-        let mut major = 0i32;
-        let mut minor = 0i32;
-        va_check(
-            unsafe { va::vaInitialize(va_display, &mut major, &mut minor) },
-            "vaInitialize (VPP)",
-        )?;
+        let va_display = sys::VaDisplay::open_drm(drm_device_path)?;
+        let display = va_display.raw();
 
         // Create VPP config: VAProfileNone + VAEntrypointVideoProc
         let mut config_id: VAConfigID = 0;
         va_check(
             unsafe {
                 va::vaCreateConfig(
-                    va_display,
+                    display,
                     sys::VA_PROFILE_NONE,
                     sys::VA_ENTRYPOINT_VIDEO_PROC,
                     std::ptr::null_mut(),
@@ -138,7 +89,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateSurfaces(
-                    va_display,
+                    display,
                     VA_RT_FORMAT_YUV420,
                     width,
                     height,
@@ -156,7 +107,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateContext(
-                    va_display,
+                    display,
                     config_id,
                     width as i32,
                     height as i32,
@@ -184,7 +135,6 @@ impl VppConverter {
             output_surface,
             width,
             height,
-            _drm_fd: drm_fd,
             nv12_export_fd: None,
         })
     }
@@ -239,7 +189,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaCreateSurfaces(
-                    self.va_display,
+                    self.va_display.raw(),
                     rt_format,
                     width,
                     height,
@@ -269,7 +219,7 @@ impl VppConverter {
         va_check(
             unsafe {
                 va::vaExportSurfaceHandle(
-                    self.va_display,
+                    self.va_display.raw(),
                     self.output_surface,
                     VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2,
                     VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_COMPOSED_LAYERS,
@@ -319,50 +269,19 @@ impl VppConverter {
             .get(input_surface_idx)
             .context("invalid VPP input surface index")?;
 
-        // Build VPP pipeline parameter buffer
-        let pipeline_param = VAProcPipelineParameterBuffer {
-            surface: input_surface,
-            _pad0: 0,
-            surface_region: std::ptr::null(),
-            surface_color_standard: 0,
-            _pad1: 0,
-            output_region: std::ptr::null(),
-            output_background_color: 0,
-            output_color_standard: 0,
-            pipeline_flags: 0,
-            filter_flags: 0,
-            filters: std::ptr::null(),
-            num_filters: 0,
-            _pad2: 0,
-            forward_references: std::ptr::null(),
-            num_forward_references: 0,
-            _pad3: 0,
-            backward_references: std::ptr::null(),
-            num_backward_references: 0,
-            rotation_state: 0,
-            blend_state: std::ptr::null(),
-            mirror_state: 0,
-            _pad4: 0,
-            additional_outputs: std::ptr::null(),
-            num_additional_outputs: 0,
-            input_surface_flag: 0,
-            output_surface_flag: 0,
-            input_color_properties: [0; 2],
-            output_color_properties: [0; 2],
-            processing_mode: 0,
-            _pad5: 0,
-            output_hdr_metadata: std::ptr::null(),
-            va_reserved: [0; 16],
-        };
+        // vaCreateBuffer copies the full struct, including reserved bytes and padding.
+        // SAFETY: the binding contains only integers, raw pointers, and arrays thereof.
+        let mut pipeline_param: va::VAProcPipelineParameterBuffer = unsafe { std::mem::zeroed() };
+        pipeline_param.surface = input_surface;
 
         let mut buffer_id: VABufferID = 0;
         va_check(
             unsafe {
                 va::vaCreateBuffer(
-                    self.va_display,
+                    self.va_display.raw(),
                     self.context_id,
                     va::VABufferType_VAProcPipelineParameterBufferType,
-                    std::mem::size_of::<VAProcPipelineParameterBuffer>() as u32,
+                    std::mem::size_of::<va::VAProcPipelineParameterBuffer>() as u32,
                     1,
                     &pipeline_param as *const _ as *mut std::ffi::c_void,
                     &mut buffer_id,
@@ -374,27 +293,29 @@ impl VppConverter {
         let result = (|| -> Result<()> {
             va_check(
                 unsafe {
-                    va::vaBeginPicture(self.va_display, self.context_id, self.output_surface)
+                    va::vaBeginPicture(self.va_display.raw(), self.context_id, self.output_surface)
                 },
                 "vaBeginPicture (VPP)",
             )?;
             va_check(
-                unsafe { va::vaRenderPicture(self.va_display, self.context_id, &mut buffer_id, 1) },
+                unsafe {
+                    va::vaRenderPicture(self.va_display.raw(), self.context_id, &mut buffer_id, 1)
+                },
                 "vaRenderPicture (VPP)",
             )?;
             va_check(
-                unsafe { va::vaEndPicture(self.va_display, self.context_id) },
+                unsafe { va::vaEndPicture(self.va_display.raw(), self.context_id) },
                 "vaEndPicture (VPP)",
             )?;
             va_check(
-                unsafe { va::vaSyncSurface(self.va_display, self.output_surface) },
+                unsafe { va::vaSyncSurface(self.va_display.raw(), self.output_surface) },
                 "vaSyncSurface (VPP output)",
             )?;
             Ok(())
         })();
 
         unsafe {
-            va::vaDestroyBuffer(self.va_display, buffer_id);
+            va::vaDestroyBuffer(self.va_display.raw(), buffer_id);
         }
 
         result
@@ -417,12 +338,11 @@ impl Drop for VppConverter {
     fn drop(&mut self) {
         unsafe {
             for surface_id in &mut self.input_surfaces {
-                va::vaDestroySurfaces(self.va_display, surface_id, 1);
+                va::vaDestroySurfaces(self.va_display.raw(), surface_id, 1);
             }
-            va::vaDestroySurfaces(self.va_display, &mut self.output_surface, 1);
-            va::vaDestroyContext(self.va_display, self.context_id);
-            va::vaDestroyConfig(self.va_display, self.config_id);
-            va::vaTerminate(self.va_display);
+            va::vaDestroySurfaces(self.va_display.raw(), &mut self.output_surface, 1);
+            va::vaDestroyContext(self.va_display.raw(), self.context_id);
+            va::vaDestroyConfig(self.va_display.raw(), self.config_id);
         }
     }
 }
