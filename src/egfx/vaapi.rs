@@ -359,10 +359,10 @@ fn vaapi_rate_control_policy(
             pic_init_qp: H264_DEFAULT_PIC_INIT_QP,
             bits_per_second: bitrate,
             target_percentage: 100,
-            initial_qp: 0,
+            initial_qp: qp.into(),
             min_qp: 0,
             rc_flags: 0,
-            max_qp: 0,
+            max_qp: u32::from(qp.max(1)),
         },
         H264RateControl::Cqp => VaapiRateControlPolicy {
             config_mode: sys::VA_RC_CQP,
@@ -1630,6 +1630,149 @@ impl BitWriter {
 mod tests {
     use super::*;
 
+    fn tiled_bgra_frame(width: usize, height: usize, phase: usize) -> Vec<u8> {
+        let stride = width * 4;
+        let mut frame = vec![0u8; stride * height];
+        for y in 0..height {
+            for x in 0..width {
+                let tile_x = x / 48;
+                let tile_y = y / 40;
+                let seed = tile_x
+                    .wrapping_mul(73_856_093)
+                    .wrapping_add(tile_y.wrapping_mul(19_349_663))
+                    .wrapping_add(phase.wrapping_mul(83_492_791));
+                let mut rgb = [
+                    24 + (seed & 0x9f) as u8,
+                    24 + ((seed >> 8) & 0x9f) as u8,
+                    24 + ((seed >> 16) & 0x9f) as u8,
+                ];
+                if (x + phase * 13).is_multiple_of(17) || (y + phase * 7).is_multiple_of(19) {
+                    rgb = [224, 226, 232];
+                }
+                let offset = y * stride + x * 4;
+                frame[offset] = rgb[2];
+                frame[offset + 1] = rgb[1];
+                frame[offset + 2] = rgb[0];
+                frame[offset + 3] = 255;
+            }
+        }
+        frame
+    }
+
+    fn expected_luma(bgra: &[u8]) -> Vec<u8> {
+        bgra.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|pixel| {
+                let b = i32::from(pixel[0]);
+                let g = i32::from(pixel[1]);
+                let r = i32::from(pixel[2]);
+                ((54 * r + 183 * g + 18 * b) >> 8).clamp(0, 255) as u8
+            })
+            .collect()
+    }
+
+    fn decoded_luma_mse(picture: &ffmpeg_next::frame::Video, expected: &[u8]) -> f64 {
+        let width = picture.width() as usize;
+        let height = picture.height() as usize;
+        let stride = picture.stride(0);
+        let mut squared_error = 0u64;
+        for (row, expected_row) in expected.chunks_exact(width).enumerate().take(height) {
+            let decoded_row = &picture.data(0)[row * stride..row * stride + width];
+            for (&actual, &target) in decoded_row.iter().zip(expected_row) {
+                let error = i32::from(actual) - i32::from(target);
+                squared_error += (error * error) as u64;
+            }
+        }
+        squared_error as f64 / (width * height) as f64
+    }
+
+    #[test]
+    #[ignore = "requires a VA-API H.264 encoder"]
+    fn vaapi_vbr_abrupt_scene_recovers_decoded_quality_without_human_viewing() {
+        use ffmpeg_next as ffmpeg;
+
+        const WIDTH: usize = 1920;
+        const HEIGHT: usize = 1200;
+        const FPS: u32 = 30;
+        const MAX_RECOVERY_FRAMES: usize = 3;
+        const RECOVERED_LUMA_MSE: f64 = 50.0;
+
+        let mut encoder = VaapiEncoder::new(
+            WIDTH as u32,
+            HEIGHT as u32,
+            10_000_000,
+            FPS,
+            23,
+            H264RateControl::Vbr,
+        )
+        .expect("raw VA-API VBR encoder must initialize");
+        ffmpeg::init().expect("FFmpeg must initialize");
+        let codec = ffmpeg::decoder::find(ffmpeg::codec::Id::H264)
+            .expect("FFmpeg H.264 decoder must be available");
+        let mut decoder = ffmpeg::codec::context::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .expect("FFmpeg H.264 decoder must initialize");
+        let before = tiled_bgra_frame(WIDTH, HEIGHT, 0);
+        let settled = tiled_bgra_frame(WIDTH, HEIGHT, 100);
+
+        for _ in 0..FPS / 2 {
+            let packet = encoder
+                .encode(&before, WIDTH * 4)
+                .expect("pre-transition frame must encode");
+            decoder
+                .send_packet(&ffmpeg::Packet::copy(&packet))
+                .expect("pre-transition packet must be accepted");
+            let mut picture = ffmpeg::frame::Video::empty();
+            decoder
+                .receive_frame(&mut picture)
+                .expect("pre-transition packet must produce a picture");
+        }
+
+        let mut recovered_at = None;
+        let mut worst_transition_mse = 0.0f64;
+        for frame_index in 0..FPS as usize {
+            let changing;
+            let current = if frame_index < FPS as usize / 2 {
+                changing = tiled_bgra_frame(WIDTH, HEIGHT, frame_index + 1);
+                &changing
+            } else {
+                &settled
+            };
+            let expected = expected_luma(current);
+            let packet = encoder
+                .encode(current, WIDTH * 4)
+                .expect("post-transition frame must encode");
+            decoder
+                .send_packet(&ffmpeg::Packet::copy(&packet))
+                .expect("post-transition packet must be accepted");
+            let mut picture = ffmpeg::frame::Video::empty();
+            decoder
+                .receive_frame(&mut picture)
+                .expect("post-transition packet must produce a picture");
+            let mse = decoded_luma_mse(&picture, &expected);
+            eprintln!(
+                "post-transition frame {frame_index}: bytes={}, luma_mse={mse:.2}",
+                packet.len()
+            );
+            if frame_index < FPS as usize / 2 {
+                worst_transition_mse = worst_transition_mse.max(mse);
+            } else if mse <= RECOVERED_LUMA_MSE {
+                recovered_at.get_or_insert(frame_index - FPS as usize / 2);
+            }
+        }
+
+        assert!(
+            worst_transition_mse <= RECOVERED_LUMA_MSE,
+            "decoded luma exceeded MSE {RECOVERED_LUMA_MSE} during the transition: {worst_transition_mse:.2}"
+        );
+        assert!(
+            recovered_at.is_some_and(|frame| frame <= MAX_RECOVERY_FRAMES),
+            "decoded luma did not recover below MSE {RECOVERED_LUMA_MSE} within {MAX_RECOVERY_FRAMES} frames; first recovery: {recovered_at:?}"
+        );
+    }
+
     struct TestBitReader {
         data: Vec<u8>,
         bit_pos: usize,
@@ -1969,23 +2112,35 @@ mod tests {
     }
 
     #[test]
-    fn vaapi_vbr_policy_uses_configured_bitrate_without_qp_controls() {
+    fn vaapi_vbr_policy_honors_bitrate_and_quality_ceiling() {
         let policy = vaapi_rate_control_policy(10_000_000, 23, H264RateControl::Vbr);
 
         assert_eq!(policy.config_mode, sys::VA_RC_VBR);
         assert_eq!(policy.bits_per_second, 10_000_000);
         assert_eq!(policy.pic_init_qp, H264_DEFAULT_PIC_INIT_QP);
-        assert_eq!(policy.initial_qp, 0);
+        assert_eq!(policy.initial_qp, 23);
         assert_eq!(policy.min_qp, 0);
         assert_eq!(policy.target_percentage, 100);
         assert_eq!(policy.rc_flags, 0);
-        assert_eq!(policy.max_qp, 0);
+        assert_eq!(policy.max_qp, 23);
 
         let parameters = vaapi_rate_control_parameters(policy, 30);
         let hrd = parameters.hrd.expect("VBR bitrate target requires HRD");
+        assert_eq!(parameters.rate_control.bits_per_second, 10_000_000);
+        assert_eq!(parameters.rate_control.target_percentage, 100);
+        assert_eq!(parameters.rate_control.window_size, 1000);
+        assert_eq!(parameters.rate_control.initial_qp, 23);
+        assert_eq!(parameters.rate_control.max_qp, 23);
         assert_eq!(hrd.initial_buffer_fullness, 5_000_000);
         assert_eq!(hrd.buffer_size, 10_000_000);
         assert_eq!(parameters.frame_rate.framerate, 30);
+    }
+
+    #[test]
+    fn vaapi_vbr_policy_represents_quality_zero_with_active_ceiling() {
+        let policy = vaapi_rate_control_policy(10_000_000, 0, H264RateControl::Vbr);
+        assert_eq!(policy.initial_qp, 0);
+        assert_eq!(policy.max_qp, 1);
     }
 
     #[test]
