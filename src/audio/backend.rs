@@ -284,6 +284,27 @@ mod tests {
         }
     }
 
+    /// A capture thread that does not notice the stop signal promptly -- what a
+    /// PipeWire loop blocked inside a library call looks like from here.
+    struct SlowToStopRunner {
+        delay: Duration,
+    }
+
+    impl AudioCaptureRunner for SlowToStopRunner {
+        fn spawn(
+            &self,
+            _sender: mpsc::UnboundedSender<ServerEvent>,
+            _stop_signal: Arc<AtomicBool>,
+            startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            let delay = self.delay;
+            Ok(thread::spawn(move || {
+                let _ = startup_tx.send(Ok(()));
+                thread::sleep(delay);
+            }))
+        }
+    }
+
     struct FailingStartupRunner;
 
     impl AudioCaptureRunner for FailingStartupRunner {
@@ -340,6 +361,43 @@ mod tests {
             formats: vec![advertised_format()],
             audio_mode,
         }
+    }
+
+    /// Issue #66: the server wedges with the accept backlog full and CPU at 0%.
+    ///
+    /// `stop()` is reached from `Drop`, and the drop happens inside
+    /// `RdpServer::run`'s accept loop -- the pinned IronRDP clears the static
+    /// channel set between `run_connection` returning and the next `accept()`.
+    /// Everything `stop()` does is therefore on the loop's own thread, and the
+    /// loop runs on a `LocalSet`, so nothing else in the server progresses
+    /// meanwhile.
+    ///
+    /// Startup is already bounded by `AUDIO_STARTUP_TIMEOUT`. Teardown is not
+    /// bounded at all: `handle.join()` waits for the capture thread however
+    /// long it takes, and the routing guard then runs several `pactl`
+    /// subprocesses through a blocking `Command::output()` with no timeout
+    /// either. A capture thread that stops noticing the flag -- or a `pactl`
+    /// that never returns -- wedges the listener while the process stays alive,
+    /// which is why `Restart=always` does not recover it.
+    #[test]
+    fn stopping_capture_does_not_wait_on_the_capture_thread_forever() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut handler = handler_with_runner(
+            Some(event_tx),
+            Arc::new(SlowToStopRunner {
+                delay: Duration::from_secs(2),
+            }),
+        );
+        handler.start_capture().expect("capture starts");
+
+        let started = std::time::Instant::now();
+        handler.stop();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "stop() blocked the accept loop for {elapsed:?}; teardown has no deadline"
+        );
     }
 
     #[test]
