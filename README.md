@@ -4,7 +4,7 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 
 ## Features
 
-- **H.264/EGFX** — AVC420 by default, experimental AVC444 support, and VA-API acceleration with automatic software fallback
+- **H.264/EGFX** — AVC420 by default, experimental AVC444 support, and VA-API acceleration with automatic software fallback; clients that never open the graphics pipeline are sent bitmap updates instead
 - **Screen capture** — `wlr-screencopy-v1` and `ext-image-copy-capture-v1` protocols
 - **Audio** — PipeWire audio forwarding via RDPSND
 - **Clipboard** — Bidirectional text and image clipboard sync

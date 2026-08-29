@@ -496,6 +496,26 @@ mod tests {
         ));
     }
 
+    /// Zero-copy capture has no bitmap path at all, so a client that never
+    /// opens the graphics pipeline can only be served by handing the session to
+    /// the SHM loop. That hand-off is this classification: anything but a
+    /// geometry change falls back, and this must fall back.
+    ///
+    /// The wording deliberately avoids the phrase the warning uses, so that
+    /// counting the warning in a log does not also count this.
+    #[test]
+    fn ext_dmabuf_gives_up_to_shm_when_the_pipeline_never_opens() {
+        let never_opened = anyhow::anyhow!(
+            "DMA-BUF capture has no bitmap path and the graphics pipeline stayed closed; \
+             falling back to SHM"
+        );
+
+        assert_eq!(
+            dmabuf_capture_error_action(&never_opened),
+            DmaBufCaptureErrorAction::FallBackToShm
+        );
+    }
+
     #[test]
     fn ext_dmabuf_source_geometry_error_restarts_instead_of_shm_fallback() {
         let restart = anyhow::Error::new(dmabuf_capture::DmaBufCaptureSessionGeometryChanged);

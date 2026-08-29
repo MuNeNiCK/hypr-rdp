@@ -236,6 +236,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
             self.shared.ready_generation.fetch_add(1, Ordering::Release);
         }
         self.shared.ready.store(true, Ordering::Release);
+        self.shared.note_gfx_ready();
     }
 
     fn on_close(&mut self) {

@@ -496,6 +496,17 @@ impl FrameProcessor {
 
     /// Process a captured frame. Returns true if the capture loop should continue.
     pub(super) fn process(&mut self, data: &[u8], tx: &mpsc::Sender<DisplayUpdate>) -> bool {
+        self.process_at(data, tx, Instant::now())
+    }
+
+    /// The body, with the clock passed in: the fallback below is a deadline,
+    /// and a deadline nothing can move is a deadline nothing can test.
+    pub(super) fn process_at(
+        &mut self,
+        data: &[u8],
+        tx: &mpsc::Sender<DisplayUpdate>,
+        now: Instant,
+    ) -> bool {
         let force_egfx_full_frame = self
             .egfx_shared
             .as_ref()
@@ -871,9 +882,16 @@ impl FrameProcessor {
             .map(|s| (s.is_ready(), s.is_avc_enabled()));
         let egfx_runtime_available =
             self.egfx_active && self.h264_encoder.is_some() && self.egfx_surface_id.is_some();
+        // The wait for an unready pipeline lives in `EgfxShared`, not here: this
+        // processor is torn down and rebuilt on every resize, and a client that
+        // has already shown it will not open the channel must not buy a fresh
+        // grace period each time.
         let should_send_bitmap = match egfx_state {
             None => true,
-            Some((false, _)) => false,
+            Some((false, _)) => self
+                .egfx_shared
+                .as_ref()
+                .is_some_and(|shared| shared.bitmap_fallback_due(now)),
             Some((true, avc_enabled)) => !avc_enabled || !egfx_runtime_available,
         };
 
@@ -907,12 +925,13 @@ mod tests {
     use crate::display::geometry::{PresentationGeometry, Size};
     use crate::egfx::test_support::{
         ack_frame, drain_gfx_pdus, negotiated_avc444_egfx, negotiated_egfx_with_policy,
-        negotiated_no_avc_egfx, process_avc444_capabilities, start_gfx_channel,
-        tracked_avc444_session, unnegotiated_egfx_shared, Avc444PresentationOracle,
-        ExpectedAvc444Encoding, TestQueueDepth,
+        negotiated_no_avc_egfx, process_avc444_capabilities, process_no_avc_capabilities,
+        start_gfx_channel, tracked_avc444_session, unnegotiated_egfx_session,
+        unnegotiated_egfx_shared, Avc444PresentationOracle, ExpectedAvc444Encoding, TestQueueDepth,
     };
     use crate::egfx::{
         EgfxCodecPolicy, H264RateControl, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT,
+        GFX_READY_GRACE,
     };
     use crate::input::OutputLayoutSnapshot;
     use ironrdp_server::{DisplayUpdate, PixelFormat};
@@ -1344,6 +1363,250 @@ mod tests {
         assert!(!processor.sent_first_frame);
         assert!(processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
+    }
+
+    /// Issue #65. A client that never opens `rdpgfx` -- FreeRDP 2.x asking for
+    /// 32-bit colour does exactly this -- leaves the channel unready forever,
+    /// and waiting for it unconditionally meant sending nothing for the whole
+    /// session. The client then paints its own empty viewport: white under GTK,
+    /// black under X11, which is why the same bug is reported as both.
+    #[test]
+    fn frame_processor_stops_waiting_for_an_egfx_channel_that_never_opens() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        );
+
+        // The grace is a person waiting in front of a blank screen, so its size
+        // is part of the fix and not a tuning knob. Asserted here rather than
+        // only used symbolically: every other assertion in these tests is
+        // written in terms of the constant and would hold at any value.
+        assert!(
+            GFX_READY_GRACE <= Duration::from_secs(5),
+            "a client that never opens the channel shows nothing for this long: {GFX_READY_GRACE:?}"
+        );
+
+        let start = Instant::now();
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start));
+        assert!(
+            display_rx.try_recv().is_err(),
+            "the activation sequence is still worth waiting for"
+        );
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start + GFX_READY_GRACE));
+
+        assert!(
+            matches!(display_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+            "past the grace the client must get pixels, not silence"
+        );
+        assert!(processor.sent_first_frame);
+    }
+
+    /// The wait itself is still the right thing to do at first: bitmaps mixed
+    /// into the activation sequence are worse than a moment of nothing.
+    #[test]
+    fn frame_processor_still_waits_inside_the_grace() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        );
+
+        let start = Instant::now();
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start));
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(
+            &frame,
+            &display_tx,
+            start + GFX_READY_GRACE - Duration::from_millis(1)
+        ));
+
+        assert!(display_rx.try_recv().is_err());
+        assert!(!processor.sent_first_frame);
+        assert!(processor.has_pending_damage());
+    }
+
+    /// `process` is the only production caller, and the wall clock enters at
+    /// exactly one line inside it. Every other test here supplies its own
+    /// instant to `process_at`, so nothing else touches that wiring -- and a
+    /// clock frozen there ships the original bug in full: a client that never
+    /// opens the channel gets nothing for the whole session, with a green
+    /// suite.
+    #[test]
+    fn the_deadline_process_uses_moves_with_wall_time() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+
+        // Start the connection's clock in the past, close enough to the grace
+        // that a short real sleep crosses it.
+        let nearly_done = Instant::now()
+            .checked_sub(GFX_READY_GRACE)
+            .expect("clock has room")
+            + Duration::from_millis(60);
+        assert!(!shared.bitmap_fallback_due(nearly_done));
+
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        );
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&frame, &display_tx));
+        assert!(
+            display_rx.try_recv().is_err(),
+            "still inside the grace by the real clock"
+        );
+
+        std::thread::sleep(Duration::from_millis(120));
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&frame, &display_tx));
+        assert!(
+            matches!(display_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+            "the deadline must move with wall time, not with a clock that stopped"
+        );
+    }
+
+    /// A channel that has been ready once needs no second wait. The grace
+    /// protects an activation sequence from having bitmaps mixed into it; a
+    /// client that already negotiated has no activation left to protect, so
+    /// waiting again would only freeze its screen for two seconds.
+    #[test]
+    fn a_channel_that_was_ready_once_does_not_wait_again() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let mut session =
+            unnegotiated_egfx_session(width as u16, height as u16, EgfxCodecPolicy::Auto);
+
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new(
+            Some(Arc::clone(&session.shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        );
+
+        let start = Instant::now();
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start));
+        assert!(display_rx.try_recv().is_err(), "still worth waiting for");
+
+        start_gfx_channel(&mut session.bridge);
+        process_no_avc_capabilities(&mut session.bridge);
+        assert!(session.shared.is_ready());
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start + Duration::from_millis(10)));
+        assert!(matches!(
+            display_rx.try_recv(),
+            Ok(DisplayUpdate::Bitmap(_))
+        ));
+
+        // The client closes the channel. No grace this time.
+        session.shared.mark_not_ready_for_test();
+        let changed: Vec<u8> = frame.iter().map(|byte| !byte).collect();
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&changed, &display_tx, start + Duration::from_millis(20)));
+        assert!(
+            matches!(display_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+            "a channel that already negotiated must not buy another two seconds of silence"
+        );
+    }
+
+    /// The capture loop is torn down and rebuilt on every resize, taking the
+    /// frame processor with it. If the wait lived there, a client that never
+    /// opens the channel would freeze for the whole grace after each resize --
+    /// which is what a FreeRDP 2.x session with dynamic resolution does every
+    /// time the window is dragged.
+    #[test]
+    fn a_rebuilt_processor_does_not_start_the_wait_over() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let build = |shared: &Arc<crate::egfx::EgfxShared>| {
+            FrameProcessor::new(
+                Some(Arc::clone(shared)),
+                width as u32,
+                height as u32,
+                PixelFormat::BgrA32,
+                stride as u32,
+                1_000_000,
+                23,
+                H264RateControl::Vbr,
+                30,
+            )
+        };
+
+        let start = Instant::now();
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let mut first = build(&shared);
+        first.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(first.process_at(&frame, &first_tx, start));
+        assert!(first_rx.try_recv().is_err());
+        drop(first);
+
+        // The resize happens here: same connection, new processor.
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let mut second = build(&shared);
+        second.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(second.process_at(&frame, &second_tx, start + GFX_READY_GRACE));
+
+        assert!(
+            matches!(second_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+            "the wait belongs to the connection, not to whichever processor is current"
+        );
     }
 
     #[test]

@@ -523,6 +523,18 @@ pub(super) fn capture_loop_ext_dmabuf(
                     }
                 }
 
+                // Zero-copy has no bitmap path: everything here goes through the
+                // graphics pipeline. A client that never opens it would be sent
+                // nothing at all for the whole session, so once the wait is up
+                // this hands the session to the SHM loop, which does have one.
+                if !session_refresh.ready && shared.bitmap_fallback_due(std::time::Instant::now()) {
+                    frame.destroy();
+                    bail!(
+                        "DMA-BUF capture has no bitmap path and the graphics pipeline stayed \
+                         closed; falling back to SHM"
+                    );
+                }
+
                 if session_refresh.ready && h264_encoder.is_some() {
                     if !egfx_session.ensure_surface(shared, width as u16, height as u16) {
                         continue;
