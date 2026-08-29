@@ -48,7 +48,9 @@ pipewire = "0.9"
 libc = "0.2"
 
 # TLS auto-cert generation
-rcgen = "0.13"
+# aws_lc_rs rather than the default ring backend: ring cannot generate RSA keys,
+# and rustls already builds aws-lc here, so this costs no new build tooling.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 # Clipboard image support (DIB/PNG conversion)
 ironrdp-cliprdr-format = { git = "https://github.com/MuNeNICK/IronRDP.git", rev = "227afa01569a3c1d14a55b938f8d4a0d7584d999" }

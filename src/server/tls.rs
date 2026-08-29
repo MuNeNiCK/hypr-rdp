@@ -59,9 +59,19 @@ fn auto_generate_tls_in(config_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     }
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(subject_alt_names)
-            .context("failed to generate self-signed certificate")?;
+    // RSA rather than rcgen's default P-256. This certificate authenticates
+    // nothing -- it is self-signed and every client warns about it -- so its
+    // only job is to let the handshake finish, and the key algorithm is the one
+    // thing about it a client can refuse outright. rdesktop 1.9 does:
+    // "Peer's certificate public key algorithm is not RSA". RSA-2048 is
+    // accepted by every RDP client that accepts anything, and a user who wants
+    // a modern key can still bring one with --cert/--key.
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .context("failed to generate an RSA key for the self-signed certificate")?;
+    let cert = rcgen::CertificateParams::new(subject_alt_names)
+        .context("failed to build self-signed certificate parameters")?
+        .self_signed(&key_pair)
+        .context("failed to generate self-signed certificate")?;
 
     let tmp_key = config_dir.join(".key.pem.tmp");
     {
@@ -159,6 +169,49 @@ mod tests {
                 .modified()
                 .expect("reused key modified time"),
             key_metadata.modified().expect("key modified time")
+        );
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    /// DER encoding of the `rsaEncryption` OID 1.2.840.113549.1.1.1, and of
+    /// `id-ecPublicKey` 1.2.840.10045.2.1, as they appear inside a certificate's
+    /// SubjectPublicKeyInfo.
+    const RSA_ENCRYPTION_OID: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ];
+    const EC_PUBLIC_KEY_OID: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    /// Issue #68. rdesktop 1.9 refuses a peer certificate whose public key is
+    /// not RSA -- "Peer's certificate public key algorithm is not RSA" -- and
+    /// rcgen's `generate_simple_self_signed` produces P-256. Asserted against
+    /// the certificate's own DER, which is the thing the client parses, rather
+    /// than against the algorithm we asked for.
+    #[test]
+    fn the_auto_generated_certificate_uses_an_rsa_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (cert, key) = auto_generate_tls_in(&dir).expect("generate TLS identity");
+
+        let tls_ctx =
+            TlsIdentityCtx::init_from_paths(&cert, &key).expect("generated TLS identity loads");
+        let der = tls_ctx.certs.first().expect("one certificate").as_ref();
+
+        assert!(
+            contains(der, RSA_ENCRYPTION_OID),
+            "the certificate must carry an RSA public key; older clients refuse anything else"
+        );
+        assert!(
+            !contains(der, EC_PUBLIC_KEY_OID),
+            "an EC public key is what rdesktop rejects"
         );
 
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
