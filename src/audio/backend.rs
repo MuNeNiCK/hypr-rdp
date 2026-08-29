@@ -16,6 +16,15 @@ use super::pipewire::run_capture;
 use super::routing::{ActiveAudioRouting, AudioMode, AudioRoutingRunner, PipeWireRoutingRunner};
 
 const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long teardown may hold the thread it runs on.
+///
+/// `stop()` is reached from `Drop`, and the drop happens inside the accept
+/// loop -- IronRDP replaces the static channel set between one connection
+/// ending and the next `accept()` -- on the `LocalSet` thread that runs the
+/// whole server. Every millisecond spent here is a millisecond the listener is
+/// not accepting, so this is a budget, not a hope: past it the capture thread
+/// is left to finish on its own rather than waited for.
+const AUDIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 type AudioStartupStatus = Result<(), String>;
 
 trait AudioCaptureRunner: Send + Sync {
@@ -204,10 +213,39 @@ impl RdpsndServerHandler for HyprSoundHandler {
         }
 
         if let Some(handle) = self.capture_thread.take() {
-            let _ = handle.join();
+            join_within(handle, AUDIO_SHUTDOWN_TIMEOUT);
         }
 
         self.active_routing.take();
+    }
+}
+
+/// Wait for the capture thread, but not past `budget`.
+///
+/// `std::thread::JoinHandle` has no timed join, so the join happens on a helper
+/// thread and this waits on its result instead. Past the budget the helper is
+/// left running: it finishes whenever the capture thread does and then goes
+/// away by itself. Leaving a thread to finish is a leak of one thread until
+/// PipeWire returns; blocking here is a listener that never accepts again.
+fn join_within(handle: thread::JoinHandle<()>, budget: Duration) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    if thread::Builder::new()
+        .name("audio-join".into())
+        .spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        })
+        .is_err()
+    {
+        tracing::warn!("Audio: could not spawn the join helper; not waiting for the capture thread");
+        return;
+    }
+
+    if done_rx.recv_timeout(budget).is_err() {
+        tracing::warn!(
+            budget_ms = budget.as_millis(),
+            "Audio: capture thread did not stop within its budget; leaving it to finish"
+        );
     }
 }
 
@@ -382,10 +420,12 @@ mod tests {
     #[test]
     fn stopping_capture_does_not_wait_on_the_capture_thread_forever() {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        // Three times the budget, so the assertion below cannot pass by luck:
+        // without a deadline `stop()` waits the whole delay.
         let mut handler = handler_with_runner(
             Some(event_tx),
             Arc::new(SlowToStopRunner {
-                delay: Duration::from_secs(2),
+                delay: AUDIO_SHUTDOWN_TIMEOUT * 3,
             }),
         );
         handler.start_capture().expect("capture starts");
@@ -394,9 +434,11 @@ mod tests {
         handler.stop();
         let elapsed = started.elapsed();
 
+        // Expressed against the constant rather than a literal, so raising the
+        // budget cannot quietly leave this test passing on a wider one.
         assert!(
-            elapsed < Duration::from_millis(500),
-            "stop() blocked the accept loop for {elapsed:?}; teardown has no deadline"
+            elapsed < AUDIO_SHUTDOWN_TIMEOUT * 2,
+            "stop() held the accept loop for {elapsed:?}, past its {AUDIO_SHUTDOWN_TIMEOUT:?} budget"
         );
     }
 
