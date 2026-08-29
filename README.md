@@ -73,6 +73,28 @@ Requires **Hyprland 0.54+**.
 VA-API is included in the standard build and falls back to software encoding
 automatically when unavailable.
 
+Run it as the same user as Hyprland, with `XDG_RUNTIME_DIR` and
+`WAYLAND_DISPLAY` set. `HYPRLAND_INSTANCE_SIGNATURE` is not needed: hypr-rdp
+finds the running instance itself when exactly one is live, and checks the
+variable against the same test when it is set. Set it only when more than one
+Hyprland is live for the same user, to choose between them.
+
+When Hyprland starts it copies the signature into the user manager, and when it
+exits it takes it back out again — both only for a real session (not a nested
+one) and only unless `HYPRLAND_NO_SD_VARS` is set. So a unit started while
+Hyprland is up inherits a good value, and two cases leave a stale one: a shell
+or parent that outlived the old Hyprland hands its old value to a newly started
+hypr-rdp, and a Hyprland that dies without running its shutdown — `SIGKILL`, a
+crash, a power cut, but not a plain `SIGTERM`, which it handles cleanly — never
+runs the removal, leaving the old value in the manager for the next unit. Both
+are recognised at startup and resolved to the live instance.
+
+Starting with no Hyprland running is still a startup failure, so order the unit
+after the compositor or give it `Restart=`. A Hyprland restart under a *running*
+server needs the server restarted too: the instance is deliberately resolved
+only once, and the input handler's connection to Wayland is made once at
+startup.
+
 ```sh
 # Basic (auto-generates TLS cert, binds to 127.0.0.1:3389)
 hypr-rdp -u <username> -p <password>
@@ -139,8 +161,11 @@ on_session_end = "hyprctl dispatch dpms on eDP-1"
   exits unsuccessfully, or outlives the deadline cannot guarantee that the
   corresponding start action is undone.
 - Commands run through `/bin/sh -c` as the same user as hypr-rdp, with its
-  environment and working directory, so `hyprctl` works but shell profiles are
-  not read — use absolute paths for anything outside the inherited `PATH`.
+  environment and working directory, plus `HYPRLAND_INSTANCE_SIGNATURE` set to
+  the instance the server resolved, which may differ from the one the unit was
+  started with — so `hyprctl` reaches the same compositor the session is on.
+  Shell profiles are not read: use absolute paths for anything outside the
+  inherited `PATH`.
   hypr-rdp never kills a command; one still running at exit is left to the
   service manager. Hook command text is not written to hypr-rdp's logs.
 
