@@ -237,7 +237,9 @@ fn join_within(handle: thread::JoinHandle<()>, budget: Duration) {
         })
         .is_err()
     {
-        tracing::warn!("Audio: could not spawn the join helper; not waiting for the capture thread");
+        tracing::warn!(
+            "Audio: could not spawn the join helper; not waiting for the capture thread"
+        );
         return;
     }
 

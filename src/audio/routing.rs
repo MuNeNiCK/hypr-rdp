@@ -1,14 +1,21 @@
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 
 use super::format::{BITS_PER_SAMPLE, CHANNELS, SAMPLE_RATE};
 
 const DEFAULT_REMOTE_SINK_NAME: &str = "hypr_rdp_remote_audio";
+
+/// How long any one `pactl` call may take. These run on the thread that tears a
+/// session down, which is the thread that goes back to accepting connections, so
+/// a sound server that has stopped answering must not be able to hold it.
+const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const ROUTE_COMMAND_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioMode {
@@ -217,21 +224,67 @@ pub(super) trait RouteCommandRunner: Send + Sync {
 
 struct SystemCommandRunner;
 
-impl RouteCommandRunner for SystemCommandRunner {
-    fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
-        let output = Command::new(program)
-            .args(args)
-            .output()
-            .with_context(|| format!("failed to run {program}"))?;
+/// Reads a child pipe to the end on its own thread, so a child that outruns the
+/// pipe buffer cannot block waiting for us while we wait for it.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
+    thread::spawn(move || {
+        let mut text = String::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_string(&mut text);
+        }
+        text
+    })
+}
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("{} {} failed: {}", program, args.join(" "), stderr.trim());
+/// Waits for `child`, giving up after `ROUTE_COMMAND_TIMEOUT`.
+///
+/// The child is polled here rather than waited on in a helper thread so that the
+/// timeout path still owns it: `Child::kill` is safe only while the process has
+/// not been reaped, and nothing else reaps it.
+fn wait_within(child: &mut Child, description: &str) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + ROUTE_COMMAND_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed to wait for {description}"))
+            }
         }
 
-        Ok(RouteCommandOutput {
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        })
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("{description} did not finish within {ROUTE_COMMAND_TIMEOUT:?}");
+        }
+
+        thread::sleep(ROUTE_COMMAND_POLL);
+    }
+}
+
+impl RouteCommandRunner for SystemCommandRunner {
+    fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
+        let description = format!("{program} {}", args.join(" "));
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("failed to run {program}"))?;
+
+        let stdout = drain(child.stdout.take());
+        let stderr = drain(child.stderr.take());
+        let status = wait_within(&mut child, &description)?;
+
+        let stdout = stdout.join().unwrap_or_default();
+        let stderr = stderr.join().unwrap_or_default();
+
+        if !status.success() {
+            bail!("{} failed: {}", description, stderr.trim());
+        }
+
+        Ok(RouteCommandOutput { stdout })
     }
 }
 
@@ -547,6 +600,59 @@ mod tests {
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
         }
+    }
+
+    /// The real runner, not the scripted one: these spawn processes.
+    ///
+    /// `pactl` is run on the thread that tears a session down and then goes back
+    /// to accepting connections, so the failure this bounds is a sound server
+    /// that accepts the request and never answers -- which is what issue #66
+    /// describes on the other side of the teardown.
+    #[test]
+    fn a_command_that_never_finishes_is_given_up_on() {
+        let started = Instant::now();
+        let result = SystemCommandRunner.run("sleep", &["30".to_owned()]);
+        let elapsed = started.elapsed();
+
+        let error = result.expect_err("a command that outlives the budget must fail");
+        assert!(
+            error.to_string().contains("did not finish within"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            elapsed < ROUTE_COMMAND_TIMEOUT + Duration::from_secs(1),
+            "gave up after {elapsed:?}, budget is {ROUTE_COMMAND_TIMEOUT:?}"
+        );
+    }
+
+    #[test]
+    fn a_command_that_finishes_still_returns_its_output() {
+        let output = SystemCommandRunner
+            .run("echo", &["hello".to_owned()])
+            .expect("echo should succeed");
+
+        assert_eq!(output.stdout.trim(), "hello");
+    }
+
+    /// More output than a pipe buffer holds. Waiting for the child while nothing
+    /// reads its stdout would deadlock until the budget expired, turning a
+    /// working command into a timeout.
+    #[test]
+    fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
+        let output = SystemCommandRunner
+            .run("sh", &["-c".to_owned(), "printf '%0999999d' 0".to_owned()])
+            .expect("sh should succeed");
+
+        assert_eq!(output.stdout.len(), 999_999);
+    }
+
+    #[test]
+    fn a_failing_command_reports_its_stderr() {
+        let error = SystemCommandRunner
+            .run("sh", &["-c".to_owned(), "echo nope >&2; exit 1".to_owned()])
+            .expect_err("a non-zero exit must fail");
+
+        assert!(error.to_string().contains("nope"), "unexpected: {error}");
     }
 
     impl RouteCommandRunner for ScriptedRunner {
