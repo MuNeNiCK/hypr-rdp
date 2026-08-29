@@ -75,7 +75,14 @@ impl PipeWireRoutingRunner {
     }
 
     fn start_redirect(&self) -> Result<RedirectRouteGuard> {
-        let previous_default_sink = default_sink(self.command_runner.as_ref())?;
+        // A teardown that ran out of budget, or a process that was killed
+        // outright, leaves its null sink loaded and the machine's default
+        // pointing at it. Take those out first, or they accumulate: the module
+        // stays forever, and each new session finds one more of them.
+        unload_orphaned_remote_sinks(self.command_runner.as_ref());
+
+        let previous_default_sink =
+            usable_previous_sink(default_sink(self.command_runner.as_ref())?);
         let module_id = load_remote_sink(self.command_runner.as_ref(), &self.sink_name)?;
         let mut guard = RedirectRouteGuard {
             command_runner: Arc::clone(&self.command_runner),
@@ -205,6 +212,91 @@ fn follow_new_sink_inputs(
 fn parse_new_sink_input_event(line: &str) -> Option<&str> {
     let id = line.trim().strip_prefix("Event 'new' on sink-input #")?;
     (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
+}
+
+/// The default sink to go back to, if it is one worth going back to.
+///
+/// A default that is one of our own null sinks is a leftover from a teardown
+/// that could not finish. Recording it would spread the failure: this session
+/// would end cleanly and dutifully "restore" the orphan, so every session
+/// after the broken one inherits it. Better to record nothing and let the
+/// sound server pick, which is what it does when a default disappears.
+fn usable_previous_sink(name: Option<String>) -> Option<String> {
+    name.filter(|name| !name.starts_with(DEFAULT_REMOTE_SINK_NAME))
+}
+
+/// The pid embedded in one of our sink names, if that is what this is.
+///
+/// The name is `<prefix>_<pid>_<counter>`, so a sink whose pid is gone belongs
+/// to nobody. A recycled pid makes this answer "still alive" and the module is
+/// left alone, which is the safe direction to be wrong in.
+fn owner_pid_of_remote_sink(sink_name: &str) -> Option<u32> {
+    let tail = sink_name
+        .strip_prefix(DEFAULT_REMOTE_SINK_NAME)?
+        .strip_prefix('_')?;
+    let (pid, _counter) = tail.split_once('_')?;
+    pid.parse().ok()
+}
+
+/// Module ids of our null sinks whose owning process is gone.
+///
+/// Parses `pactl list short modules`, whose lines are id, name and arguments
+/// separated by tabs.
+fn orphaned_remote_sink_modules(modules: &str, is_alive: impl Fn(u32) -> bool) -> Vec<String> {
+    modules
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split('\t');
+            let id = fields.next()?.trim();
+            if fields.next()?.trim() != "module-null-sink" {
+                return None;
+            }
+            let argument = fields.next()?;
+            let sink_name = argument
+                .split_whitespace()
+                .find_map(|pair| pair.strip_prefix("sink_name="))?;
+            let pid = owner_pid_of_remote_sink(sink_name)?;
+            (!is_alive(pid)).then(|| id.to_owned())
+        })
+        .collect()
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    // Signal 0 asks about the process without touching it.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+/// Take out null sinks left behind by a hypr-rdp that is no longer running.
+///
+/// Best effort on purpose: this runs on the way into a session, and a sound
+/// server that will not answer is not a reason to refuse the session.
+fn unload_orphaned_remote_sinks(command_runner: &dyn RouteCommandRunner) {
+    let modules = match pactl(
+        command_runner,
+        &["list".into(), "short".into(), "modules".into()],
+    ) {
+        Ok(output) => output.stdout,
+        Err(error) => {
+            tracing::debug!(
+                "Audio: could not list modules to look for orphans: {:#}",
+                error
+            );
+            return;
+        }
+    };
+
+    for module_id in orphaned_remote_sink_modules(&modules, process_is_alive) {
+        match pactl(command_runner, &["unload-module".into(), module_id.clone()]) {
+            Ok(_) => tracing::info!(module_id, "Audio: unloaded an orphaned remote sink"),
+            Err(error) => {
+                tracing::warn!(
+                    module_id,
+                    "Audio: failed to unload an orphaned sink: {:#}",
+                    error
+                )
+            }
+        }
+    }
 }
 
 fn next_remote_sink_name() -> String {
@@ -737,6 +829,63 @@ mod tests {
         );
     }
 
+    /// A default sink that is one of ours is a leftover from a teardown that
+    /// could not finish. Recording it would spread the failure: this session
+    /// would end cleanly and "restore" the orphan, and so would the next.
+    #[test]
+    fn our_own_sink_is_not_a_default_worth_restoring() {
+        assert_eq!(
+            usable_previous_sink(Some("alsa_output.pci-0000_00_1f.3".into())),
+            Some("alsa_output.pci-0000_00_1f.3".into())
+        );
+        assert_eq!(
+            usable_previous_sink(Some(format!("{DEFAULT_REMOTE_SINK_NAME}_4242_1"))),
+            None
+        );
+        assert_eq!(usable_previous_sink(None), None);
+    }
+
+    #[test]
+    fn the_owning_pid_is_read_back_out_of_the_name() {
+        let name = format!("{DEFAULT_REMOTE_SINK_NAME}_4242_7");
+
+        assert_eq!(owner_pid_of_remote_sink(&name), Some(4242));
+        assert_eq!(owner_pid_of_remote_sink("alsa_output.something"), None);
+        assert_eq!(
+            owner_pid_of_remote_sink(&format!("{DEFAULT_REMOTE_SINK_NAME}_notapid_1")),
+            None
+        );
+    }
+
+    /// Only our own sinks, and only those whose process is gone. Somebody
+    /// else's null sink is not ours to unload, and a live hypr-rdp is using
+    /// its own.
+    #[test]
+    fn only_our_orphans_are_collected() {
+        let modules = format!(
+            "5\tmodule-native-protocol-unix\t\n\
+             6\tmodule-null-sink\tsink_name=someone_elses_sink\n\
+             7\tmodule-null-sink\tsink_name={p}_111_1 sink_properties=device.description=x\n\
+             8\tmodule-null-sink\tsink_name={p}_222_1\n",
+            p = DEFAULT_REMOTE_SINK_NAME
+        );
+
+        let orphans = orphaned_remote_sink_modules(&modules, |pid| pid == 222);
+
+        assert_eq!(orphans, vec!["7".to_string()]);
+    }
+
+    /// Nothing to collect is the ordinary case and must stay silent.
+    #[test]
+    fn a_clean_machine_has_no_orphans() {
+        let modules = format!(
+            "6\tmodule-null-sink\tsink_name={p}_999_1\n",
+            p = DEFAULT_REMOTE_SINK_NAME
+        );
+
+        assert!(orphaned_remote_sink_modules(&modules, |_| true).is_empty());
+    }
+
     /// The real runner, not the scripted one: these spawn processes.
     ///
     /// `pactl` is run on the thread that tears a session down and then goes back
@@ -893,6 +1042,8 @@ mod tests {
     #[test]
     fn redirect_mode_creates_routes_and_restores_remote_sink() {
         let runner = ScriptedRunner::with_outputs(vec![
+            // The orphan sweep that now runs before anything else.
+            Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
             Ok(""),
@@ -915,33 +1066,34 @@ mod tests {
         drop(guard);
 
         let calls = runner.calls();
-        assert_eq!(calls[0], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[1][..3], ["pactl", "load-module", "module-null-sink"]);
+        assert_eq!(calls[0], vec!["pactl", "list", "short", "modules"]);
+        assert_eq!(calls[1], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[2][..3], ["pactl", "load-module", "module-null-sink"]);
         assert_eq!(
-            calls[2],
+            calls[3],
             vec!["pactl", "set-default-sink", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[3], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[4], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[4], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[5], vec!["pactl", "list", "short", "sink-inputs"]);
         assert_eq!(
-            calls[5],
+            calls[6],
             vec!["pactl", "move-sink-input", "9", DEFAULT_REMOTE_SINK_NAME]
         );
         assert_eq!(
-            calls[6],
+            calls[7],
             vec!["pactl", "move-sink-input", "10", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[7], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[8], vec!["pactl", "set-default-sink", "alsa_output"]);
-        assert_eq!(calls[9], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[10], vec!["pactl", "list", "short", "sink-inputs"]);
-        assert_eq!(calls[11], vec!["pactl", "move-sink-input", "9", "122"]);
-        assert_eq!(calls[12], vec!["pactl", "move-sink-input", "10", "777"]);
+        assert_eq!(calls[8], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[9], vec!["pactl", "set-default-sink", "alsa_output"]);
+        assert_eq!(calls[10], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[11], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[12], vec!["pactl", "move-sink-input", "9", "122"]);
+        assert_eq!(calls[13], vec!["pactl", "move-sink-input", "10", "777"]);
         assert_eq!(
-            calls[13],
+            calls[14],
             vec!["pactl", "move-sink-input", "11", "alsa_output"]
         );
-        assert_eq!(calls[14], vec!["pactl", "unload-module", "55"]);
+        assert_eq!(calls[15], vec!["pactl", "unload-module", "55"]);
     }
 
     #[test]
@@ -967,6 +1119,8 @@ mod tests {
     #[test]
     fn redirect_restore_preserves_user_changed_default_sink() {
         let runner = ScriptedRunner::with_outputs(vec![
+            // The orphan sweep that now runs before anything else.
+            Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
             Ok(""),
@@ -986,32 +1140,35 @@ mod tests {
         drop(guard);
 
         let calls = runner.calls();
-        assert_eq!(calls[0], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[1][..3], ["pactl", "load-module", "module-null-sink"]);
+        assert_eq!(calls[0], vec!["pactl", "list", "short", "modules"]);
+        assert_eq!(calls[1], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[2][..3], ["pactl", "load-module", "module-null-sink"]);
         assert_eq!(
-            calls[2],
+            calls[3],
             vec!["pactl", "set-default-sink", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[3], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[4], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[4], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[5], vec!["pactl", "list", "short", "sink-inputs"]);
         assert_eq!(
-            calls[5],
+            calls[6],
             vec!["pactl", "move-sink-input", "9", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[6], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[7], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[8], vec!["pactl", "list", "short", "sink-inputs"]);
-        assert_eq!(calls[9], vec!["pactl", "move-sink-input", "9", "122"]);
+        assert_eq!(calls[7], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[8], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[9], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[10], vec!["pactl", "move-sink-input", "9", "122"]);
         assert_eq!(
-            calls[10],
+            calls[11],
             vec!["pactl", "move-sink-input", "10", "usb_sink"]
         );
-        assert_eq!(calls[11], vec!["pactl", "unload-module", "55"]);
+        assert_eq!(calls[12], vec!["pactl", "unload-module", "55"]);
     }
 
     #[test]
     fn redirect_start_failure_restores_inputs_moved_before_failure() {
         let runner = ScriptedRunner::with_outputs(vec![
+            // The orphan sweep that now runs before anything else.
+            Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
             Ok(""),
@@ -1031,33 +1188,36 @@ mod tests {
         assert!(router.start(AudioMode::Redirect).is_err());
 
         let calls = runner.calls();
-        assert_eq!(calls[0], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[1][..3], ["pactl", "load-module", "module-null-sink"]);
+        assert_eq!(calls[0], vec!["pactl", "list", "short", "modules"]);
+        assert_eq!(calls[1], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[2][..3], ["pactl", "load-module", "module-null-sink"]);
         assert_eq!(
-            calls[2],
+            calls[3],
             vec!["pactl", "set-default-sink", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[3], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[4], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[4], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[5], vec!["pactl", "list", "short", "sink-inputs"]);
         assert_eq!(
-            calls[5],
+            calls[6],
             vec!["pactl", "move-sink-input", "9", DEFAULT_REMOTE_SINK_NAME]
         );
         assert_eq!(
-            calls[6],
+            calls[7],
             vec!["pactl", "move-sink-input", "10", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[7], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[8], vec!["pactl", "set-default-sink", "alsa_output"]);
-        assert_eq!(calls[9], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[10], vec!["pactl", "list", "short", "sink-inputs"]);
-        assert_eq!(calls[11], vec!["pactl", "move-sink-input", "9", "122"]);
-        assert_eq!(calls[12], vec!["pactl", "unload-module", "55"]);
+        assert_eq!(calls[8], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[9], vec!["pactl", "set-default-sink", "alsa_output"]);
+        assert_eq!(calls[10], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[11], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[12], vec!["pactl", "move-sink-input", "9", "122"]);
+        assert_eq!(calls[13], vec!["pactl", "unload-module", "55"]);
     }
 
     #[test]
     fn redirect_restore_treats_activation_remote_inputs_as_untracked() {
         let runner = ScriptedRunner::with_outputs(vec![
+            // The orphan sweep that now runs before anything else.
+            Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
             Ok(""),
@@ -1078,33 +1238,36 @@ mod tests {
         drop(guard);
 
         let calls = runner.calls();
-        assert_eq!(calls[0], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[1][..3], ["pactl", "load-module", "module-null-sink"]);
+        assert_eq!(calls[0], vec!["pactl", "list", "short", "modules"]);
+        assert_eq!(calls[1], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[2][..3], ["pactl", "load-module", "module-null-sink"]);
         assert_eq!(
-            calls[2],
+            calls[3],
             vec!["pactl", "set-default-sink", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[3], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[4], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[4], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[5], vec!["pactl", "list", "short", "sink-inputs"]);
         assert_eq!(
-            calls[5],
+            calls[6],
             vec!["pactl", "move-sink-input", "9", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[6], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[7], vec!["pactl", "set-default-sink", "alsa_output"]);
-        assert_eq!(calls[8], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[9], vec!["pactl", "list", "short", "sink-inputs"]);
-        assert_eq!(calls[10], vec!["pactl", "move-sink-input", "9", "122"]);
+        assert_eq!(calls[7], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[8], vec!["pactl", "set-default-sink", "alsa_output"]);
+        assert_eq!(calls[9], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[10], vec!["pactl", "list", "short", "sink-inputs"]);
+        assert_eq!(calls[11], vec!["pactl", "move-sink-input", "9", "122"]);
         assert_eq!(
-            calls[11],
+            calls[12],
             vec!["pactl", "move-sink-input", "10", "alsa_output"]
         );
-        assert_eq!(calls[12], vec!["pactl", "unload-module", "55"]);
+        assert_eq!(calls[13], vec!["pactl", "unload-module", "55"]);
     }
 
     #[test]
     fn redirect_start_failure_unloads_created_sink() {
         let runner = ScriptedRunner::with_outputs(vec![
+            // The orphan sweep that now runs before anything else.
+            Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
             Err("set default failed"),
@@ -1117,14 +1280,15 @@ mod tests {
         assert!(router.start(AudioMode::Redirect).is_err());
 
         let calls = runner.calls();
-        assert_eq!(calls[0], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[1][..3], ["pactl", "load-module", "module-null-sink"]);
+        assert_eq!(calls[0], vec!["pactl", "list", "short", "modules"]);
+        assert_eq!(calls[1], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[2][..3], ["pactl", "load-module", "module-null-sink"]);
         assert_eq!(
-            calls[2],
+            calls[3],
             vec!["pactl", "set-default-sink", DEFAULT_REMOTE_SINK_NAME]
         );
-        assert_eq!(calls[3], vec!["pactl", "get-default-sink"]);
-        assert_eq!(calls[4], vec!["pactl", "list", "short", "sinks"]);
-        assert_eq!(calls[5], vec!["pactl", "unload-module", "55"]);
+        assert_eq!(calls[4], vec!["pactl", "get-default-sink"]);
+        assert_eq!(calls[5], vec!["pactl", "list", "short", "sinks"]);
+        assert_eq!(calls[6], vec!["pactl", "unload-module", "55"]);
     }
 }
