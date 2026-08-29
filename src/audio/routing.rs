@@ -17,6 +17,16 @@ const DEFAULT_REMOTE_SINK_NAME: &str = "hypr_rdp_remote_audio";
 const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const ROUTE_COMMAND_POLL: Duration = Duration::from_millis(10);
 
+/// How long undoing the routing may take in total.
+///
+/// The per-call deadline bounds one `pactl`; it does not bound their sum, and
+/// teardown is the one path that keeps going after a failure instead of
+/// returning. It runs one command per stream that was moved, so a machine with
+/// several players and a sound server that answers slowly could hold the thread
+/// that goes back to accepting connections for far longer than any single
+/// deadline suggests.
+const ROUTE_RESTORE_BUDGET: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AudioMode {
     Mirror,
@@ -298,6 +308,27 @@ struct RedirectRouteGuard {
     restored: bool,
 }
 
+/// Wraps a runner with a shared deadline, so a sequence of commands is bounded
+/// as a sequence and not only one command at a time.
+struct BudgetedRunner<'a> {
+    inner: &'a dyn RouteCommandRunner,
+    deadline: Instant,
+}
+
+impl RouteCommandRunner for BudgetedRunner<'_> {
+    fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
+        if Instant::now() >= self.deadline {
+            bail!(
+                "{} {} skipped: the audio teardown budget of {:?} is spent",
+                program,
+                args.join(" "),
+                ROUTE_RESTORE_BUDGET
+            );
+        }
+        self.inner.run(program, args)
+    }
+}
+
 impl RedirectRouteGuard {
     fn activate(&mut self) -> Result<()> {
         pactl(
@@ -322,12 +353,24 @@ impl RedirectRouteGuard {
         self.restored = true;
 
         // Stop following new streams before moving anything back, so the
-        // watcher cannot re-route an input the restore just moved.
+        // watcher cannot re-route an input the restore just moved. This is
+        // outside the budget below on purpose: it kills a child and joins a
+        // thread, and the one command that thread can be inside is already
+        // bounded on its own.
         if let Some(mut watch) = self.stream_watch.take() {
             watch.stop();
         }
 
-        let current_default_sink = match default_sink(self.command_runner.as_ref()) {
+        // Everything below this point except unloading the module shares one
+        // deadline. Unloading does not: while the module is loaded the
+        // machine's default output is a sink nobody is listening to, so that
+        // command is worth its own wait even when the rest gave up.
+        let budgeted = BudgetedRunner {
+            inner: self.command_runner.as_ref(),
+            deadline: Instant::now() + ROUTE_RESTORE_BUDGET,
+        };
+
+        let current_default_sink = match default_sink(&budgeted) {
             Ok(current_default_sink) => current_default_sink,
             Err(error) => {
                 tracing::warn!("Audio: failed to read current default sink: {:#}", error);
@@ -343,7 +386,7 @@ impl RedirectRouteGuard {
 
             if should_restore_default {
                 if let Err(error) = pactl(
-                    self.command_runner.as_ref(),
+                    &budgeted,
                     &["set-default-sink".into(), previous_default_sink.into()],
                 ) {
                     tracing::warn!("Audio: failed to restore default sink: {:#}", error);
@@ -354,9 +397,10 @@ impl RedirectRouteGuard {
                 .as_deref()
                 .filter(|current| *current != self.sink_name)
                 .unwrap_or(previous_default_sink);
-            self.restore_sink_inputs(Some(fallback_sink));
+            self.restore_sink_inputs(&budgeted, Some(fallback_sink));
         } else {
             self.restore_sink_inputs(
+                &budgeted,
                 current_default_sink
                     .as_deref()
                     .filter(|current| *current != self.sink_name),
@@ -373,9 +417,9 @@ impl RedirectRouteGuard {
         }
     }
 
-    fn restore_sink_inputs(&self, fallback_sink: Option<&str>) {
+    fn restore_sink_inputs(&self, runner: &dyn RouteCommandRunner, fallback_sink: Option<&str>) {
         if let Err(error) = restore_sink_inputs_from_remote(
-            self.command_runner.as_ref(),
+            runner,
             &self.sink_name,
             &self.moved_sink_inputs,
             fallback_sink,
@@ -600,6 +644,97 @@ mod tests {
         fn calls(&self) -> Vec<Vec<String>> {
             self.calls.lock().unwrap().clone()
         }
+    }
+
+    /// A runner that takes `delay` on its first call and is instant after, so a
+    /// test can spend the teardown budget without spending its own time.
+    struct SlowFirstRunner {
+        delay: Duration,
+        calls: Mutex<Vec<Vec<String>>>,
+        served: Mutex<usize>,
+    }
+
+    impl RouteCommandRunner for SlowFirstRunner {
+        fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
+            let mut call = vec![program.to_owned()];
+            call.extend(args.iter().cloned());
+            self.calls.lock().unwrap().push(call);
+
+            let mut served = self.served.lock().unwrap();
+            let first = *served == 0;
+            *served += 1;
+            drop(served);
+
+            if first {
+                std::thread::sleep(self.delay);
+            }
+            Ok(RouteCommandOutput {
+                stdout: "other_sink".to_owned(),
+            })
+        }
+    }
+
+    /// The per-call deadline bounds one command; this bounds their sum. Without
+    /// it, teardown runs one command per moved stream and keeps going after
+    /// each failure, so a slow sound server holds the thread that returns to
+    /// accepting connections for as long as it likes.
+    #[test]
+    fn a_spent_budget_refuses_further_commands_without_running_them() {
+        let inner = ScriptedRunner::with_outputs(vec![Ok("never used")]);
+        let spent = BudgetedRunner {
+            inner: inner.as_ref(),
+            deadline: Instant::now() - Duration::from_millis(1),
+        };
+
+        let error = spent
+            .run("pactl", &["get-default-sink".to_owned()])
+            .expect_err("a spent budget must refuse");
+
+        assert!(
+            error.to_string().contains("budget"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            inner.calls().is_empty(),
+            "a refused command must not reach the sound server"
+        );
+    }
+
+    /// Unloading the module is not under the shared budget. While it is loaded
+    /// the machine's default output is a sink nobody is listening to, so it is
+    /// worth its own wait even when everything before it gave up.
+    #[test]
+    fn the_module_is_unloaded_even_when_the_budget_is_spent() {
+        let runner = Arc::new(SlowFirstRunner {
+            delay: ROUTE_RESTORE_BUDGET + Duration::from_millis(100),
+            calls: Mutex::new(Vec::new()),
+            served: Mutex::new(0),
+        });
+        let mut guard = RedirectRouteGuard {
+            command_runner: Arc::clone(&runner) as Arc<dyn RouteCommandRunner>,
+            sink_name: DEFAULT_REMOTE_SINK_NAME.to_owned(),
+            previous_default_sink: Some("previous_sink".to_owned()),
+            moved_sink_inputs: Vec::new(),
+            module_id: Some("42".to_owned()),
+            stream_watch: None,
+            restored: false,
+        };
+
+        let started = Instant::now();
+        guard.restore();
+        let elapsed = started.elapsed();
+
+        let calls = runner.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|call| call.get(1).map(String::as_str) == Some("unload-module")),
+            "the remote sink must come out even after the budget is spent: {calls:?}"
+        );
+        assert!(
+            elapsed < ROUTE_RESTORE_BUDGET + ROUTE_COMMAND_TIMEOUT + Duration::from_secs(2),
+            "teardown ran for {elapsed:?}, which is not a bounded teardown"
+        );
     }
 
     /// The real runner, not the scripted one: these spawn processes.
