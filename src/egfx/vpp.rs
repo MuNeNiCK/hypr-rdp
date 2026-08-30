@@ -9,7 +9,7 @@ use libva_sys::va_display_drm as va;
 
 use super::vaapi_sys::{
     self as sys, va_check, VABufferID, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
-    VASurfaceAttrib, VASurfaceID,
+    VASurfaceAttrib, VASurfaceID, VA_FOURCC_BGRA, VA_FOURCC_BGRX,
 };
 
 // Constants from VA-API headers
@@ -150,14 +150,21 @@ impl VppConverter {
         modifier: u64,
         format: u32,
     ) -> Result<usize> {
-        let rt_format = match format {
-            DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => VA_RT_FORMAT_RGB32,
+        // libva defines VADRMPRIMESurfaceDescriptor.fourcc as a VA_FOURCC_* for the
+        // whole surface, while layers[].drm_format carries the DRM fourcc. Passing
+        // the DRM fourcc in both places makes drivers reject the import:
+        // iHD returns VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT (14) and i965 returns
+        // VA_STATUS_ERROR_INVALID_PARAMETER (18), and capture silently falls back
+        // to a CPU shm copy.
+        let (rt_format, va_fourcc) = match format {
+            DRM_FORMAT_XRGB8888 => (VA_RT_FORMAT_RGB32, VA_FOURCC_BGRX),
+            DRM_FORMAT_ARGB8888 => (VA_RT_FORMAT_RGB32, VA_FOURCC_BGRA),
             _ => bail!("unsupported DRM format for VPP input: 0x{:08x}", format),
         };
 
         // Build VADRMPRIMESurfaceDescriptor for import
         let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
-        desc.fourcc = format;
+        desc.fourcc = va_fourcc;
         desc.width = width;
         desc.height = height;
         desc.num_objects = 1;
