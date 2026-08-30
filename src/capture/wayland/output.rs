@@ -80,7 +80,7 @@ pub(crate) fn create_headless_output(
 
     // Set resolution
     let mode = format!("{}x{}@60", width, height);
-    let rule = format!("{},{},-9999x0,1", name, mode);
+    let rule = crate::hyprland::headless_monitor_rule(&name, &mode);
     crate::hyprland::keyword_monitor(&rule).context("failed to set headless output resolution")?;
 
     tracing::info!(name = %name, width, height, "Created headless output");

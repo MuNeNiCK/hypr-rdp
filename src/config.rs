@@ -38,6 +38,10 @@ struct Args {
     #[arg(short, long)]
     resolution: Option<String>,
 
+    /// Scale of the managed headless output, e.g. 2 for HiDPI clients
+    #[arg(long)]
+    scale: Option<f64>,
+
     /// Screen capture protocol: "wlr" (wlr-screencopy-v1) or "ext" (ext-image-copy-capture-v1)
     #[arg(long)]
     capture_mode: Option<String>,
@@ -106,6 +110,7 @@ struct ConfigFile {
     username: Option<String>,
     password: Option<String>,
     resolution: Option<String>,
+    scale: Option<f64>,
     capture_mode: Option<String>,
     bitrate: Option<u32>,
     quality: Option<u8>,
@@ -172,6 +177,7 @@ pub struct RuntimeConfig {
     pub key: Option<String>,
     pub credentials: Option<ConfigCredentials>,
     pub resolution: (u32, u32),
+    pub scale: f64,
     pub capture_mode: CaptureMode,
     pub bitrate: u32,
     pub quality: u8,
@@ -269,6 +275,7 @@ impl RuntimeConfig {
             .resolution
             .or(config.resolution)
             .unwrap_or_else(|| "1920x1080".into());
+        let scale = resolve_scale(args.scale.or(config.scale))?;
         let capture_mode_str = args
             .capture_mode
             .or(config.capture_mode)
@@ -315,6 +322,7 @@ impl RuntimeConfig {
             key,
             credentials,
             resolution,
+            scale,
             capture_mode,
             bitrate,
             quality,
@@ -453,6 +461,18 @@ fn resolve_audio_mode(
     parse_audio_mode(&value)
 }
 
+fn resolve_scale(scale: Option<f64>) -> anyhow::Result<f64> {
+    let Some(scale) = scale else {
+        return Ok(1.0);
+    };
+
+    if !scale.is_finite() || scale <= 0.0 {
+        anyhow::bail!("invalid scale {scale}, expected a positive number (e.g. 1, 1.5, 2)");
+    }
+
+    Ok(scale)
+}
+
 fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
     let parts: Vec<&str> = s.split('x').collect();
     if parts.len() != 2 {
@@ -481,6 +501,28 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn scale_defaults_to_one_when_unset() {
+        assert_eq!(resolve_scale(None).expect("default scale"), 1.0);
+    }
+
+    #[test]
+    fn scale_accepts_fractional_values() {
+        assert_eq!(resolve_scale(Some(1.5)).expect("fractional scale"), 1.5);
+    }
+
+    #[test]
+    fn scale_rejects_zero_and_negative() {
+        assert!(resolve_scale(Some(0.0)).is_err());
+        assert!(resolve_scale(Some(-2.0)).is_err());
+    }
+
+    #[test]
+    fn scale_rejects_non_finite() {
+        assert!(resolve_scale(Some(f64::NAN)).is_err());
+        assert!(resolve_scale(Some(f64::INFINITY)).is_err());
+    }
     use super::*;
     use proptest::prelude::*;
     use std::fs;

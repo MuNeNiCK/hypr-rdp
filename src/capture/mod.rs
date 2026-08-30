@@ -92,7 +92,7 @@ impl HyprDisplayHandle {
 
 fn resize_headless_output(output_name: &str, width: u32, height: u32) -> Result<()> {
     let mode = format!("{}x{}@60", width, height);
-    let rule = format!("{},{},-9999x0,1", output_name, mode);
+    let rule = crate::hyprland::headless_monitor_rule(output_name, &mode);
     crate::hyprland::keyword_monitor(&rule).context("failed to resize headless output")?;
     wayland::wait_for_output_size(output_name, width, height, Duration::from_secs(5))
         .context("headless output did not reach requested size after resize")?;
@@ -395,7 +395,7 @@ impl HyprDisplay {
             if let Some(existing) = stale.into_iter().next() {
                 tracing::info!(name = %existing, "Reusing headless output from previous session");
                 let mode = format!("{}x{}@60", configured_resolution.0, configured_resolution.1);
-                let rule = format!("{},{},-9999x0,1", existing, mode);
+                let rule = crate::hyprland::headless_monitor_rule(&existing, &mode);
                 crate::hyprland::keyword_monitor(&rule)
                     .context("failed to resize reused headless output")?;
                 wayland::wait_for_output_size(

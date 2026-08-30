@@ -33,6 +33,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         key,
         credentials,
         resolution,
+        scale,
         capture_mode,
         bitrate,
         quality,
@@ -54,6 +55,10 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         egfx_codec,
     ));
     let output_layout = Arc::new(SharedOutputLayout::new());
+
+    // Recorded before the headless output is created, so its monitor rule
+    // carries the configured scale.
+    crate::hyprland::set_headless_scale(scale);
 
     let (display, display_handle, (rdp_width, rdp_height)) = HyprDisplay::new(
         resolution,

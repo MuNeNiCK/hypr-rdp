@@ -2,6 +2,7 @@
 //!
 //! Direct Unix socket communication instead of spawning hyprctl subprocesses.
 
+use std::sync::OnceLock;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
@@ -79,6 +80,35 @@ fn option_string_from_response(response: &str) -> Result<Option<String>> {
 /// Hyprland will name it `{name}-1`, `{name}-2`, etc.
 pub fn output_create_headless(name: &str) -> Result<()> {
     send_action(&format!("output create headless {}", name))
+}
+
+/// Scale applied to the managed headless output, set once at startup from config.
+static HEADLESS_SCALE: OnceLock<f64> = OnceLock::new();
+
+/// Record the scale to apply to the managed headless output.
+///
+/// Called once during startup. Later calls are ignored, so the value stays
+/// stable for the lifetime of the process.
+pub fn set_headless_scale(scale: f64) {
+    let _ = HEADLESS_SCALE.set(scale);
+}
+
+fn headless_scale() -> f64 {
+    HEADLESS_SCALE.get().copied().unwrap_or(1.0)
+}
+
+/// Build the monitor rule for the managed headless output.
+///
+/// The output is parked off-screen at -9999x0 so it never displaces real
+/// monitors in the layout. The scale comes from config; Hyprland only accepts
+/// scales that divide the mode into whole logical pixels, so an unusable value
+/// is rejected by the compositor rather than silently rounded here.
+pub fn headless_monitor_rule(name: &str, mode: &str) -> String {
+    headless_monitor_rule_with(name, mode, headless_scale())
+}
+
+fn headless_monitor_rule_with(name: &str, mode: &str, scale: f64) -> String {
+    format!("{},{},-9999x0,{}", name, mode, scale)
 }
 
 /// Set a monitor rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").
@@ -277,7 +307,10 @@ impl EventStream {
 mod tests {
     use anyhow::anyhow;
 
-    use super::{is_non_legacy_parser_error, monitor_rule_to_lua, option_string_from_response};
+    use super::{
+        headless_monitor_rule_with, is_non_legacy_parser_error, monitor_rule_to_lua,
+        option_string_from_response,
+    };
 
     #[test]
     fn option_string_parser_returns_non_empty_string_values() {
@@ -306,6 +339,41 @@ mod tests {
         assert_eq!(
             lua,
             r#"hl.monitor({ output = "hypr-rdp-1", mode = "1920x1080@60", position = "-9999x0", scale = 1 })"#
+        );
+    }
+
+    #[test]
+    fn headless_monitor_rule_defaults_to_scale_one() {
+        assert_eq!(
+            headless_monitor_rule_with("hypr-rdp-1", "1920x1080@60", 1.0),
+            "hypr-rdp-1,1920x1080@60,-9999x0,1"
+        );
+    }
+
+    #[test]
+    fn headless_monitor_rule_carries_configured_scale() {
+        assert_eq!(
+            headless_monitor_rule_with("hypr-rdp-1", "3024x1896@60", 2.0),
+            "hypr-rdp-1,3024x1896@60,-9999x0,2"
+        );
+    }
+
+    #[test]
+    fn headless_monitor_rule_keeps_fractional_scale() {
+        assert_eq!(
+            headless_monitor_rule_with("hypr-rdp-1", "2560x1440@60", 1.5),
+            "hypr-rdp-1,2560x1440@60,-9999x0,1.5"
+        );
+    }
+
+    #[test]
+    fn generated_headless_rule_with_scale_translates_to_lua() {
+        let rule = headless_monitor_rule_with("hypr-rdp-1", "3024x1896@60", 2.0);
+        let lua = monitor_rule_to_lua(&rule).expect("monitor rule translates");
+
+        assert_eq!(
+            lua,
+            r#"hl.monitor({ output = "hypr-rdp-1", mode = "3024x1896@60", position = "-9999x0", scale = 2 })"#
         );
     }
 
