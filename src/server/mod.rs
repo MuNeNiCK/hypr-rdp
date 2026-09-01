@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ironrdp_server::{
-    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer,
+    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer, ServerError,
     SoundServerFactory, TlsIdentityCtx,
 };
 
@@ -132,7 +132,19 @@ fn sound_factory_for_audio_mode(audio_mode: AudioMode) -> Option<Box<dyn SoundSe
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
-    ctx.server.run().await
+    ctx.server.run().await.map_err(server_run_error)
+}
+
+/// Converts a server run failure into the application's error type.
+///
+/// `run` reports through the server's own error type now. That type implements
+/// `core::error::Error`, so it can be carried whole rather than printed: plain
+/// `Display` on a `ServerError` gives the context and the kind only, and every
+/// kind that keeps its detail in `source` -- `Io`, `Encode`, `Decode`,
+/// `Connector`, `Pdu`, `Custom` -- would otherwise arrive as a bare
+/// "I/O error".
+fn server_run_error(error: ServerError) -> anyhow::Error {
+    anyhow::Error::new(error)
 }
 
 /// Adapts IronRDP connection boundaries to application-owned policies.
@@ -169,7 +181,7 @@ impl ConnectionHandler for ClientConnectionHandler {
         &mut self,
         _peer: SocketAddr,
         _duration: Duration,
-        _error: Option<&anyhow::Error>,
+        _error: Option<&ServerError>,
     ) -> PostConnectionAction {
         self.input_session_sink.session_ended();
         if let Some(hooks) = &mut self.session_hooks {
@@ -224,6 +236,26 @@ mod tests {
         ConnectionInfo::new(0x0409, KeyboardType::IBM_ENHANCED, String::new())
     }
 
+    #[test]
+    fn server_run_error_keeps_the_cause_the_server_reported() {
+        use ironrdp_server::ServerErrorExt as _;
+        let error = ServerError::io(
+            "accepting a client",
+            std::io::Error::other("tls handshake failed"),
+        );
+
+        let converted = server_run_error(error);
+        let rendered = format!("{converted:#}");
+
+        assert!(
+            rendered.contains("accepting a client"),
+            "context lost: {rendered}"
+        );
+        assert!(
+            rendered.contains("tls handshake failed"),
+            "cause lost: {rendered}"
+        );
+    }
     #[test]
     fn connection_handler_drives_hooks_on_both_boundaries() {
         struct NoopSink;
@@ -406,7 +438,7 @@ mod tests {
             &mut self,
             _peer: std::net::SocketAddr,
             _duration: Duration,
-            error: Option<&anyhow::Error>,
+            error: Option<&ServerError>,
         ) -> PostConnectionAction {
             assert!(error.is_some(), "raw client abort should end with an error");
             PostConnectionAction::Stop

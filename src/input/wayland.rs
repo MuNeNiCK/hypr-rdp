@@ -5,7 +5,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use ironrdp_server::MouseEvent;
+use ironrdp_server::{MouseButton, MouseEvent};
 use wayland_client::protocol::wl_pointer::{Axis, AxisSource, ButtonState};
 use wayland_client::protocol::{wl_keyboard, wl_output, wl_registry, wl_seat};
 use wayland_client::{delegate_noop, Connection, Dispatch, EventQueue, QueueHandle, WEnum};
@@ -90,97 +90,15 @@ impl KeyboardSink for WaylandInput {
 
 impl InputBackend for WaylandInput {
     fn mouse(&mut self, t: u32, event: MouseEvent) {
-        match event {
-            MouseEvent::Move { x, y } => {
-                // Pointer is bound to the output via create_virtual_pointer_with_output,
-                // so coordinates are mapped within that output by the compositor.
-                // Use the current output dimensions as extent (updates on resize).
-                let Some(layout) = self.output_layout.snapshot() else {
-                    return;
-                };
-                let (source_x, source_y) = map_rdp_pointer_to_source(&layout, x, y);
-                self.vp
-                    .motion_absolute(t, source_x, source_y, layout.output_w, layout.output_h);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::LeftPressed => {
-                self.vp.button(t, keymap::BTN_LEFT, ButtonState::Pressed);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::LeftReleased => {
-                self.vp.button(t, keymap::BTN_LEFT, ButtonState::Released);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::RightPressed => {
-                self.vp.button(t, keymap::BTN_RIGHT, ButtonState::Pressed);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::RightReleased => {
-                self.vp.button(t, keymap::BTN_RIGHT, ButtonState::Released);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::MiddlePressed => {
-                self.vp.button(t, keymap::BTN_MIDDLE, ButtonState::Pressed);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::MiddleReleased => {
-                self.vp.button(t, keymap::BTN_MIDDLE, ButtonState::Released);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::Button4Pressed => {
-                self.vp.button(t, keymap::BTN_SIDE, ButtonState::Pressed);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::Button4Released => {
-                self.vp.button(t, keymap::BTN_SIDE, ButtonState::Released);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::Button5Pressed => {
-                self.vp.button(t, keymap::BTN_EXTRA, ButtonState::Pressed);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::Button5Released => {
-                self.vp.button(t, keymap::BTN_EXTRA, ButtonState::Released);
-                self.vp.frame();
-                self.flush();
-            }
-            MouseEvent::VerticalScroll { value } => {
-                emit_scroll_event(
-                    &self.vp,
-                    t,
-                    0,
-                    i32::from(value),
-                    &mut self.scroll_residual_h,
-                    &mut self.scroll_residual_v,
-                );
-                self.flush();
-            }
-            MouseEvent::Scroll { x, y } => {
-                emit_scroll_event(
-                    &self.vp,
-                    t,
-                    x,
-                    y,
-                    &mut self.scroll_residual_h,
-                    &mut self.scroll_residual_v,
-                );
-                self.flush();
-            }
-            MouseEvent::RelMove { x, y } => {
-                self.vp.motion(t, x as f64, y as f64);
-                self.vp.frame();
-                self.flush();
-            }
+        if emit_mouse_event(
+            &self.vp,
+            || self.output_layout.snapshot(),
+            t,
+            event,
+            &mut self.scroll_residual_h,
+            &mut self.scroll_residual_v,
+        ) {
+            self.flush();
         }
     }
 
@@ -222,6 +140,165 @@ impl ScrollRequestSink for ZwlrVirtualPointerV1 {
 
     fn frame(&self) {
         self.frame();
+    }
+}
+
+trait PointerRequestSink: ScrollRequestSink {
+    fn motion(&self, time: u32, dx: f64, dy: f64);
+    fn motion_absolute(&self, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32);
+    fn button(&self, time: u32, button: u32, state: ButtonState);
+}
+
+// Each body calls the protocol object's own inherent method of the same name:
+// inherent methods take precedence over trait methods, so this forwards rather
+// than recurses. Renaming one away would silently turn it into a stack
+// overflow, which is why the pairing is spelled out here.
+impl PointerRequestSink for ZwlrVirtualPointerV1 {
+    fn motion(&self, time: u32, dx: f64, dy: f64) {
+        self.motion(time, dx, dy);
+    }
+
+    fn motion_absolute(&self, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32) {
+        self.motion_absolute(time, x, y, x_extent, y_extent);
+    }
+
+    fn button(&self, time: u32, button: u32, state: ButtonState) {
+        self.button(time, button, state);
+    }
+}
+
+/// Translates one mouse event into pointer requests. Returns whether the
+/// caller must flush the Wayland connection.
+///
+/// `layout` is a thunk so the snapshot lock is taken only for the events that
+/// need absolute coordinates, exactly as the inline match did.
+fn emit_mouse_event(
+    sink: &impl PointerRequestSink,
+    layout: impl FnOnce() -> Option<OutputLayoutSnapshot>,
+    t: u32,
+    event: MouseEvent,
+    scroll_residual_h: &mut i64,
+    scroll_residual_v: &mut i64,
+) -> bool {
+    match event {
+        MouseEvent::Move { x, y } => {
+            // Pointer is bound to the output via create_virtual_pointer_with_output,
+            // so coordinates are mapped within that output by the compositor.
+            // Use the current output dimensions as extent (updates on resize).
+            let Some(layout) = layout() else {
+                return false;
+            };
+            let (source_x, source_y) = map_rdp_pointer_to_source(&layout, x, y);
+            sink.motion_absolute(t, source_x, source_y, layout.output_w, layout.output_h);
+            sink.frame();
+        }
+        // The absolute position now travels with the button rather than
+        // arriving as a separate Move. Applying it costs one redundant
+        // motion for the usual client, which sends a Move first anyway, and
+        // puts the click where the client asked for one that does not.
+        MouseEvent::Button {
+            x,
+            y,
+            button,
+            pressed,
+        } => {
+            // The position is best-effort. Without a layout it cannot be
+            // mapped, but the button is still reported: dropping the event
+            // whole would let a release go missing and leave the button held
+            // down in the session. An unrecognised button costs only the
+            // button, the same way it does for `ButtonRel`.
+            if let Some(layout) = layout() {
+                let (source_x, source_y) = map_rdp_pointer_to_source(&layout, x, y);
+                sink.motion_absolute(t, source_x, source_y, layout.output_w, layout.output_h);
+            }
+            if let Some(code) = evdev_button(button) {
+                sink.button(t, code, button_state(pressed));
+            } else {
+                tracing::debug!(?button, "Ignoring unrecognised mouse button");
+            }
+            sink.frame();
+        }
+        // With relative motion the delta belongs to this event and no
+        // RelMove follows it, so dropping it would lose the movement
+        // entirely rather than merely misplace the click.
+        MouseEvent::ButtonRel {
+            x,
+            y,
+            button,
+            pressed,
+        } => {
+            // The delta is applied even for a button this version cannot name,
+            // because no RelMove carries it instead.
+            sink.motion(t, x as f64, y as f64);
+            if let Some(code) = evdev_button(button) {
+                sink.button(t, code, button_state(pressed));
+            } else {
+                tracing::debug!(?button, "Ignoring unrecognised mouse button");
+            }
+            sink.frame();
+        }
+        MouseEvent::VerticalScroll { value } => {
+            emit_scroll_event(
+                sink,
+                t,
+                0,
+                i32::from(value),
+                scroll_residual_h,
+                scroll_residual_v,
+            );
+        }
+        MouseEvent::Scroll { x, y } => {
+            emit_scroll_event(sink, t, x, y, scroll_residual_h, scroll_residual_v);
+        }
+        MouseEvent::HorizontalScroll { value } => {
+            emit_scroll_event(
+                sink,
+                t,
+                i32::from(value),
+                0,
+                scroll_residual_h,
+                scroll_residual_v,
+            );
+        }
+        MouseEvent::RelMove { x, y } => {
+            sink.motion(t, x as f64, y as f64);
+            sink.frame();
+        }
+        // `MouseEvent` is non-exhaustive upstream: a variant added there
+        // must not stop this building, and doing nothing is the right
+        // answer for an event this version does not understand.
+        other => {
+            tracing::debug!(?other, "Ignoring unrecognised mouse event");
+            return false;
+        }
+    }
+    true
+}
+
+/// The evdev code for a button identity from the wire.
+///
+/// `MouseButton` is non-exhaustive upstream, and an identity this version does
+/// not know has no safe stand-in. Every spare evdev code already means
+/// something -- BTN_SIDE is Back in every browser and file manager -- and
+/// borrowing one would alias that button's own press and release pairs, so an
+/// X1 held across an unknown button's release would come up stuck. Such an
+/// event is dropped instead.
+fn evdev_button(button: MouseButton) -> Option<u32> {
+    Some(match button {
+        MouseButton::Left => keymap::BTN_LEFT,
+        MouseButton::Right => keymap::BTN_RIGHT,
+        MouseButton::Middle => keymap::BTN_MIDDLE,
+        MouseButton::X1 => keymap::BTN_SIDE,
+        MouseButton::X2 => keymap::BTN_EXTRA,
+        _ => return None,
+    })
+}
+
+fn button_state(pressed: bool) -> ButtonState {
+    if pressed {
+        ButtonState::Pressed
+    } else {
+        ButtonState::Released
     }
 }
 
@@ -1202,6 +1279,399 @@ mod tests {
 
         assert_eq!(map_rdp_pointer_to_source(&layout, 512, 0).1, 0);
         assert_eq!(map_rdp_pointer_to_source(&layout, 512, 767).1, 1079);
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum RecordedPointerRequest {
+        MotionAbsolute(u32, u32, u32, u32, u32),
+        Motion(u32, f64, f64),
+        Button(u32, u32, ButtonState),
+        Source(AxisSource),
+        Axis(u32, Axis, f64),
+        Discrete(u32, Axis, f64, i32),
+        Frame,
+    }
+
+    #[derive(Default)]
+    struct RecordingPointerSink(RefCell<Vec<RecordedPointerRequest>>);
+
+    impl ScrollRequestSink for RecordingPointerSink {
+        fn axis_source(&self, source: AxisSource) {
+            self.0
+                .borrow_mut()
+                .push(RecordedPointerRequest::Source(source));
+        }
+
+        fn axis(&self, time: u32, axis: Axis, value: f64) {
+            self.0
+                .borrow_mut()
+                .push(RecordedPointerRequest::Axis(time, axis, value));
+        }
+
+        fn axis_discrete(&self, time: u32, axis: Axis, value: f64, discrete: i32) {
+            self.0.borrow_mut().push(RecordedPointerRequest::Discrete(
+                time, axis, value, discrete,
+            ));
+        }
+
+        fn frame(&self) {
+            self.0.borrow_mut().push(RecordedPointerRequest::Frame);
+        }
+    }
+
+    impl PointerRequestSink for RecordingPointerSink {
+        fn motion(&self, time: u32, dx: f64, dy: f64) {
+            self.0
+                .borrow_mut()
+                .push(RecordedPointerRequest::Motion(time, dx, dy));
+        }
+
+        fn motion_absolute(&self, time: u32, x: u32, y: u32, x_extent: u32, y_extent: u32) {
+            self.0
+                .borrow_mut()
+                .push(RecordedPointerRequest::MotionAbsolute(
+                    time, x, y, x_extent, y_extent,
+                ));
+        }
+
+        fn button(&self, time: u32, button: u32, state: ButtonState) {
+            self.0
+                .borrow_mut()
+                .push(RecordedPointerRequest::Button(time, button, state));
+        }
+    }
+
+    fn emit_one(sink: &RecordingPointerSink, event: MouseEvent) -> bool {
+        emit_one_counting_layout_reads(sink, event).0
+    }
+
+    /// Also reports how often the layout thunk was consulted: the snapshot
+    /// takes a lock, and the events that need no coordinates must not pay it.
+    fn emit_one_counting_layout_reads(
+        sink: &RecordingPointerSink,
+        event: MouseEvent,
+    ) -> (bool, usize) {
+        let mut horizontal_residual = 0;
+        let mut vertical_residual = 0;
+        let layout_reads = std::cell::Cell::new(0);
+        let flush = emit_mouse_event(
+            sink,
+            || {
+                layout_reads.set(layout_reads.get() + 1);
+                Some(layout_snapshot((3840, 2160), (1920, 1080)))
+            },
+            7,
+            event,
+            &mut horizontal_residual,
+            &mut vertical_residual,
+        );
+        (flush, layout_reads.get())
+    }
+
+    #[test]
+    fn button_press_places_the_pointer_at_the_position_the_click_carried() {
+        // A client that clicks without a preceding Move must land where it
+        // asked, in source pixels, not wherever the pointer happened to be.
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(
+            &sink,
+            MouseEvent::Button {
+                x: 960,
+                y: 540,
+                button: MouseButton::Left,
+                pressed: true,
+            }
+        ));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::MotionAbsolute(7, 1920, 1080, 3840, 2160),
+                RecordedPointerRequest::Button(7, keymap::BTN_LEFT, ButtonState::Pressed),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn button_release_reports_the_released_state() {
+        let sink = RecordingPointerSink::default();
+
+        let flush = emit_one(
+            &sink,
+            MouseEvent::Button {
+                x: 960,
+                y: 540,
+                button: MouseButton::Right,
+                pressed: false,
+            },
+        );
+
+        assert!(flush);
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                RecordedPointerRequest::MotionAbsolute(7, 1920, 1080, 3840, 2160),
+                RecordedPointerRequest::Button(7, keymap::BTN_RIGHT, ButtonState::Released),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn only_the_events_that_need_coordinates_take_the_layout_lock() {
+        // The snapshot is behind a mutex, so an event that carries its own
+        // delta must not reach for it.
+        let sink = RecordingPointerSink::default();
+
+        let (_, reads) = emit_one_counting_layout_reads(&sink, MouseEvent::RelMove { x: 4, y: -3 });
+        assert_eq!(reads, 0, "RelMove needs no layout");
+
+        let sink = RecordingPointerSink::default();
+        let (_, reads) = emit_one_counting_layout_reads(&sink, MouseEvent::Move { x: 960, y: 540 });
+        assert_eq!(reads, 1, "Move needs the layout exactly once");
+    }
+
+    #[test]
+    fn button_without_a_layout_still_reports_the_button() {
+        // A press already delivered has to see its release even if the layout
+        // went away in between, or the button stays held down in the session.
+        // Only the position is lost.
+        let sink = RecordingPointerSink::default();
+        let mut horizontal_residual = 0;
+        let mut vertical_residual = 0;
+
+        let flush = emit_mouse_event(
+            &sink,
+            || None,
+            7,
+            MouseEvent::Button {
+                x: 960,
+                y: 540,
+                button: MouseButton::Left,
+                pressed: false,
+            },
+            &mut horizontal_residual,
+            &mut vertical_residual,
+        );
+
+        assert!(flush);
+        assert_eq!(
+            *sink.0.borrow(),
+            vec![
+                RecordedPointerRequest::Button(7, keymap::BTN_LEFT, ButtonState::Released),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn relative_button_applies_its_own_delta_before_the_click() {
+        // No RelMove accompanies ButtonRel, so dropping the delta loses the
+        // movement rather than merely misplacing the click.
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(
+            &sink,
+            MouseEvent::ButtonRel {
+                x: -3,
+                y: 7,
+                button: MouseButton::Middle,
+                pressed: true,
+            }
+        ));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::Motion(7, -3.0, 7.0),
+                RecordedPointerRequest::Button(7, keymap::BTN_MIDDLE, ButtonState::Pressed),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn horizontal_scroll_travels_on_the_horizontal_axis() {
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(&sink, MouseEvent::HorizontalScroll { value: 120 }));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::Source(AxisSource::Wheel),
+                RecordedPointerRequest::Discrete(7, Axis::HorizontalScroll, -15.0, -1),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn vertical_scroll_travels_on_the_vertical_axis() {
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(&sink, MouseEvent::VerticalScroll { value: 120 }));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::Source(AxisSource::Wheel),
+                RecordedPointerRequest::Discrete(7, Axis::VerticalScroll, -15.0, -1),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn move_places_the_pointer_at_the_mapped_source_position() {
+        // The absolute-motion path: nothing else drives this arm, so a swapped
+        // coordinate, a swapped extent or a dropped request is silent, and a
+        // pointer that lands in the wrong place is the whole session.
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(&sink, MouseEvent::Move { x: 960, y: 540 }));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::MotionAbsolute(7, 1920, 1080, 3840, 2160),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn move_without_a_layout_emits_nothing_and_asks_for_no_flush() {
+        // Unlike a button, a move carries nothing but the position: with no
+        // layout to map through there is nothing to report, and nothing to
+        // flush either.
+        let sink = RecordingPointerSink::default();
+        let mut horizontal_residual = 0;
+        let mut vertical_residual = 0;
+
+        let flush = emit_mouse_event(
+            &sink,
+            || None,
+            7,
+            MouseEvent::Move { x: 960, y: 540 },
+            &mut horizontal_residual,
+            &mut vertical_residual,
+        );
+
+        assert!(!flush, "nothing was emitted, so there is nothing to flush");
+        assert_eq!(*sink.0.borrow(), []);
+    }
+
+    #[test]
+    fn relative_move_commits_its_delta_in_a_frame() {
+        // Wayland applies pointer requests on the frame; a motion without one
+        // is a move the compositor never performs.
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(&sink, MouseEvent::RelMove { x: -3, y: 7 }));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::Motion(7, -3.0, 7.0),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn two_axis_scroll_sends_each_axis_the_units_it_was_given() {
+        let sink = RecordingPointerSink::default();
+
+        assert!(emit_one(&sink, MouseEvent::Scroll { x: 120, y: 240 }));
+
+        assert_eq!(
+            *sink.0.borrow(),
+            [
+                RecordedPointerRequest::Source(AxisSource::Wheel),
+                RecordedPointerRequest::Discrete(7, Axis::VerticalScroll, -30.0, -2),
+                RecordedPointerRequest::Discrete(7, Axis::HorizontalScroll, -15.0, -1),
+                RecordedPointerRequest::Frame,
+            ]
+        );
+    }
+
+    #[test]
+    fn the_two_scroll_axes_keep_separate_sub_detent_remainders() {
+        // Half a detent on each axis is not a whole detent on either. Crossing
+        // the accumulators turns two unrelated nudges into one click of the
+        // wheel, and no single-event test can see the difference.
+        let sink = RecordingPointerSink::default();
+        let mut horizontal_residual = 0;
+        let mut vertical_residual = 0;
+        let layout = || Some(layout_snapshot((3840, 2160), (1920, 1080)));
+
+        emit_mouse_event(
+            &sink,
+            layout,
+            7,
+            MouseEvent::VerticalScroll { value: 60 },
+            &mut horizontal_residual,
+            &mut vertical_residual,
+        );
+        emit_mouse_event(
+            &sink,
+            layout,
+            7,
+            MouseEvent::HorizontalScroll { value: 60 },
+            &mut horizontal_residual,
+            &mut vertical_residual,
+        );
+
+        assert_eq!(
+            (horizontal_residual, vertical_residual),
+            (60, 60),
+            "each axis keeps its own half detent"
+        );
+        assert!(
+            !sink
+                .0
+                .borrow()
+                .iter()
+                .any(|call| matches!(call, RecordedPointerRequest::Discrete(..))),
+            "half a detent on each axis must not add up to a whole one: {:?}",
+            sink.0.borrow()
+        );
+    }
+
+    #[test]
+    fn evdev_button_maps_each_wire_identity_to_its_own_code() {
+        // X1 and X2 are the old Button4 and Button5: back is the side button,
+        // forward is the extra one. Swapping them is silent at the wire.
+        assert_eq!(evdev_button(MouseButton::Left), Some(keymap::BTN_LEFT));
+        assert_eq!(evdev_button(MouseButton::Right), Some(keymap::BTN_RIGHT));
+        assert_eq!(evdev_button(MouseButton::Middle), Some(keymap::BTN_MIDDLE));
+        assert_eq!(evdev_button(MouseButton::X1), Some(keymap::BTN_SIDE));
+        assert_eq!(evdev_button(MouseButton::X2), Some(keymap::BTN_EXTRA));
+
+        let codes = [
+            evdev_button(MouseButton::Left),
+            evdev_button(MouseButton::Right),
+            evdev_button(MouseButton::Middle),
+            evdev_button(MouseButton::X1),
+            evdev_button(MouseButton::X2),
+        ];
+        let mut distinct = codes.to_vec();
+        distinct.sort_unstable();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            codes.len(),
+            "two button identities collapsed onto one evdev code: {codes:?}"
+        );
+    }
+
+    #[test]
+    fn button_state_follows_the_pressed_flag() {
+        assert_eq!(button_state(true), ButtonState::Pressed);
+        assert_eq!(button_state(false), ButtonState::Released);
     }
 
     #[test]
