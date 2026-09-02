@@ -33,25 +33,12 @@ const HOOK_SESSION_END: &str = "session_end";
 pub(super) fn session_hooks_from_config(
     on_session_start: Option<String>,
     on_session_end: Option<String>,
+    instance: Option<String>,
 ) -> Option<SessionHooks> {
     let on_session_start = on_session_start.filter(|command| !command.trim().is_empty());
     let on_session_end = on_session_end.filter(|command| !command.trim().is_empty());
     if on_session_start.is_none() && on_session_end.is_none() {
         return None;
-    }
-    // Resolved once here rather than per hook: the answer cannot change for
-    // the life of the process, and reading it from inside the queue made the
-    // hook path reach into the runtime directory.
-    //
-    // `None` means nothing has resolved an instance yet, so hooks inherit
-    // whatever this process was started with -- which is what they did before
-    // any of this. It is worth a line because the README promises otherwise,
-    // and because it can only happen if this is built before the display is.
-    let instance = crate::hyprland::resolved_instance();
-    if instance.is_none() {
-        tracing::debug!(
-            "Session hooks will inherit HYPRLAND_INSTANCE_SIGNATURE: no instance resolved yet"
-        );
     }
     Some(SessionHooks::spawn(
         on_session_start,
@@ -246,14 +233,6 @@ fn reap_finished(stragglers: &mut Vec<RunningHook>) {
     });
 }
 
-/// The child a hook runs as.
-///
-/// Hooks inherit this process's environment, and the README says `hyprctl`
-/// works in them. A unit that never had HYPRLAND_INSTANCE_SIGNATURE has none
-/// to pass on, so `hyprctl` would fail with "not set" while the server that
-/// spawned it is talking to Hyprland perfectly well. Passing on what the
-/// server resolved is what makes the two agree; when it has resolved nothing
-/// the variable is left exactly as inherited.
 fn hook_command(command: &str, instance: Option<String>) -> Command {
     let mut child = Command::new("/bin/sh");
     child.arg("-c").arg(command).stdin(Stdio::null());
@@ -382,98 +361,6 @@ mod tests {
             .collect()
     }
 
-    /// And through the production entry point, not only through
-    /// `spawn_session_hook`: the one line that decides what to pass is the
-    /// whole feature, and it is exactly the line a later edit would set to
-    /// `None`.
-    #[test]
-    fn hooks_started_by_the_handler_see_the_instance() {
-        let out = hook_log_path("handler-instance");
-        let _ = std::fs::remove_file(&out);
-        let command = format!(
-            "printf '%s' \"$HYPRLAND_INSTANCE_SIGNATURE\" > '{}'",
-            out.display()
-        );
-
-        let mut hooks = SessionHooks::spawn(
-            Some(command),
-            None,
-            Duration::from_secs(10),
-            Some("handed-down".to_string()),
-        );
-        hooks.session_started();
-        drop(hooks);
-
-        assert_eq!(
-            std::fs::read_to_string(&out).expect("hook wrote the file"),
-            "handed-down"
-        );
-        let _ = std::fs::remove_file(&out);
-    }
-
-    /// End to end: the variable has to reach the child's environment through
-    /// the real spawn path, not only through the builder. `hook_command`'s
-    /// `Some` branch was called by every hook test before this and was never
-    /// effective, because nothing had resolved an instance for them to pass.
-    #[test]
-    fn a_spawned_hook_really_sees_the_instance() {
-        let out = hook_log_path("hook-instance");
-        let _ = std::fs::remove_file(&out);
-        let command = format!(
-            "printf '%s' \"$HYPRLAND_INSTANCE_SIGNATURE\" > '{}'",
-            out.display()
-        );
-
-        let mut running = spawn_session_hook(
-            HOOK_SESSION_START,
-            &command,
-            Some("passed-through".to_string()),
-        )
-        .expect("hook spawns");
-        let _ = running.child.wait();
-
-        assert_eq!(
-            std::fs::read_to_string(&out).expect("hook wrote the file"),
-            "passed-through"
-        );
-        let _ = std::fs::remove_file(&out);
-    }
-
-    /// Both ends of the wire at once, through the real entry point.
-    ///
-    /// The other instance tests hand the value over themselves, so either end
-    /// could be cut -- `session_hooks_from_config` passing `None`, or
-    /// `resolved_instance` returning it -- and the feature would silently
-    /// revert to "not set" in the hook while every test still passed. This one
-    /// seeds the process-wide instance and then reads what a real hook saw.
-    ///
-    /// It is the only test that may seed it: the cache is a `OnceLock` and the
-    /// first writer wins for the life of the binary.
-    #[test]
-    fn hooks_built_from_config_carry_the_processes_instance() {
-        crate::hyprland::remember_instance_for_test("from-the-process");
-        let out = hook_log_path("config-instance");
-        let _ = std::fs::remove_file(&out);
-        let command = format!(
-            "printf '%s' \"$HYPRLAND_INSTANCE_SIGNATURE\" > '{}'",
-            out.display()
-        );
-
-        let mut hooks =
-            session_hooks_from_config(Some(command), None).expect("a start hook was configured");
-        hooks.session_started();
-        drop(hooks);
-
-        assert_eq!(
-            std::fs::read_to_string(&out).expect("hook wrote the file"),
-            "from-the-process",
-            "the hook must see the instance this process resolved, not the unit's"
-        );
-        let _ = std::fs::remove_file(&out);
-    }
-
-    /// A hook has to see the instance the server resolved, or `hyprctl` in it
-    /// fails with "not set" under exactly the unit this feature makes possible.
     #[test]
     fn a_hook_is_given_the_resolved_instance() {
         let command = hook_command("true", Some("resolved-sig".into()));
@@ -487,21 +374,11 @@ mod tests {
         );
     }
 
-    /// And when nothing has been resolved the child's environment is left
-    /// exactly as inherited -- overriding it with an empty or invented value
-    /// would be worse than passing nothing.
-    #[test]
-    fn a_hook_inherits_the_environment_when_nothing_was_resolved() {
-        let command = hook_command("true", None);
-
-        assert!(env_of(&command).is_empty());
-    }
-
     #[test]
     fn missing_hook_commands_disable_connection_handler_wiring() {
-        assert!(session_hooks_from_config(None, None).is_none());
-        assert!(session_hooks_from_config(Some("true".into()), None).is_some());
-        assert!(session_hooks_from_config(None, Some("true".into())).is_some());
+        assert!(session_hooks_from_config(None, None, None).is_none());
+        assert!(session_hooks_from_config(Some("true".into()), None, None).is_some());
+        assert!(session_hooks_from_config(None, Some("true".into()), None).is_some());
     }
 
     #[test]
@@ -643,6 +520,7 @@ mod tests {
         let mut hooks = session_hooks_from_config(
             Some(echo_to_log(&log, "start")),
             Some(echo_to_log(&log, "end")),
+            None,
         )
         .expect("both commands configured");
 
