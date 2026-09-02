@@ -10,7 +10,8 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 - **Clipboard** — Bidirectional text and image clipboard sync
 - **Input** — Full keyboard and mouse support via virtual keyboard/pointer protocols
 - **Session hooks** — Run a command when a client session starts and ends
-- **TLS** — Auto-generated self-signed certificates, or bring your own
+- **TLS** — Auto-generated self-signed RSA-2048 certificates, or bring your own. Existing
+  `~/.config/hypr-rdp/cert.pem` and `key.pem` files are reused; delete both to regenerate them.
 - **Config file** — `~/.config/hypr-rdp/config.toml`
 
 ## Installation
@@ -72,6 +73,11 @@ sudo install -Dm755 target/release/hypr-rdp /usr/local/bin/hypr-rdp
 Requires **Hyprland 0.54+**.
 VA-API is included in the standard build and falls back to software encoding
 automatically when unavailable.
+
+Run hypr-rdp as the same user as Hyprland with `WAYLAND_DISPLAY` set. When
+`HYPRLAND_INSTANCE_SIGNATURE` is absent, hypr-rdp selects the live Hyprland
+instance whose lock file names that Wayland display. Set the signature
+explicitly if discovery reports no unique match.
 
 ```sh
 # Basic (auto-generates TLS cert, binds to 127.0.0.1:3389)
@@ -139,8 +145,10 @@ on_session_end = "hyprctl dispatch dpms on eDP-1"
   exits unsuccessfully, or outlives the deadline cannot guarantee that the
   corresponding start action is undone.
 - Commands run through `/bin/sh -c` as the same user as hypr-rdp, with its
-  environment and working directory, so `hyprctl` works but shell profiles are
-  not read — use absolute paths for anything outside the inherited `PATH`.
+  environment and working directory. The selected
+  `HYPRLAND_INSTANCE_SIGNATURE` is supplied so `hyprctl` targets the same
+  compositor. Shell profiles are not read — use absolute paths for anything
+  outside the inherited `PATH`.
   hypr-rdp never kills a command; one still running at exit is left to the
   service manager. Hook command text is not written to hypr-rdp's logs.
 
@@ -156,7 +164,7 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--bind`, `-b` | Bind address | `127.0.0.1:3389` |
-| `--cert` | TLS certificate (PEM) | Auto-generated |
+| `--cert` | TLS certificate (PEM) | Auto-generated, RSA-2048 |
 | `--key` | TLS private key (PEM) | Auto-generated |
 | `-u`, `--username` | RDP username | _(none)_ |
 | `-p`, `--password` | RDP password | _(none)_ |

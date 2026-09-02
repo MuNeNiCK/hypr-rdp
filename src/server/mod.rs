@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ironrdp_server::{
-    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer,
+    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer, ServerError,
     SoundServerFactory, TlsIdentityCtx,
 };
 
@@ -27,6 +27,8 @@ pub struct ServerContext {
 }
 
 pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
+    let hyprland_instance =
+        crate::hyprland::initialize().context("failed to select the Hyprland instance")?;
     let RuntimeConfig {
         bind,
         cert,
@@ -82,7 +84,8 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
     let sound_factory = sound_factory_for_audio_mode(audio_mode);
-    let session_hooks = session_hooks_from_config(on_session_start, on_session_end);
+    let session_hooks =
+        session_hooks_from_config(on_session_start, on_session_end, Some(hyprland_instance));
 
     let builder = RdpServer::builder().with_addr(bind);
 
@@ -132,7 +135,11 @@ fn sound_factory_for_audio_mode(audio_mode: AudioMode) -> Option<Box<dyn SoundSe
 }
 
 pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
-    ctx.server.run().await
+    ctx.server.run().await.map_err(server_run_error)
+}
+
+fn server_run_error(error: ServerError) -> anyhow::Error {
+    anyhow::Error::new(error)
 }
 
 /// Adapts IronRDP connection boundaries to application-owned policies.
@@ -169,7 +176,7 @@ impl ConnectionHandler for ClientConnectionHandler {
         &mut self,
         _peer: SocketAddr,
         _duration: Duration,
-        _error: Option<&anyhow::Error>,
+        _error: Option<&ServerError>,
     ) -> PostConnectionAction {
         self.input_session_sink.session_ended();
         if let Some(hooks) = &mut self.session_hooks {
@@ -224,6 +231,26 @@ mod tests {
         ConnectionInfo::new(0x0409, KeyboardType::IBM_ENHANCED, String::new())
     }
 
+    #[test]
+    fn server_run_error_keeps_the_cause_the_server_reported() {
+        use ironrdp_server::ServerErrorExt as _;
+        let error = ServerError::io(
+            "accepting a client",
+            std::io::Error::other("tls handshake failed"),
+        );
+
+        let converted = server_run_error(error);
+        let rendered = format!("{converted:#}");
+
+        assert!(
+            rendered.contains("accepting a client"),
+            "context lost: {rendered}"
+        );
+        assert!(
+            rendered.contains("tls handshake failed"),
+            "cause lost: {rendered}"
+        );
+    }
     #[test]
     fn connection_handler_drives_hooks_on_both_boundaries() {
         struct NoopSink;
@@ -406,7 +433,7 @@ mod tests {
             &mut self,
             _peer: std::net::SocketAddr,
             _duration: Duration,
-            error: Option<&anyhow::Error>,
+            error: Option<&ServerError>,
         ) -> PostConnectionAction {
             assert!(error.is_some(), "raw client abort should end with an error");
             PostConnectionAction::Stop
