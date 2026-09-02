@@ -10,7 +10,8 @@ Native RDP server for Hyprland. Connect to your Hyprland desktop from an RDP cli
 - **Clipboard** — Bidirectional text and image clipboard sync
 - **Input** — Full keyboard and mouse support via virtual keyboard/pointer protocols
 - **Session hooks** — Run a command when a client session starts and ends
-- **TLS** — Auto-generated self-signed certificates, or bring your own
+- **TLS** — Auto-generated self-signed RSA-2048 certificates, or bring your own. Existing
+  `~/.config/hypr-rdp/cert.pem` and `key.pem` files are reused; delete both to regenerate them.
 - **Config file** — `~/.config/hypr-rdp/config.toml`
 
 ## Installation
@@ -156,7 +157,7 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--bind`, `-b` | Bind address | `127.0.0.1:3389` |
-| `--cert` | TLS certificate (PEM) | Auto-generated |
+| `--cert` | TLS certificate (PEM) | Auto-generated, RSA-2048 |
 | `--key` | TLS private key (PEM) | Auto-generated |
 | `-u`, `--username` | RDP username | _(none)_ |
 | `-p`, `--password` | RDP password | _(none)_ |

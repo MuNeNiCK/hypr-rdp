@@ -48,7 +48,8 @@ pipewire = "0.9"
 libc = "0.2"
 
 # TLS auto-cert generation
-rcgen = "0.13"
+# RSA key generation requires rcgen's aws-lc backend.
+rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 # Clipboard image support (DIB/PNG conversion)
 ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", rev = "a36af40d49491f1d0c9db24b7d91cf47d9a07d38" }
