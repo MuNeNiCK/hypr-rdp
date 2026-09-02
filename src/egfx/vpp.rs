@@ -9,7 +9,7 @@ use libva_sys::va_display_drm as va;
 
 use super::vaapi_sys::{
     self as sys, va_check, VABufferID, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
-    VASurfaceAttrib, VASurfaceID,
+    VASurfaceAttrib, VASurfaceID, VA_FOURCC_BGRA, VA_FOURCC_BGRX,
 };
 
 // Constants from VA-API headers
@@ -20,6 +20,38 @@ const VA_EXPORT_SURFACE_READ_ONLY: u32 = sys::VA_EXPORT_SURFACE_READ_ONLY;
 const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = sys::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
 const DRM_FORMAT_ARGB8888: u32 = 0x34324152;
+
+fn input_surface_descriptor(
+    dmabuf_fd: RawFd,
+    width: u32,
+    height: u32,
+    stride: u32,
+    modifier: u64,
+    drm_format: u32,
+) -> Result<(u32, VADRMPRIMESurfaceDescriptor)> {
+    let va_fourcc = match drm_format {
+        DRM_FORMAT_XRGB8888 => VA_FOURCC_BGRX,
+        DRM_FORMAT_ARGB8888 => VA_FOURCC_BGRA,
+        _ => bail!("unsupported DRM format for VPP input: 0x{:08x}", drm_format),
+    };
+
+    let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
+    desc.fourcc = va_fourcc;
+    desc.width = width;
+    desc.height = height;
+    desc.num_objects = 1;
+    desc.objects[0].fd = dmabuf_fd;
+    desc.objects[0].size = stride * height;
+    desc.objects[0].drm_format_modifier = modifier;
+    desc.num_layers = 1;
+    desc.layers[0].drm_format = drm_format;
+    desc.layers[0].num_planes = 1;
+    desc.layers[0].object_index[0] = 0;
+    desc.layers[0].offset[0] = 0;
+    desc.layers[0].pitch[0] = stride;
+
+    Ok((VA_RT_FORMAT_RGB32, desc))
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct VppDmaBufInfo {
@@ -150,26 +182,8 @@ impl VppConverter {
         modifier: u64,
         format: u32,
     ) -> Result<usize> {
-        let rt_format = match format {
-            DRM_FORMAT_XRGB8888 | DRM_FORMAT_ARGB8888 => VA_RT_FORMAT_RGB32,
-            _ => bail!("unsupported DRM format for VPP input: 0x{:08x}", format),
-        };
-
-        // Build VADRMPRIMESurfaceDescriptor for import
-        let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
-        desc.fourcc = format;
-        desc.width = width;
-        desc.height = height;
-        desc.num_objects = 1;
-        desc.objects[0].fd = dmabuf_fd;
-        desc.objects[0].size = stride * height;
-        desc.objects[0].drm_format_modifier = modifier;
-        desc.num_layers = 1;
-        desc.layers[0].drm_format = format;
-        desc.layers[0].num_planes = 1;
-        desc.layers[0].object_index[0] = 0;
-        desc.layers[0].offset[0] = 0;
-        desc.layers[0].pitch[0] = stride;
+        let (rt_format, mut desc) =
+            input_surface_descriptor(dmabuf_fd, width, height, stride, modifier, format)?;
 
         let mut attrs: [VASurfaceAttrib; 2] = unsafe { std::mem::zeroed() };
 
@@ -344,5 +358,43 @@ impl Drop for VppConverter {
             va::vaDestroyContext(self.va_display.raw(), self.context_id);
             va::vaDestroyConfig(self.va_display.raw(), self.config_id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vpp_import_descriptor_maps_xrgb_to_va_bgrx() {
+        let (rt_format, desc) =
+            input_surface_descriptor(7, 1920, 1080, 7680, 42, DRM_FORMAT_XRGB8888).unwrap();
+
+        assert_eq!(rt_format, VA_RT_FORMAT_RGB32);
+        assert_eq!(desc.fourcc, VA_FOURCC_BGRX);
+        assert_eq!(desc.layers[0].drm_format, DRM_FORMAT_XRGB8888);
+        assert_eq!(desc.objects[0].fd, 7);
+        assert_eq!(desc.objects[0].drm_format_modifier, 42);
+        assert_eq!(desc.layers[0].pitch[0], 7680);
+    }
+
+    #[test]
+    fn vpp_import_descriptor_maps_argb_to_va_bgra() {
+        let (_, desc) =
+            input_surface_descriptor(8, 1280, 720, 5120, 9, DRM_FORMAT_ARGB8888).unwrap();
+
+        assert_eq!(desc.fourcc, VA_FOURCC_BGRA);
+        assert_eq!(desc.layers[0].drm_format, DRM_FORMAT_ARGB8888);
+    }
+
+    #[test]
+    fn vpp_import_descriptor_rejects_unsupported_drm_format() {
+        let error = input_surface_descriptor(0, 1, 1, 4, 0, 0)
+            .err()
+            .expect("unsupported format must fail");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported DRM format for VPP input"));
     }
 }
