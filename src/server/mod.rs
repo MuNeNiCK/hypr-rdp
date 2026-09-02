@@ -221,6 +221,7 @@ mod tests {
     use ironrdp_server::{
         ConnectionHandler, ConnectionInfo, PostConnectionAction, RdpServer, ServerEvent,
     };
+    use tokio::io::AsyncWriteExt as _;
     use tokio::net::TcpStream;
     use tokio::sync::mpsc;
     use tokio::sync::oneshot;
@@ -405,7 +406,7 @@ mod tests {
             .with_no_security()
             .with_no_input()
             .with_no_display()
-            .with_connection_handler(Some(Box::new(StopAfterDisconnect)))
+            .with_connection_handler(Some(Box::new(StopAfterDisconnects::new(1))))
             .build();
         let event_sender = server.event_sender().clone();
 
@@ -428,9 +429,57 @@ mod tests {
             .await;
     }
 
-    struct StopAfterDisconnect;
+    #[tokio::test]
+    async fn server_lifecycle_malformed_zero_length_pdu_does_not_block_next_client() {
+        let mut server = RdpServer::builder()
+            .with_addr(([127, 0, 0, 1], 0))
+            .with_no_security()
+            .with_no_input()
+            .with_no_display()
+            .with_connection_handler(Some(Box::new(StopAfterDisconnects::new(2))))
+            .build();
+        let event_sender = server.event_sender().clone();
 
-    impl ConnectionHandler for StopAfterDisconnect {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let server_task = tokio::task::spawn_local(async move { server.run().await });
+                let bound_addr = wait_for_local_addr(&event_sender).await;
+
+                let mut malformed = TcpStream::connect(bound_addr)
+                    .await
+                    .expect("connect malformed client");
+                malformed
+                    .write_all(&[0; 43])
+                    .await
+                    .expect("write malformed pre-authentication bytes");
+                drop(malformed);
+
+                let second = TcpStream::connect(bound_addr)
+                    .await
+                    .expect("connect second client");
+                drop(second);
+
+                tokio::time::timeout(Duration::from_secs(1), server_task)
+                    .await
+                    .expect("malformed client must not block the next client")
+                    .expect("server task must not panic")
+                    .expect("server run must succeed");
+            })
+            .await;
+    }
+
+    struct StopAfterDisconnects {
+        remaining: usize,
+    }
+
+    impl StopAfterDisconnects {
+        fn new(remaining: usize) -> Self {
+            Self { remaining }
+        }
+    }
+
+    impl ConnectionHandler for StopAfterDisconnects {
         fn on_disconnected(
             &mut self,
             _peer: std::net::SocketAddr,
@@ -438,7 +487,12 @@ mod tests {
             error: Option<&ServerError>,
         ) -> PostConnectionAction {
             assert!(error.is_some(), "raw client abort should end with an error");
-            PostConnectionAction::Stop
+            self.remaining -= 1;
+            if self.remaining == 0 {
+                PostConnectionAction::Stop
+            } else {
+                PostConnectionAction::Continue
+            }
         }
     }
 
