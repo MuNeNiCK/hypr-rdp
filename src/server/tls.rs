@@ -59,13 +59,7 @@ fn auto_generate_tls_in(config_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     }
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    // RSA rather than rcgen's default P-256. This certificate authenticates
-    // nothing -- it is self-signed and every client warns about it -- so its
-    // only job is to let the handshake finish, and the key algorithm is the one
-    // thing about it a client can refuse outright. rdesktop 1.9 does:
-    // "Peer's certificate public key algorithm is not RSA". RSA-2048 is
-    // accepted by every RDP client that accepts anything, and a user who wants
-    // a modern key can still bring one with --cert/--key.
+    // Use RSA for compatibility with rdesktop 1.9.
     let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
         .context("failed to generate an RSA key for the self-signed certificate")?;
     let cert = rcgen::CertificateParams::new(subject_alt_names)
@@ -174,9 +168,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 
-    /// DER encoding of the `rsaEncryption` OID 1.2.840.113549.1.1.1, and of
-    /// `id-ecPublicKey` 1.2.840.10045.2.1, as they appear inside a certificate's
-    /// SubjectPublicKeyInfo.
     const RSA_ENCRYPTION_OID: &[u8] = &[
         0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
     ];
@@ -188,11 +179,6 @@ mod tests {
             .any(|window| window == needle)
     }
 
-    /// Issue #68. rdesktop 1.9 refuses a peer certificate whose public key is
-    /// not RSA -- "Peer's certificate public key algorithm is not RSA" -- and
-    /// rcgen's `generate_simple_self_signed` produces P-256. Asserted against
-    /// the certificate's own DER, which is the thing the client parses, rather
-    /// than against the algorithm we asked for.
     #[test]
     fn the_auto_generated_certificate_uses_an_rsa_key() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -205,15 +191,43 @@ mod tests {
             TlsIdentityCtx::init_from_paths(&cert, &key).expect("generated TLS identity loads");
         let der = tls_ctx.certs.first().expect("one certificate").as_ref();
 
-        assert!(
-            contains(der, RSA_ENCRYPTION_OID),
-            "the certificate must carry an RSA public key; older clients refuse anything else"
-        );
-        assert!(
-            !contains(der, EC_PUBLIC_KEY_OID),
-            "an EC public key is what rdesktop rejects"
-        );
+        assert!(contains(der, RSA_ENCRYPTION_OID));
+        assert!(!contains(der, EC_PUBLIC_KEY_OID));
 
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn an_existing_ecdsa_identity_is_not_replaced() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate ECDSA key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("certificate parameters")
+            .self_signed(&key_pair)
+            .expect("self-signed certificate");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+        std::fs::write(&cert_path, &cert_pem).expect("write certificate");
+        std::fs::write(&key_path, &key_pem).expect("write key");
+
+        let reused = auto_generate_tls_in(&dir).expect("reuse TLS identity");
+
+        assert_eq!(reused, (cert_path.clone(), key_path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&cert_path).expect("read certificate"),
+            cert_pem
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).expect("read key"),
+            key_pem
+        );
+        TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("reused identity loads");
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 

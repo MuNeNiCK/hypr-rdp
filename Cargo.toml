@@ -48,8 +48,7 @@ pipewire = "0.9"
 libc = "0.2"
 
 # TLS auto-cert generation
-# aws_lc_rs rather than the default ring backend: ring cannot generate RSA keys,
-# and rustls already builds aws-lc here, so this costs no new build tooling.
+# RSA key generation requires rcgen's aws-lc backend.
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "aws_lc_rs"] }
 
 # Clipboard image support (DIB/PNG conversion)
