@@ -12,7 +12,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use ironrdp_displaycontrol::pdu::{DisplayControlMonitorLayout, MonitorOrientation};
-use ironrdp_server::{DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates};
+use ironrdp_server::{
+    DesktopSize, DisplayUpdate, RdpServerDisplay, RdpServerDisplayUpdates, ServerError,
+    ServerErrorExt as _, ServerResult,
+};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
@@ -734,7 +737,7 @@ impl RdpServerDisplay for HyprDisplay {
         );
     }
 
-    async fn updates(&mut self) -> Result<Box<dyn RdpServerDisplayUpdates>> {
+    async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         // Extract stop_flag and handle before joining, to avoid holding
         // the Mutex during a blocking join() call.
         let (stop_flag, handle) = {
@@ -771,7 +774,8 @@ impl RdpServerDisplay for HyprDisplay {
             pending_initial_resize,
             Arc::clone(&inner.stop_flag),
         )
-        .await?;
+        .await
+        .map_err(capture_start_error)?;
         inner.capture_handle = Some(capture_handle);
         inner.output_name = capture_info.output_name;
         if let Some(snapshot) = inner.output_layout.snapshot() {
@@ -789,6 +793,10 @@ impl RdpServerDisplay for HyprDisplay {
     }
 }
 
+fn capture_start_error(error: anyhow::Error) -> ServerError {
+    ServerError::reason("failed to start capture", format!("{error:#}"))
+}
+
 struct HyprDisplayUpdates {
     rx: mpsc::Receiver<DisplayUpdate>,
     /// Signaled when the capture thread exits without a stop request. The
@@ -800,7 +808,7 @@ struct HyprDisplayUpdates {
 
 #[async_trait]
 impl RdpServerDisplayUpdates for HyprDisplayUpdates {
-    async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+    async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
         tokio::select! {
             biased;
             update = self.rx.recv() => Ok(update),
@@ -812,6 +820,28 @@ impl RdpServerDisplayUpdates for HyprDisplayUpdates {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_start_error_carries_the_whole_anyhow_chain() {
+        let error =
+            anyhow::anyhow!("no dmabuf feedback").context("binding zwlr_screencopy_manager_v1");
+
+        let converted = capture_start_error(error);
+        let rendered = format!("{converted:#}");
+
+        assert!(
+            rendered.contains("failed to start capture"),
+            "context lost: {rendered}"
+        );
+        assert!(
+            rendered.contains("binding zwlr_screencopy_manager_v1"),
+            "outer context dropped: {rendered}"
+        );
+        assert!(
+            rendered.contains("no dmabuf feedback"),
+            "root cause dropped: {rendered}"
+        );
+    }
 
     #[tokio::test]
     async fn next_update_delivers_buffered_updates_before_the_death_signal() {
