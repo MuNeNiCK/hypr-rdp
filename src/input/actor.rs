@@ -957,7 +957,12 @@ mod tests {
                     code: 0x1d,
                     extended: false,
                 }),
-                InputCommand::Mouse(MouseEvent::LeftPressed),
+                InputCommand::Mouse(MouseEvent::Button {
+                    x: 0,
+                    y: 0,
+                    button: ironrdp_server::MouseButton::Left,
+                    pressed: true,
+                }),
             ],
         );
 
@@ -986,10 +991,20 @@ mod tests {
             .expect("default keymap compiles");
         let (commands, receiver) = mpsc::channel();
         commands
-            .send(InputCommand::Mouse(MouseEvent::LeftPressed))
+            .send(InputCommand::Mouse(MouseEvent::Button {
+                x: 0,
+                y: 0,
+                button: ironrdp_server::MouseButton::Left,
+                pressed: true,
+            }))
             .unwrap();
         commands
-            .send(InputCommand::Mouse(MouseEvent::LeftReleased))
+            .send(InputCommand::Mouse(MouseEvent::Button {
+                x: 0,
+                y: 0,
+                button: ironrdp_server::MouseButton::Left,
+                pressed: false,
+            }))
             .unwrap();
         drop(commands);
 
