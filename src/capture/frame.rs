@@ -496,6 +496,10 @@ impl FrameProcessor {
 
     /// Process a captured frame. Returns true if the capture loop should continue.
     pub(super) fn process(&mut self, data: &[u8], tx: &mpsc::Sender<DisplayUpdate>) -> bool {
+        self.process_at(data, tx, Instant::now())
+    }
+
+    fn process_at(&mut self, data: &[u8], tx: &mpsc::Sender<DisplayUpdate>, now: Instant) -> bool {
         let force_egfx_full_frame = self
             .egfx_shared
             .as_ref()
@@ -873,7 +877,10 @@ impl FrameProcessor {
             self.egfx_active && self.h264_encoder.is_some() && self.egfx_surface_id.is_some();
         let should_send_bitmap = match egfx_state {
             None => true,
-            Some((false, _)) => false,
+            Some((false, _)) => self
+                .egfx_shared
+                .as_ref()
+                .is_some_and(|shared| shared.bitmap_fallback_due(now)),
             Some((true, avc_enabled)) => !avc_enabled || !egfx_runtime_available,
         };
 
@@ -913,6 +920,7 @@ mod tests {
     };
     use crate::egfx::{
         EgfxCodecPolicy, H264RateControl, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT,
+        GFX_READY_GRACE,
     };
     use crate::input::OutputLayoutSnapshot;
     use ironrdp_server::{DisplayUpdate, PixelFormat};
@@ -1344,6 +1352,88 @@ mod tests {
         assert!(!processor.sent_first_frame);
         assert!(processor.has_pending_damage());
         assert!(display_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn frame_processor_falls_back_after_egfx_activation_timeout() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new(
+            Some(shared),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Vbr,
+            30,
+        );
+
+        let start = Instant::now();
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start));
+        assert!(
+            display_rx.try_recv().is_err(),
+            "the activation sequence is still worth waiting for"
+        );
+        assert!(processor.has_pending_damage());
+        assert!(!processor.sent_first_frame);
+
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process_at(&frame, &display_tx, start + GFX_READY_GRACE));
+
+        assert!(
+            matches!(display_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+            "past the grace the client must get pixels, not silence"
+        );
+        assert!(processor.sent_first_frame);
+        assert!(!processor.has_pending_damage());
+    }
+
+    #[test]
+    fn rebuilt_frame_processor_keeps_connection_activation_deadline() {
+        let width = 16;
+        let height = 16;
+        let stride = width * 4;
+        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+        let frame = gradient_bgra_frame(width, height, stride);
+        let build = |shared: &Arc<crate::egfx::EgfxShared>| {
+            FrameProcessor::new(
+                Some(Arc::clone(shared)),
+                width as u32,
+                height as u32,
+                PixelFormat::BgrA32,
+                stride as u32,
+                1_000_000,
+                23,
+                H264RateControl::Vbr,
+                30,
+            )
+        };
+
+        let start = Instant::now();
+        let (first_tx, mut first_rx) = mpsc::channel(4);
+        let mut first = build(&shared);
+        first.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(first.process_at(&frame, &first_tx, start));
+        assert!(first_rx.try_recv().is_err());
+        drop(first);
+
+        let (second_tx, mut second_rx) = mpsc::channel(4);
+        let mut second = build(&shared);
+        second.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(second.process_at(&frame, &second_tx, start + GFX_READY_GRACE));
+
+        assert!(
+            matches!(second_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+            "the wait belongs to the connection, not to whichever processor is current"
+        );
     }
 
     #[test]

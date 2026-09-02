@@ -177,7 +177,7 @@ pub struct RuntimeConfig {
     pub key: Option<String>,
     pub credentials: Option<ConfigCredentials>,
     pub resolution: (u32, u32),
-    pub scale: f64,
+    pub headless_scale: f64,
     pub capture_mode: CaptureMode,
     pub bitrate: u32,
     pub quality: u8,
@@ -275,7 +275,7 @@ impl RuntimeConfig {
             .resolution
             .or(config.resolution)
             .unwrap_or_else(|| "1920x1080".into());
-        let scale = resolve_scale(args.scale.or(config.scale))?;
+        let headless_scale = resolve_headless_scale(args.scale, config.scale)?;
         let capture_mode_str = args
             .capture_mode
             .or(config.capture_mode)
@@ -322,7 +322,7 @@ impl RuntimeConfig {
             key,
             credentials,
             resolution,
-            scale,
+            headless_scale,
             capture_mode,
             bitrate,
             quality,
@@ -461,10 +461,8 @@ fn resolve_audio_mode(
     parse_audio_mode(&value)
 }
 
-fn resolve_scale(scale: Option<f64>) -> anyhow::Result<f64> {
-    let Some(scale) = scale else {
-        return Ok(1.0);
-    };
+fn resolve_headless_scale(cli: Option<f64>, config: Option<f64>) -> anyhow::Result<f64> {
+    let scale = cli.or(config).unwrap_or(1.0);
 
     if !scale.is_finite() || scale <= 0.0 {
         anyhow::bail!("invalid scale {scale}, expected a positive number (e.g. 1, 1.5, 2)");
@@ -501,32 +499,31 @@ fn parse_resolution(s: &str) -> anyhow::Result<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-
-    #[test]
-    fn scale_defaults_to_one_when_unset() {
-        assert_eq!(resolve_scale(None).expect("default scale"), 1.0);
-    }
-
-    #[test]
-    fn scale_accepts_fractional_values() {
-        assert_eq!(resolve_scale(Some(1.5)).expect("fractional scale"), 1.5);
-    }
-
-    #[test]
-    fn scale_rejects_zero_and_negative() {
-        assert!(resolve_scale(Some(0.0)).is_err());
-        assert!(resolve_scale(Some(-2.0)).is_err());
-    }
-
-    #[test]
-    fn scale_rejects_non_finite() {
-        assert!(resolve_scale(Some(f64::NAN)).is_err());
-        assert!(resolve_scale(Some(f64::INFINITY)).is_err());
-    }
     use super::*;
     use proptest::prelude::*;
     use std::fs;
     use StartupWarning::*;
+
+    #[test]
+    fn headless_scale_defaults_and_cli_overrides_config() {
+        assert_eq!(resolve_headless_scale(None, None).unwrap(), 1.0);
+        assert_eq!(resolve_headless_scale(None, Some(1.5)).unwrap(), 1.5);
+        assert_eq!(resolve_headless_scale(Some(2.0), Some(1.5)).unwrap(), 2.0);
+    }
+
+    #[test]
+    fn headless_scale_rejects_non_positive_and_non_finite_values() {
+        for value in [0.0, -2.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(resolve_headless_scale(Some(value), None).is_err());
+        }
+    }
+
+    #[test]
+    fn cli_accepts_headless_scale() {
+        let args = Args::try_parse_from(["hypr-rdp", "--scale", "1.5"]).unwrap();
+
+        assert_eq!(args.scale, Some(1.5));
+    }
 
     fn warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
         let credentials = ConfigCredentials::from_parts(username.to_owned(), password.to_owned());
@@ -622,7 +619,7 @@ mod tests {
         let path = temp_config_path("valid");
         fs::write(
             &path,
-            "bind = '127.0.0.1:3390'\nusername = 'alice'\nh264_backend = 'software'\n",
+            "bind = '127.0.0.1:3390'\nusername = 'alice'\nscale = 2\nh264_backend = 'software'\n",
         )
         .expect("write valid config");
 
@@ -630,6 +627,7 @@ mod tests {
 
         assert_eq!(config.bind.as_deref(), Some("127.0.0.1:3390"));
         assert_eq!(config.username.as_deref(), Some("alice"));
+        assert_eq!(config.scale, Some(2.0));
         assert_eq!(config.h264_backend.as_deref(), Some("software"));
         fs::remove_file(&path).expect("remove valid config");
     }

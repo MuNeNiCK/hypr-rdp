@@ -59,9 +59,13 @@ fn auto_generate_tls_in(config_dir: &Path) -> Result<(PathBuf, PathBuf)> {
     }
 
     let subject_alt_names = vec!["localhost".to_string(), "127.0.0.1".to_string()];
-    let rcgen::CertifiedKey { cert, key_pair } =
-        rcgen::generate_simple_self_signed(subject_alt_names)
-            .context("failed to generate self-signed certificate")?;
+    // Use RSA for compatibility with rdesktop 1.9.
+    let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+        .context("failed to generate an RSA key for the self-signed certificate")?;
+    let cert = rcgen::CertificateParams::new(subject_alt_names)
+        .context("failed to build self-signed certificate parameters")?
+        .self_signed(&key_pair)
+        .context("failed to generate self-signed certificate")?;
 
     let tmp_key = config_dir.join(".key.pem.tmp");
     {
@@ -161,6 +165,69 @@ mod tests {
             key_metadata.modified().expect("key modified time")
         );
 
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    const RSA_ENCRYPTION_OID: &[u8] = &[
+        0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01,
+    ];
+    const EC_PUBLIC_KEY_OID: &[u8] = &[0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01];
+
+    fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn the_auto_generated_certificate_uses_an_rsa_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (cert, key) = auto_generate_tls_in(&dir).expect("generate TLS identity");
+
+        let tls_ctx =
+            TlsIdentityCtx::init_from_paths(&cert, &key).expect("generated TLS identity loads");
+        let der = tls_ctx.certs.first().expect("one certificate").as_ref();
+
+        assert!(contains(der, RSA_ENCRYPTION_OID));
+        assert!(!contains(der, EC_PUBLIC_KEY_OID));
+
+        std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn an_existing_ecdsa_identity_is_not_replaced() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("generate ECDSA key");
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .expect("certificate parameters")
+            .self_signed(&key_pair)
+            .expect("self-signed certificate");
+        let cert_path = dir.join("cert.pem");
+        let key_path = dir.join("key.pem");
+        let cert_pem = cert.pem();
+        let key_pem = key_pair.serialize_pem();
+        std::fs::write(&cert_path, &cert_pem).expect("write certificate");
+        std::fs::write(&key_path, &key_pem).expect("write key");
+
+        let reused = auto_generate_tls_in(&dir).expect("reuse TLS identity");
+
+        assert_eq!(reused, (cert_path.clone(), key_path.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&cert_path).expect("read certificate"),
+            cert_pem
+        );
+        assert_eq!(
+            std::fs::read_to_string(&key_path).expect("read key"),
+            key_pem
+        );
+        TlsIdentityCtx::init_from_paths(&cert_path, &key_path).expect("reused identity loads");
         std::fs::remove_dir_all(&dir).expect("cleanup temp dir");
     }
 

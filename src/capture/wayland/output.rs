@@ -34,6 +34,10 @@ impl Drop for HeadlessOutputGuard {
 
 const HEADLESS_PREFIX: &str = "hypr-rdp";
 
+pub(crate) fn headless_monitor_rule(name: &str, mode: &str, scale: f64) -> String {
+    format!("{name},{mode},-9999x0,{scale}")
+}
+
 /// List headless outputs created by hypr-rdp (name starts with "hypr-rdp-").
 pub(crate) fn list_stale_headless_outputs() -> Result<Vec<String>> {
     let monitors = crate::hyprland::monitors()?;
@@ -54,6 +58,7 @@ pub(crate) fn list_stale_headless_outputs() -> Result<Vec<String>> {
 pub(crate) fn create_headless_output(
     width: u32,
     height: u32,
+    scale: f64,
 ) -> Result<(String, HeadlessOutputGuard)> {
     // Subscribe to events BEFORE creating the output to catch monitoradded.
     // The ensure_registered() roundtrip guarantees Hyprland has accept()'ed
@@ -80,7 +85,7 @@ pub(crate) fn create_headless_output(
 
     // Set resolution
     let mode = format!("{}x{}@60", width, height);
-    let rule = crate::hyprland::headless_monitor_rule(&name, &mode);
+    let rule = headless_monitor_rule(&name, &mode, scale);
     crate::hyprland::keyword_monitor(&rule).context("failed to set headless output resolution")?;
 
     tracing::info!(name = %name, width, height, "Created headless output");
@@ -179,6 +184,18 @@ pub(crate) fn output_info(output_name: &str) -> Result<CaptureInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn headless_monitor_rule_carries_integer_and_fractional_scale() {
+        assert_eq!(
+            headless_monitor_rule("hypr-rdp-1", "3024x1896@60", 2.0),
+            "hypr-rdp-1,3024x1896@60,-9999x0,2"
+        );
+        assert_eq!(
+            headless_monitor_rule("hypr-rdp-1", "2560x1440@60", 1.5),
+            "hypr-rdp-1,2560x1440@60,-9999x0,1.5"
+        );
+    }
 
     #[test]
     fn output_size_predicate_requires_exact_requested_dimensions() {

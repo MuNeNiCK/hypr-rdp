@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use ironrdp_server::{GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
 pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
+pub(crate) const GFX_READY_GRACE: Duration = Duration::from_secs(2);
 const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -96,6 +98,11 @@ pub struct EgfxShared {
     total_queued_frames: AtomicU64,
     total_acked_frames: AtomicU64,
     force_full_frame: AtomicBool,
+    /// Start of the connection-scoped wait for EGFX activation.
+    gfx_wait_started: Mutex<Option<Instant>>,
+    /// Avoids a second activation wait after an opened channel closes.
+    gfx_ever_ready: AtomicBool,
+    gfx_fallback_logged: AtomicBool,
     codec_policy: EgfxCodecPolicy,
 }
 
@@ -122,6 +129,9 @@ impl EgfxShared {
             total_queued_frames: AtomicU64::new(0),
             total_acked_frames: AtomicU64::new(0),
             force_full_frame: AtomicBool::new(false),
+            gfx_wait_started: Mutex::new(None),
+            gfx_ever_ready: AtomicBool::new(false),
+            gfx_fallback_logged: AtomicBool::new(false),
             codec_policy,
         }
     }
@@ -172,6 +182,34 @@ impl EgfxShared {
 
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+    }
+
+    pub(in crate::egfx) fn note_gfx_ready(&self) {
+        self.gfx_ever_ready.store(true, Ordering::Release);
+    }
+
+    /// Returns true after the bounded activation wait has expired.
+    pub(crate) fn bitmap_fallback_due(&self, now: Instant) -> bool {
+        if self.gfx_ever_ready.load(Ordering::Acquire) {
+            return true;
+        }
+
+        let Ok(mut started) = self.gfx_wait_started.lock() else {
+            return true;
+        };
+        let waited = now.saturating_duration_since(*started.get_or_insert(now));
+        if waited < GFX_READY_GRACE {
+            return false;
+        }
+        drop(started);
+
+        if !self.gfx_fallback_logged.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                waited_ms = waited.as_millis(),
+                "The client has not opened the graphics pipeline; sending bitmap updates instead"
+            );
+        }
+        true
     }
 
     pub fn generation(&self) -> u32 {
@@ -359,10 +397,51 @@ impl EgfxShared {
     /// The handle and event_sender are preserved (set per-connection by the factory).
     pub fn reset_for_new_client(&self) {
         self.ready.store(false, Ordering::Release);
+        self.gfx_ever_ready.store(false, Ordering::Release);
+        self.gfx_fallback_logged.store(false, Ordering::Release);
+        if let Ok(mut started) = self.gfx_wait_started.lock() {
+            *started = None;
+        }
         self.avc_enabled.store(false, Ordering::Release);
         self.avc444_enabled.store(false, Ordering::Release);
         self.force_full_frame.store(false, Ordering::Release);
         self.clear_current_surface();
         self.reset_frame_queue_for_new_client();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT, GFX_READY_GRACE};
+    use std::time::{Duration, Instant};
+
+    fn shared() -> EgfxShared {
+        EgfxShared::with_codec_policy(DEFAULT_MAX_FRAMES_IN_FLIGHT, super::EgfxCodecPolicy::Auto)
+    }
+
+    #[test]
+    fn bitmap_fallback_wait_expires_once_per_connection() {
+        let shared = shared();
+        let start = Instant::now();
+
+        assert!(!shared.bitmap_fallback_due(start));
+        assert!(!shared.bitmap_fallback_due(start + GFX_READY_GRACE - Duration::from_millis(1)));
+        assert!(shared.bitmap_fallback_due(start + GFX_READY_GRACE));
+        assert!(shared.bitmap_fallback_due(start + GFX_READY_GRACE + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn ready_channel_skips_future_wait_until_new_client() {
+        let shared = shared();
+        let start = Instant::now();
+
+        assert!(!shared.bitmap_fallback_due(start));
+        shared.note_gfx_ready();
+        assert!(shared.bitmap_fallback_due(start + Duration::from_millis(1)));
+
+        shared.reset_for_new_client();
+        let next = start + Duration::from_secs(1);
+        assert!(!shared.bitmap_fallback_due(next));
+        assert!(shared.bitmap_fallback_due(next + GFX_READY_GRACE));
     }
 }
