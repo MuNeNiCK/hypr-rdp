@@ -47,8 +47,6 @@ pub(crate) const VA_INVALID_ID: u32 = va::VA_INVALID_ID;
 pub(crate) const VA_INVALID_SURFACE: u32 = va::VA_INVALID_SURFACE;
 pub(crate) const VA_RT_FORMAT_YUV420: u32 = va::VA_RT_FORMAT_YUV420;
 pub(crate) const VA_RT_FORMAT_RGB32: u32 = va::VA_RT_FORMAT_RGB32;
-// VADRMPRIMESurfaceDescriptor.fourcc is a VA_FOURCC_*, not a DRM fourcc.
-// DRM_FORMAT_XRGB8888/ARGB8888 are B,G,R,X / B,G,R,A in memory order.
 pub(crate) const VA_FOURCC_BGRX: u32 = va::VA_FOURCC_BGRX;
 pub(crate) const VA_FOURCC_BGRA: u32 = va::VA_FOURCC_BGRA;
 pub(crate) const VA_RC_VBR: u32 = va::VA_RC_VBR;
