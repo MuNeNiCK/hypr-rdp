@@ -35,6 +35,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         key,
         credentials,
         resolution,
+        headless_scale,
         capture_mode,
         bitrate,
         quality,
@@ -59,6 +60,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
 
     let (display, display_handle, (rdp_width, rdp_height)) = HyprDisplay::new(
         resolution,
+        headless_scale,
         capture_mode,
         Arc::clone(&egfx_shared),
         Arc::clone(&output_layout),

@@ -12,8 +12,8 @@ use super::CaptureMode;
 use crate::egfx::{EgfxShared, H264BackendPolicy, H264RateControl};
 use crate::input::{OutputLayoutSnapshot, SharedOutputLayout};
 pub(crate) use output::{
-    create_headless_output, list_stale_headless_outputs, output_info, wait_for_output_size,
-    HeadlessOutputGuard,
+    create_headless_output, headless_monitor_rule, list_stale_headless_outputs, output_info,
+    wait_for_output_size, HeadlessOutputGuard,
 };
 use wayland_client::Connection;
 

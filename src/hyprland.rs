@@ -558,12 +558,12 @@ mod tests {
 
     #[test]
     fn monitor_rule_to_lua_translates_generated_headless_rule() {
-        let lua = monitor_rule_to_lua("hypr-rdp-1,1920x1080@60,-9999x0,1")
+        let lua = monitor_rule_to_lua("hypr-rdp-1,2560x1440@60,-9999x0,1.5")
             .expect("monitor rule translates");
 
         assert_eq!(
             lua,
-            r#"hl.monitor({ output = "hypr-rdp-1", mode = "1920x1080@60", position = "-9999x0", scale = 1 })"#
+            r#"hl.monitor({ output = "hypr-rdp-1", mode = "2560x1440@60", position = "-9999x0", scale = 1.5 })"#
         );
     }
 

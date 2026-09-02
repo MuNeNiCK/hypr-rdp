@@ -53,6 +53,7 @@ struct HyprDisplayInner {
     h264_backend: H264BackendPolicy,
     fps: u32,
     output: Option<String>,
+    headless_scale: f64,
     resolution_fixed: bool,
     stop_flag: Arc<AtomicBool>,
     capture_handle: Option<std::thread::JoinHandle<()>>,
@@ -93,9 +94,9 @@ impl HyprDisplayHandle {
     }
 }
 
-fn resize_headless_output(output_name: &str, width: u32, height: u32) -> Result<()> {
+fn resize_headless_output(output_name: &str, width: u32, height: u32, scale: f64) -> Result<()> {
     let mode = format!("{}x{}@60", width, height);
-    let rule = format!("{},{},-9999x0,1", output_name, mode);
+    let rule = wayland::headless_monitor_rule(output_name, &mode, scale);
     crate::hyprland::keyword_monitor(&rule).context("failed to resize headless output")?;
     wayland::wait_for_output_size(output_name, width, height, Duration::from_secs(5))
         .context("headless output did not reach requested size after resize")?;
@@ -330,12 +331,17 @@ fn apply_presentation_state_with(
 fn apply_resize_decision_with(
     inner: &mut HyprDisplayInner,
     decision: ResizeDecision,
-    mut resize_headless: impl FnMut(&str, u32, u32) -> Result<()>,
+    mut resize_headless: impl FnMut(&str, u32, u32, f64) -> Result<()>,
     mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
 ) -> Option<DesktopSize> {
     match decision.target {
         ResizeTarget::ManagedHeadlessOutput => {
-            if let Err(e) = resize_headless(&inner.output_name, decision.width, decision.height) {
+            if let Err(e) = resize_headless(
+                &inner.output_name,
+                decision.width,
+                decision.height,
+                inner.headless_scale,
+            ) {
                 tracing::warn!("Failed to resize headless output: {}", e);
                 None
             } else {
@@ -365,6 +371,7 @@ impl HyprDisplay {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         resolution: (u32, u32),
+        headless_scale: f64,
         capture_mode: CaptureMode,
         egfx_shared: Arc<EgfxShared>,
         output_layout: Arc<SharedOutputLayout>,
@@ -398,7 +405,7 @@ impl HyprDisplay {
             if let Some(existing) = stale.into_iter().next() {
                 tracing::info!(name = %existing, "Reusing headless output from previous session");
                 let mode = format!("{}x{}@60", configured_resolution.0, configured_resolution.1);
-                let rule = format!("{},{},-9999x0,1", existing, mode);
+                let rule = wayland::headless_monitor_rule(&existing, &mode, headless_scale);
                 crate::hyprland::keyword_monitor(&rule)
                     .context("failed to resize reused headless output")?;
                 wayland::wait_for_output_size(
@@ -415,6 +422,7 @@ impl HyprDisplay {
                 let (name, guard) = wayland::create_headless_output(
                     configured_resolution.0,
                     configured_resolution.1,
+                    headless_scale,
                 )?;
                 wayland::wait_for_output_size(
                     &name,
@@ -485,6 +493,7 @@ impl HyprDisplay {
             h264_backend,
             fps,
             output,
+            headless_scale,
             resolution_fixed,
             stop_flag,
             capture_handle: None,
@@ -505,7 +514,7 @@ impl HyprDisplay {
     async fn request_initial_size_with(
         &mut self,
         client_size: DesktopSize,
-        mut resize_headless: impl FnMut(&str, u32, u32) -> Result<()>,
+        mut resize_headless: impl FnMut(&str, u32, u32, f64) -> Result<()>,
         mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
     ) -> DesktopSize {
         let requested_w = client_size.width as u32;
@@ -599,7 +608,7 @@ impl HyprDisplay {
     fn request_layout_with(
         &mut self,
         layout: DisplayControlMonitorLayout,
-        mut resize_headless: impl FnMut(&str, u32, u32) -> Result<()>,
+        mut resize_headless: impl FnMut(&str, u32, u32, f64) -> Result<()>,
         mut refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()>,
     ) {
         let monitor = match layout.monitors().iter().find(|m| m.is_primary()) {
@@ -969,6 +978,7 @@ mod output_downscaling {
             h264_backend: H264BackendPolicy::Auto,
             fps: 30,
             output: Some("DP-1".into()),
+            headless_scale: 1.0,
             resolution_fixed: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
             capture_handle: None,
@@ -1226,7 +1236,9 @@ mod output_downscaling {
                     width: 1920,
                     height: 1200,
                 },
-                |_name, _width, _height| panic!("physical output must not resize headless output"),
+                |_name, _width, _height, _scale| {
+                    panic!("physical output must not resize headless output")
+                },
                 refresh_physical_layout_for_test,
             )
             .await;
@@ -1261,7 +1273,9 @@ mod output_downscaling {
                     width: 1600,
                     height: 900,
                 },
-                |_name, _width, _height| panic!("physical output must not resize headless output"),
+                |_name, _width, _height, _scale| {
+                    panic!("physical output must not resize headless output")
+                },
                 |_layout, _name, _presentation| anyhow::bail!("layout refresh failed"),
             )
             .await;
@@ -1349,7 +1363,9 @@ mod output_downscaling {
 
         display.request_layout_with(
             single_primary(1280, 720),
-            |_name, _width, _height| panic!("physical output must not resize headless output"),
+            |_name, _width, _height, _scale| {
+                panic!("physical output must not resize headless output")
+            },
             refresh_physical_layout_for_test,
         );
 
@@ -1378,7 +1394,9 @@ mod output_downscaling {
 
         display.request_layout_with(
             single_primary(1280, 720),
-            |_name, _width, _height| panic!("physical output must not resize headless output"),
+            |_name, _width, _height, _scale| {
+                panic!("physical output must not resize headless output")
+            },
             |_layout, _name, _presentation| anyhow::bail!("layout refresh failed"),
         );
 
@@ -1532,6 +1550,7 @@ mod managed_headless_resize {
             h264_backend: H264BackendPolicy::Auto,
             fps: 30,
             output: None,
+            headless_scale: 1.0,
             resolution_fixed: false,
             stop_flag: Arc::new(AtomicBool::new(false)),
             capture_handle: None,
@@ -1548,12 +1567,19 @@ mod managed_headless_resize {
     fn headless_display_for_callback_test(
         resolution: (u32, u32),
     ) -> (HyprDisplay, mpsc::Receiver<DisplayUpdate>) {
+        headless_display_for_callback_test_with_scale(resolution, 1.0)
+    }
+
+    fn headless_display_for_callback_test_with_scale(
+        resolution: (u32, u32),
+        headless_scale: f64,
+    ) -> (HyprDisplay, mpsc::Receiver<DisplayUpdate>) {
         let (tx, rx) = mpsc::channel(4);
+        let mut inner = headless_inner_for_resize_test_with_tx(resolution, tx);
+        inner.headless_scale = headless_scale;
         (
             HyprDisplay {
-                inner: Arc::new(Mutex::new(headless_inner_for_resize_test_with_tx(
-                    resolution, tx,
-                ))),
+                inner: Arc::new(Mutex::new(inner)),
             },
             rx,
         )
@@ -1587,7 +1613,7 @@ mod managed_headless_resize {
 
     #[tokio::test]
     async fn managed_headless_initial_size_callback_resizes_headless_and_updates_pending_resize() {
-        let (mut display, _rx) = headless_display_for_callback_test((1920, 1080));
+        let (mut display, _rx) = headless_display_for_callback_test_with_scale((1920, 1080), 1.5);
         let mut called = None;
 
         let size = display
@@ -1596,15 +1622,15 @@ mod managed_headless_resize {
                     width: 1600,
                     height: 900,
                 },
-                |name, width, height| {
-                    called = Some((name.to_string(), width, height));
+                |name, width, height, scale| {
+                    called = Some((name.to_string(), width, height, scale));
                     Ok(())
                 },
                 refresh_headless_layout_for_test,
             )
             .await;
 
-        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900)));
+        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900, 1.5)));
         assert_eq!(
             size,
             DesktopSize {
@@ -1641,19 +1667,20 @@ mod managed_headless_resize {
 
     #[test]
     fn managed_headless_displaycontrol_callback_resizes_headless_and_emits_resize() {
-        let (mut display, mut rx) = headless_display_for_callback_test((1920, 1080));
+        let (mut display, mut rx) =
+            headless_display_for_callback_test_with_scale((1920, 1080), 2.0);
         let mut called = None;
 
         display.request_layout_with(
             single_primary(1600, 900),
-            |name, width, height| {
-                called = Some((name.to_string(), width, height));
+            |name, width, height, scale| {
+                called = Some((name.to_string(), width, height, scale));
                 Ok(())
             },
             refresh_headless_layout_for_test,
         );
 
-        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900)));
+        assert_eq!(called, Some(("HEADLESS-1".into(), 1600, 900, 2.0)));
         match rx.try_recv().expect("resize update") {
             DisplayUpdate::Resize(size) => {
                 assert_eq!(
@@ -1677,7 +1704,7 @@ mod managed_headless_resize {
 
         display.request_layout_with(
             single_primary(1600, 900),
-            |_name, _width, _height| anyhow::bail!("resize failed"),
+            |_name, _width, _height, _scale| anyhow::bail!("resize failed"),
             |_layout, _output_name, _presentation| {
                 panic!("layout refresh must not run after headless resize failure")
             },
@@ -1696,7 +1723,7 @@ mod managed_headless_resize {
 
         display.request_layout_with(
             single_primary(1600, 900),
-            |name, width, height| {
+            |name, width, height, _scale| {
                 called = Some((name.to_string(), width, height));
                 Ok(())
             },
@@ -1723,7 +1750,7 @@ mod managed_headless_resize {
         let desktop_size = apply_resize_decision_with(
             &mut inner,
             decision,
-            |name, width, height| {
+            |name, width, height, _scale| {
                 called = Some((name.to_string(), width, height));
                 Ok(())
             },
@@ -1755,7 +1782,7 @@ mod managed_headless_resize {
         assert!(apply_resize_decision_with(
             &mut inner,
             decision,
-            |_name, _width, _height| { anyhow::bail!("resize failed") },
+            |_name, _width, _height, _scale| anyhow::bail!("resize failed"),
             |_layout, _output_name, _presentation| {
                 panic!("layout refresh must not run after headless resize failure")
             }

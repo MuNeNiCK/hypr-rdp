@@ -89,6 +89,9 @@ hypr-rdp -u user -p pass --bind 0.0.0.0:3389
 # Custom resolution and framerate
 hypr-rdp -u user -p pass --resolution 2560x1440 --fps 60
 
+# HiDPI client: native panel pixels, scaled so the UI stays legible
+hypr-rdp -u user -p pass --resolution 3024x1896 --scale 2
+
 # Capture a specific output
 hypr-rdp -u user -p pass --output DP-1
 
@@ -105,6 +108,7 @@ bind = "0.0.0.0:3389"
 username = "user"
 password = "pass"
 # resolution = "1920x1080"
+# scale = 1
 capture_mode = "wlr"
 bitrate = 10000000
 quality = 23
@@ -169,6 +173,7 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | `-u`, `--username` | RDP username | _(none)_ |
 | `-p`, `--password` | RDP password | _(none)_ |
 | `--resolution`, `-r` | Fixed session resolution, used as-is including above a captured output's size. When omitted for a managed headless output, the session starts at `1920x1080` and may resize to the client-requested size. | Auto client size |
+| `--scale` | Scale of the managed headless output, e.g. `2` for a HiDPI client. Hyprland only accepts scales that divide the mode into whole logical pixels. Ignored when `--output` captures an existing monitor. | `1` |
 | `--capture-mode` | `wlr` or `ext` | `wlr` |
 | `--bitrate` | H.264 bitrate (bps) | `10000000` |
 | `--quality` | H.264 quality (0-51) | `23` |
