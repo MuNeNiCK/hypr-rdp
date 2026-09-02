@@ -16,6 +16,8 @@ use super::pipewire::run_capture;
 use super::routing::{ActiveAudioRouting, AudioMode, AudioRoutingRunner, PipeWireRoutingRunner};
 
 const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
+// Static-channel teardown runs before IronRDP accepts the next connection.
+const AUDIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 type AudioStartupStatus = Result<(), String>;
 
 trait AudioCaptureRunner: Send + Sync {
@@ -204,10 +206,34 @@ impl RdpsndServerHandler for HyprSoundHandler {
         }
 
         if let Some(handle) = self.capture_thread.take() {
-            let _ = handle.join();
+            join_within(handle, AUDIO_SHUTDOWN_TIMEOUT);
         }
 
         self.active_routing.take();
+    }
+}
+
+fn join_within(handle: thread::JoinHandle<()>, budget: Duration) {
+    let (done_tx, done_rx) = std_mpsc::channel();
+    if thread::Builder::new()
+        .name("audio-join".into())
+        .spawn(move || {
+            let _ = handle.join();
+            let _ = done_tx.send(());
+        })
+        .is_err()
+    {
+        tracing::warn!(
+            "Audio: could not spawn the join helper; not waiting for the capture thread"
+        );
+        return;
+    }
+
+    if done_rx.recv_timeout(budget).is_err() {
+        tracing::warn!(
+            budget_ms = budget.as_millis(),
+            "Audio: capture thread did not stop within its budget; leaving it to finish"
+        );
     }
 }
 
@@ -284,6 +310,25 @@ mod tests {
         }
     }
 
+    struct SlowToStopRunner {
+        delay: Duration,
+    }
+
+    impl AudioCaptureRunner for SlowToStopRunner {
+        fn spawn(
+            &self,
+            _sender: mpsc::UnboundedSender<ServerEvent>,
+            _stop_signal: Arc<AtomicBool>,
+            startup_tx: std_mpsc::Sender<AudioStartupStatus>,
+        ) -> io::Result<thread::JoinHandle<()>> {
+            let delay = self.delay;
+            Ok(thread::spawn(move || {
+                let _ = startup_tx.send(Ok(()));
+                thread::sleep(delay);
+            }))
+        }
+    }
+
     struct FailingStartupRunner;
 
     impl AudioCaptureRunner for FailingStartupRunner {
@@ -340,6 +385,27 @@ mod tests {
             formats: vec![advertised_format()],
             audio_mode,
         }
+    }
+
+    #[test]
+    fn stopping_capture_does_not_wait_on_the_capture_thread_forever() {
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let mut handler = handler_with_runner(
+            Some(event_tx),
+            Arc::new(SlowToStopRunner {
+                delay: AUDIO_SHUTDOWN_TIMEOUT * 3,
+            }),
+        );
+        handler.start_capture().expect("capture starts");
+
+        let started = std::time::Instant::now();
+        handler.stop();
+        let elapsed = started.elapsed();
+
+        assert!(
+            elapsed < AUDIO_SHUTDOWN_TIMEOUT * 2,
+            "stop() held the accept loop for {elapsed:?}, past its {AUDIO_SHUTDOWN_TIMEOUT:?} budget"
+        );
     }
 
     #[test]
