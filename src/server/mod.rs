@@ -135,14 +135,6 @@ pub async fn serve(ctx: &mut ServerContext) -> Result<()> {
     ctx.server.run().await.map_err(server_run_error)
 }
 
-/// Converts a server run failure into the application's error type.
-///
-/// `run` reports through the server's own error type now. That type implements
-/// `core::error::Error`, so it can be carried whole rather than printed: plain
-/// `Display` on a `ServerError` gives the context and the kind only, and every
-/// kind that keeps its detail in `source` -- `Io`, `Encode`, `Decode`,
-/// `Connector`, `Pdu`, `Custom` -- would otherwise arrive as a bare
-/// "I/O error".
 fn server_run_error(error: ServerError) -> anyhow::Error {
     anyhow::Error::new(error)
 }

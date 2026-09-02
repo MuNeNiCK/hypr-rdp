@@ -793,15 +793,6 @@ impl RdpServerDisplay for HyprDisplay {
     }
 }
 
-/// Converts a capture-start failure into the server's error type.
-///
-/// `anyhow::Error` is not `core::error::Error`, so it cannot be attached as a
-/// source. `reason` carries the flattened chain as data instead, which keeps it
-/// in every rendering: `ServerError`'s `Display` never walks `source`, alternate
-/// or not, so through `custom` the reason would survive only where something
-/// prints `Debug`. `custom` would also need a fabricated `io::Error`, which
-/// tells anything that downcasts that a missing compositor protocol or a
-/// VA-API failure was disk I/O.
 fn capture_start_error(error: anyhow::Error) -> ServerError {
     ServerError::reason("failed to start capture", format!("{error:#}"))
 }
@@ -836,8 +827,6 @@ mod tests {
             anyhow::anyhow!("no dmabuf feedback").context("binding zwlr_screencopy_manager_v1");
 
         let converted = capture_start_error(error);
-        // `Display` never walks sources, alternate form included, so anything it
-        // leaves out survives only where something prints `Debug`.
         let rendered = format!("{converted:#}");
 
         assert!(

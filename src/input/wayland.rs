@@ -149,10 +149,6 @@ trait PointerRequestSink: ScrollRequestSink {
     fn button(&self, time: u32, button: u32, state: ButtonState);
 }
 
-// Each body calls the protocol object's own inherent method of the same name:
-// inherent methods take precedence over trait methods, so this forwards rather
-// than recurses. Renaming one away would silently turn it into a stack
-// overflow, which is why the pairing is spelled out here.
 impl PointerRequestSink for ZwlrVirtualPointerV1 {
     fn motion(&self, time: u32, dx: f64, dy: f64) {
         self.motion(time, dx, dy);
@@ -167,11 +163,6 @@ impl PointerRequestSink for ZwlrVirtualPointerV1 {
     }
 }
 
-/// Translates one mouse event into pointer requests. Returns whether the
-/// caller must flush the Wayland connection.
-///
-/// `layout` is a thunk so the snapshot lock is taken only for the events that
-/// need absolute coordinates, exactly as the inline match did.
 fn emit_mouse_event(
     sink: &impl PointerRequestSink,
     layout: impl FnOnce() -> Option<OutputLayoutSnapshot>,
@@ -192,21 +183,12 @@ fn emit_mouse_event(
             sink.motion_absolute(t, source_x, source_y, layout.output_w, layout.output_h);
             sink.frame();
         }
-        // The absolute position now travels with the button rather than
-        // arriving as a separate Move. Applying it costs one redundant
-        // motion for the usual client, which sends a Move first anyway, and
-        // puts the click where the client asked for one that does not.
         MouseEvent::Button {
             x,
             y,
             button,
             pressed,
         } => {
-            // The position is best-effort. Without a layout it cannot be
-            // mapped, but the button is still reported: dropping the event
-            // whole would let a release go missing and leave the button held
-            // down in the session. An unrecognised button costs only the
-            // button, the same way it does for `ButtonRel`.
             if let Some(layout) = layout() {
                 let (source_x, source_y) = map_rdp_pointer_to_source(&layout, x, y);
                 sink.motion_absolute(t, source_x, source_y, layout.output_w, layout.output_h);
@@ -218,17 +200,12 @@ fn emit_mouse_event(
             }
             sink.frame();
         }
-        // With relative motion the delta belongs to this event and no
-        // RelMove follows it, so dropping it would lose the movement
-        // entirely rather than merely misplace the click.
         MouseEvent::ButtonRel {
             x,
             y,
             button,
             pressed,
         } => {
-            // The delta is applied even for a button this version cannot name,
-            // because no RelMove carries it instead.
             sink.motion(t, x as f64, y as f64);
             if let Some(code) = evdev_button(button) {
                 sink.button(t, code, button_state(pressed));
@@ -264,9 +241,6 @@ fn emit_mouse_event(
             sink.motion(t, x as f64, y as f64);
             sink.frame();
         }
-        // `MouseEvent` is non-exhaustive upstream: a variant added there
-        // must not stop this building, and doing nothing is the right
-        // answer for an event this version does not understand.
         other => {
             tracing::debug!(?other, "Ignoring unrecognised mouse event");
             return false;
@@ -275,14 +249,6 @@ fn emit_mouse_event(
     true
 }
 
-/// The evdev code for a button identity from the wire.
-///
-/// `MouseButton` is non-exhaustive upstream, and an identity this version does
-/// not know has no safe stand-in. Every spare evdev code already means
-/// something -- BTN_SIDE is Back in every browser and file manager -- and
-/// borrowing one would alias that button's own press and release pairs, so an
-/// X1 held across an unknown button's release would come up stuck. Such an
-/// event is dropped instead.
 fn evdev_button(button: MouseButton) -> Option<u32> {
     Some(match button {
         MouseButton::Left => keymap::BTN_LEFT,
@@ -1345,8 +1311,6 @@ mod tests {
         emit_one_counting_layout_reads(sink, event).0
     }
 
-    /// Also reports how often the layout thunk was consulted: the snapshot
-    /// takes a lock, and the events that need no coordinates must not pay it.
     fn emit_one_counting_layout_reads(
         sink: &RecordingPointerSink,
         event: MouseEvent,
@@ -1370,8 +1334,6 @@ mod tests {
 
     #[test]
     fn button_press_places_the_pointer_at_the_position_the_click_carried() {
-        // A client that clicks without a preceding Move must land where it
-        // asked, in source pixels, not wherever the pointer happened to be.
         let sink = RecordingPointerSink::default();
 
         assert!(emit_one(
@@ -1421,8 +1383,6 @@ mod tests {
 
     #[test]
     fn only_the_events_that_need_coordinates_take_the_layout_lock() {
-        // The snapshot is behind a mutex, so an event that carries its own
-        // delta must not reach for it.
         let sink = RecordingPointerSink::default();
 
         let (_, reads) = emit_one_counting_layout_reads(&sink, MouseEvent::RelMove { x: 4, y: -3 });
@@ -1435,9 +1395,6 @@ mod tests {
 
     #[test]
     fn button_without_a_layout_still_reports_the_button() {
-        // A press already delivered has to see its release even if the layout
-        // went away in between, or the button stays held down in the session.
-        // Only the position is lost.
         let sink = RecordingPointerSink::default();
         let mut horizontal_residual = 0;
         let mut vertical_residual = 0;
@@ -1468,8 +1425,6 @@ mod tests {
 
     #[test]
     fn relative_button_applies_its_own_delta_before_the_click() {
-        // No RelMove accompanies ButtonRel, so dropping the delta loses the
-        // movement rather than merely misplacing the click.
         let sink = RecordingPointerSink::default();
 
         assert!(emit_one(
@@ -1526,9 +1481,6 @@ mod tests {
 
     #[test]
     fn move_places_the_pointer_at_the_mapped_source_position() {
-        // The absolute-motion path: nothing else drives this arm, so a swapped
-        // coordinate, a swapped extent or a dropped request is silent, and a
-        // pointer that lands in the wrong place is the whole session.
         let sink = RecordingPointerSink::default();
 
         assert!(emit_one(&sink, MouseEvent::Move { x: 960, y: 540 }));
@@ -1544,9 +1496,6 @@ mod tests {
 
     #[test]
     fn move_without_a_layout_emits_nothing_and_asks_for_no_flush() {
-        // Unlike a button, a move carries nothing but the position: with no
-        // layout to map through there is nothing to report, and nothing to
-        // flush either.
         let sink = RecordingPointerSink::default();
         let mut horizontal_residual = 0;
         let mut vertical_residual = 0;
@@ -1566,8 +1515,6 @@ mod tests {
 
     #[test]
     fn relative_move_commits_its_delta_in_a_frame() {
-        // Wayland applies pointer requests on the frame; a motion without one
-        // is a move the compositor never performs.
         let sink = RecordingPointerSink::default();
 
         assert!(emit_one(&sink, MouseEvent::RelMove { x: -3, y: 7 }));
@@ -1600,9 +1547,6 @@ mod tests {
 
     #[test]
     fn the_two_scroll_axes_keep_separate_sub_detent_remainders() {
-        // Half a detent on each axis is not a whole detent on either. Crossing
-        // the accumulators turns two unrelated nudges into one click of the
-        // wheel, and no single-event test can see the difference.
         let sink = RecordingPointerSink::default();
         let mut horizontal_residual = 0;
         let mut vertical_residual = 0;
@@ -1643,8 +1587,6 @@ mod tests {
 
     #[test]
     fn evdev_button_maps_each_wire_identity_to_its_own_code() {
-        // X1 and X2 are the old Button4 and Button5: back is the side button,
-        // forward is the extra one. Swapping them is silent at the wire.
         assert_eq!(evdev_button(MouseButton::Left), Some(keymap::BTN_LEFT));
         assert_eq!(evdev_button(MouseButton::Right), Some(keymap::BTN_RIGHT));
         assert_eq!(evdev_button(MouseButton::Middle), Some(keymap::BTN_MIDDLE));
