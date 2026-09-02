@@ -27,6 +27,8 @@ pub struct ServerContext {
 }
 
 pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
+    let hyprland_instance =
+        crate::hyprland::initialize().context("failed to select the Hyprland instance")?;
     let RuntimeConfig {
         bind,
         cert,
@@ -82,7 +84,8 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let gfx_factory = HyprGfxFactory::new(Arc::clone(&egfx_shared));
     let cliprdr_factory = HyprCliprdrFactory::new();
     let sound_factory = sound_factory_for_audio_mode(audio_mode);
-    let session_hooks = session_hooks_from_config(on_session_start, on_session_end);
+    let session_hooks =
+        session_hooks_from_config(on_session_start, on_session_end, Some(hyprland_instance));
 
     let builder = RdpServer::builder().with_addr(bind);
 

@@ -74,6 +74,11 @@ Requires **Hyprland 0.54+**.
 VA-API is included in the standard build and falls back to software encoding
 automatically when unavailable.
 
+Run hypr-rdp as the same user as Hyprland with `WAYLAND_DISPLAY` set. When
+`HYPRLAND_INSTANCE_SIGNATURE` is absent, hypr-rdp selects the live Hyprland
+instance whose lock file names that Wayland display. Set the signature
+explicitly if discovery reports no unique match.
+
 ```sh
 # Basic (auto-generates TLS cert, binds to 127.0.0.1:3389)
 hypr-rdp -u <username> -p <password>
@@ -140,8 +145,10 @@ on_session_end = "hyprctl dispatch dpms on eDP-1"
   exits unsuccessfully, or outlives the deadline cannot guarantee that the
   corresponding start action is undone.
 - Commands run through `/bin/sh -c` as the same user as hypr-rdp, with its
-  environment and working directory, so `hyprctl` works but shell profiles are
-  not read — use absolute paths for anything outside the inherited `PATH`.
+  environment and working directory. The selected
+  `HYPRLAND_INSTANCE_SIGNATURE` is supplied so `hyprctl` targets the same
+  compositor. Shell profiles are not read — use absolute paths for anything
+  outside the inherited `PATH`.
   hypr-rdp never kills a command; one still running at exit is left to the
   service manager. Hook command text is not written to hypr-rdp's logs.
 
