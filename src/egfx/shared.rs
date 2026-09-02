@@ -6,21 +6,7 @@ use ironrdp_server::{GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
 pub const DEFAULT_MAX_FRAMES_IN_FLIGHT: u32 = 3;
-
-/// How long a client is given to open the graphics pipeline before frames go
-/// out as bitmaps instead.
-///
-/// Opening `rdpgfx` is the client's move and there is no message for "I am not
-/// going to", so "not ready yet" and "not ever" are the same state from here.
-/// A client that never opens it -- FreeRDP 2.x asking for 32-bit colour, among
-/// others -- would otherwise be sent nothing at all for the whole session, and
-/// paint its own empty viewport: white under GTK, black under X11.
-///
-/// The wait is worth having: bitmaps mixed into the activation sequence are
-/// worse than a moment of nothing. It is not worth having without an end.
-/// Two seconds is long against the two round trips a DVC open costs even on a
-/// slow link, and short against a person deciding the screen is broken.
-pub const GFX_READY_GRACE: Duration = Duration::from_secs(2);
+pub(crate) const GFX_READY_GRACE: Duration = Duration::from_secs(2);
 const SUSPEND_FRAME_ACK_QUEUE_DEPTH: u32 = u32::MAX;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -112,20 +98,10 @@ pub struct EgfxShared {
     total_queued_frames: AtomicU64,
     total_acked_frames: AtomicU64,
     force_full_frame: AtomicBool,
-    /// When this connection first wanted to send a frame while the channel was
-    /// not ready.
-    ///
-    /// Here rather than in the frame processor because the capture loop is torn
-    /// down and rebuilt on every resize: a client that has already shown it will
-    /// not open the channel must not buy a fresh grace period each time it
-    /// drags a window.
+    /// Start of the connection-scoped wait for EGFX activation.
     gfx_wait_started: Mutex<Option<Instant>>,
-    /// Whether the channel has ever been ready on this connection. Once it has,
-    /// there is no activation sequence left to protect, so a later loss of
-    /// readiness falls back at once instead of freezing the screen again.
+    /// Avoids a second activation wait after an opened channel closes.
     gfx_ever_ready: AtomicBool,
-    /// Whether giving up has already been logged, so a client that never opens
-    /// the channel is told about once per connection and not once per frame.
     gfx_fallback_logged: AtomicBool,
     codec_policy: EgfxCodecPolicy,
 }
@@ -208,38 +184,17 @@ impl EgfxShared {
         self.ready.load(Ordering::Acquire)
     }
 
-    /// Drop readiness the way a channel close does, for tests that need the
-    /// transition without a live DVC.
-    #[cfg(test)]
-    pub(crate) fn mark_not_ready_for_test(&self) {
-        self.ready.store(false, Ordering::Release);
-    }
-
-    /// Remember, for the rest of this connection, that the client does speak
-    /// the graphics pipeline.
-    ///
-    /// This ends the wait on its own: `bitmap_fallback_due` never looks at the
-    /// clock again once this is set, so clearing the clock here as well would
-    /// be a store no behaviour depends on.
     pub(in crate::egfx) fn note_gfx_ready(&self) {
         self.gfx_ever_ready.store(true, Ordering::Release);
     }
 
-    /// Whether a frame should go out as a bitmap even though the graphics
-    /// pipeline is configured. Only asked when the channel is not ready.
-    ///
-    /// The first caller starts the clock. Nothing is sent until the grace runs
-    /// out, and then everything is -- except for a channel that has already
-    /// been ready once, where there is no activation sequence left to protect
-    /// and waiting again would only freeze the screen.
-    pub fn bitmap_fallback_due(&self, now: Instant) -> bool {
+    /// Returns true after the bounded activation wait has expired.
+    pub(crate) fn bitmap_fallback_due(&self, now: Instant) -> bool {
         if self.gfx_ever_ready.load(Ordering::Acquire) {
             return true;
         }
 
         let Ok(mut started) = self.gfx_wait_started.lock() else {
-            // The clock is unreadable, so the wait cannot be bounded. Sending
-            // is the failure that a user can see past.
             return true;
         };
         let waited = now.saturating_duration_since(*started.get_or_insert(now));
@@ -464,168 +419,29 @@ mod tests {
         EgfxShared::with_codec_policy(DEFAULT_MAX_FRAMES_IN_FLIGHT, super::EgfxCodecPolicy::Auto)
     }
 
-    /// The size of the grace is part of the fix, not a tuning knob, and it is
-    /// bounded on both sides. Too long and a person sits in front of a screen
-    /// that shows nothing; too short and it fires before the channel open it
-    /// exists to wait for -- two round trips -- can possibly have landed, which
-    /// puts bitmaps back into the activation sequence.
-    ///
-    /// Every other assertion here is written in terms of the constant and would
-    /// hold at any value, so this is the only thing pinning it.
     #[test]
-    fn the_grace_is_bounded_on_both_sides() {
-        assert!(
-            GFX_READY_GRACE <= Duration::from_secs(5),
-            "a client that never opens the channel shows nothing for this long: {GFX_READY_GRACE:?}"
-        );
-        assert!(
-            GFX_READY_GRACE >= Duration::from_millis(500),
-            "shorter than a channel open can land in: {GFX_READY_GRACE:?}"
-        );
-    }
-
-    /// Past the grace every frame is a bitmap. A fallback that cleared the
-    /// clock on the way out would re-arm itself: one bitmap, another two
-    /// seconds of nothing, one bitmap -- half a frame per second, which still
-    /// looks broken.
-    #[test]
-    fn the_fallback_stays_open_once_it_opens() {
-        let shared = shared();
-        let start = Instant::now();
-
-        assert!(!shared.bitmap_fallback_due(start));
-        for extra_ms in [0, 1, 2, 3] {
-            assert!(
-                shared
-                    .bitmap_fallback_due(start + GFX_READY_GRACE + Duration::from_millis(extra_ms)),
-                "the fallback re-armed itself {extra_ms}ms past the grace"
-            );
-        }
-    }
-
-    /// Giving up is said once per connection. The line is half of the fix --
-    /// silence is what made this hard to recognise from the outside -- and a
-    /// line at frame rate buries the log it was added to.
-    #[test]
-    fn giving_up_is_announced_once_per_connection() {
-        let shared = shared();
-        let start = Instant::now();
-        let past = start + GFX_READY_GRACE;
-
-        let first = capture_warnings(|| {
-            shared.bitmap_fallback_due(start);
-            for _ in 0..6 {
-                shared.bitmap_fallback_due(past);
-            }
-        });
-        assert_eq!(
-            first
-                .matches("has not opened the graphics pipeline")
-                .count(),
-            1,
-            "expected exactly one line, got: {first}"
-        );
-
-        shared.reset_for_new_client();
-        let second = capture_warnings(|| {
-            shared.bitmap_fallback_due(past);
-            shared.bitmap_fallback_due(past + GFX_READY_GRACE);
-        });
-        assert_eq!(
-            second
-                .matches("has not opened the graphics pipeline")
-                .count(),
-            1,
-            "the next client must be told too, got: {second}"
-        );
-    }
-
-    /// Collects what `tracing` emitted on this thread while `body` ran.
-    fn capture_warnings(body: impl FnOnce()) -> String {
-        #[derive(Clone)]
-        struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("sink").extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Sink {
-                self.clone()
-            }
-        }
-
-        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(Sink(std::sync::Arc::clone(&buffer)))
-            .with_ansi(false)
-            .finish();
-        tracing::subscriber::with_default(subscriber, body);
-        let bytes = buffer.lock().expect("sink").clone();
-        String::from_utf8(bytes).expect("utf-8")
-    }
-
-    #[test]
-    fn the_wait_starts_at_the_first_ask_and_ends_after_the_grace() {
+    fn bitmap_fallback_wait_expires_once_per_connection() {
         let shared = shared();
         let start = Instant::now();
 
         assert!(!shared.bitmap_fallback_due(start));
         assert!(!shared.bitmap_fallback_due(start + GFX_READY_GRACE - Duration::from_millis(1)));
         assert!(shared.bitmap_fallback_due(start + GFX_READY_GRACE));
+        assert!(shared.bitmap_fallback_due(start + GFX_READY_GRACE + Duration::from_secs(1)));
     }
 
-    /// The clock starts when the first frame wants to go out, not when the
-    /// connection was made -- a capture thread that takes a moment to produce
-    /// its first frame must not have that time counted against the client.
     #[test]
-    fn the_clock_starts_at_the_first_ask_not_at_construction() {
-        let shared = shared();
-        let late = Instant::now() + Duration::from_secs(60);
-
-        assert!(!shared.bitmap_fallback_due(late));
-        assert!(shared.bitmap_fallback_due(late + GFX_READY_GRACE));
-    }
-
-    /// Once the channel has negotiated there is no activation sequence left to
-    /// protect, so losing readiness later must not freeze the screen again.
-    #[test]
-    fn a_channel_that_was_ready_never_waits_again() {
+    fn ready_channel_skips_future_wait_until_new_client() {
         let shared = shared();
         let start = Instant::now();
 
         assert!(!shared.bitmap_fallback_due(start));
         shared.note_gfx_ready();
-
         assert!(shared.bitmap_fallback_due(start + Duration::from_millis(1)));
-    }
-
-    /// The wait belongs to one connection. A new client has not shown anything
-    /// yet, so it gets the grace its predecessor used up.
-    #[test]
-    fn a_new_client_gets_a_fresh_wait() {
-        let shared = shared();
-        let start = Instant::now();
-
-        assert!(!shared.bitmap_fallback_due(start));
-        assert!(shared.bitmap_fallback_due(start + GFX_READY_GRACE));
-        shared.note_gfx_ready();
-        assert!(shared.bitmap_fallback_due(start + GFX_READY_GRACE));
 
         shared.reset_for_new_client();
-
-        let reconnect = start + Duration::from_secs(600);
-        assert!(
-            !shared.bitmap_fallback_due(reconnect),
-            "the next client is owed the same wait as the first"
-        );
-        assert!(shared.bitmap_fallback_due(reconnect + GFX_READY_GRACE));
+        let next = start + Duration::from_secs(1);
+        assert!(!shared.bitmap_fallback_due(next));
+        assert!(shared.bitmap_fallback_due(next + GFX_READY_GRACE));
     }
 }

@@ -124,6 +124,10 @@ fn dmabuf_capture_decision_result(decision: DmaBufCaptureDecision) -> Result<()>
     }
 }
 
+fn dmabuf_egfx_activation_timed_out(shared: &EgfxShared, ready: bool, now: Instant) -> bool {
+    !ready && shared.bitmap_fallback_due(now)
+}
+
 fn dmabuf_frame_wait_decision(
     frame_ready: bool,
     frame_failed: bool,
@@ -523,16 +527,9 @@ pub(super) fn capture_loop_ext_dmabuf(
                     }
                 }
 
-                // Zero-copy has no bitmap path: everything here goes through the
-                // graphics pipeline. A client that never opens it would be sent
-                // nothing at all for the whole session, so once the wait is up
-                // this hands the session to the SHM loop, which does have one.
-                if !session_refresh.ready && shared.bitmap_fallback_due(std::time::Instant::now()) {
+                if dmabuf_egfx_activation_timed_out(shared, session_refresh.ready, Instant::now()) {
                     frame.destroy();
-                    bail!(
-                        "DMA-BUF capture has no bitmap path and the graphics pipeline stayed \
-                         closed; falling back to SHM"
-                    );
+                    bail!("EGFX activation timed out in DMA-BUF mode; falling back to SHM");
                 }
 
                 if session_refresh.ready && h264_encoder.is_some() {
@@ -820,6 +817,27 @@ mod tests {
     fn dmabuf_current_geometry_decision_is_ok() {
         dmabuf_capture_decision_result(DmaBufCaptureDecision::Continue)
             .expect("current geometry continues");
+    }
+
+    #[test]
+    fn dmabuf_egfx_activation_timeout_selects_shm_fallback() {
+        let shared = EgfxShared::with_codec_policy(
+            crate::egfx::DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            crate::egfx::EgfxCodecPolicy::Auto,
+        );
+        let start = Instant::now();
+
+        assert!(!dmabuf_egfx_activation_timed_out(&shared, false, start));
+        assert!(!dmabuf_egfx_activation_timed_out(
+            &shared,
+            true,
+            start + crate::egfx::GFX_READY_GRACE
+        ));
+        assert!(dmabuf_egfx_activation_timed_out(
+            &shared,
+            false,
+            start + crate::egfx::GFX_READY_GRACE
+        ));
     }
 
     #[test]

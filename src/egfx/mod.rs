@@ -25,11 +25,9 @@ pub(crate) use frame::{EgfxFrameCodec, EncodedEgfxFrame, EncodedFrameState};
 #[cfg(feature = "vaapi")]
 pub(crate) use h264::extract_sps_pps;
 pub(crate) use rdpegfx::EgfxFrameSession;
-pub use shared::{EgfxCodecPolicy, EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT};
-// The grace itself is only named by tests; production code asks
-// `EgfxShared::bitmap_fallback_due` instead of comparing against it.
 #[cfg(test)]
 pub(crate) use shared::GFX_READY_GRACE;
+pub use shared::{EgfxCodecPolicy, EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 pub(crate) use shared::{EgfxFrameFlowSnapshot, EgfxFrameReadiness};
 #[cfg(feature = "vaapi")]
 pub(crate) use vpp::{VppConverter, VppDmaBufInfo};
