@@ -33,6 +33,7 @@ const HOOK_SESSION_END: &str = "session_end";
 pub(super) fn session_hooks_from_config(
     on_session_start: Option<String>,
     on_session_end: Option<String>,
+    instance: Option<String>,
 ) -> Option<SessionHooks> {
     let on_session_start = on_session_start.filter(|command| !command.trim().is_empty());
     let on_session_end = on_session_end.filter(|command| !command.trim().is_empty());
@@ -43,6 +44,7 @@ pub(super) fn session_hooks_from_config(
         on_session_start,
         on_session_end,
         SESSION_HOOK_DEADLINE,
+        instance,
     ))
 }
 
@@ -51,6 +53,7 @@ impl SessionHooks {
         on_session_start: Option<String>,
         on_session_end: Option<String>,
         deadline: Duration,
+        instance: Option<String>,
     ) -> Self {
         let (jobs, queue) = mpsc::channel();
         let shutting_down = Arc::new(AtomicBool::new(false));
@@ -64,6 +67,7 @@ impl SessionHooks {
                     on_session_start,
                     on_session_end,
                     deadline,
+                    instance,
                 );
             });
         let runner = match runner {
@@ -120,6 +124,7 @@ fn run_hook_queue(
     on_session_start: Option<String>,
     on_session_end: Option<String>,
     deadline: Duration,
+    instance: Option<String>,
 ) {
     let mut running: Option<RunningHook> = None;
     let mut stragglers: Vec<RunningHook> = Vec::new();
@@ -144,7 +149,7 @@ fn run_hook_queue(
         };
 
         finish_running(&mut running, &mut stragglers, deadline, drain_until);
-        running = spawn_session_hook(hook, command);
+        running = spawn_session_hook(hook, command, instance.clone());
     }
 
     // Shutdown: only the end command is worth waiting for — nothing is
@@ -228,16 +233,24 @@ fn reap_finished(stragglers: &mut Vec<RunningHook>) {
     });
 }
 
-fn spawn_session_hook(hook: &'static str, command: &str) -> Option<RunningHook> {
+fn hook_command(command: &str, instance: Option<String>) -> Command {
+    let mut child = Command::new("/bin/sh");
+    child.arg("-c").arg(command).stdin(Stdio::null());
+    if let Some(instance) = instance {
+        child.env("HYPRLAND_INSTANCE_SIGNATURE", instance);
+    }
+    child
+}
+
+fn spawn_session_hook(
+    hook: &'static str,
+    command: &str,
+    instance: Option<String>,
+) -> Option<RunningHook> {
     tracing::info!(hook, "Running session hook");
     // Deliberately not logging the command text: a hook string may embed
     // tokens, passwords or other secrets that must not reach the log.
-    match Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .spawn()
-    {
+    match hook_command(command, instance).spawn() {
         Ok(child) => Some(RunningHook {
             hook,
             child,
@@ -280,6 +293,7 @@ pub(super) mod test_support {
             connect_command,
             disconnect.then(|| echo_to_log(log, "end")),
             Duration::from_secs(10),
+            None,
         )
     }
 
@@ -335,11 +349,36 @@ mod tests {
     use super::test_support::*;
     use super::*;
 
+    fn env_of(command: &Command) -> Vec<(String, Option<String>)> {
+        command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_hook_is_given_the_resolved_instance() {
+        let command = hook_command("true", Some("resolved-sig".into()));
+
+        assert_eq!(
+            env_of(&command),
+            vec![(
+                "HYPRLAND_INSTANCE_SIGNATURE".to_string(),
+                Some("resolved-sig".to_string())
+            )]
+        );
+    }
+
     #[test]
     fn missing_hook_commands_disable_connection_handler_wiring() {
-        assert!(session_hooks_from_config(None, None).is_none());
-        assert!(session_hooks_from_config(Some("true".into()), None).is_some());
-        assert!(session_hooks_from_config(None, Some("true".into())).is_some());
+        assert!(session_hooks_from_config(None, None, None).is_none());
+        assert!(session_hooks_from_config(Some("true".into()), None, None).is_some());
+        assert!(session_hooks_from_config(None, Some("true".into()), None).is_some());
     }
 
     #[test]
@@ -382,6 +421,7 @@ mod tests {
             Some("exec sleep 30 >/dev/null 2>&1".into()),
             Some(echo_to_log(&log, "end")),
             Duration::from_millis(300),
+            None,
         );
 
         let start = std::time::Instant::now();
@@ -407,6 +447,7 @@ mod tests {
             Some("exec sleep 30 >/dev/null 2>&1".into()),
             Some(echo_to_log(&log, "end")),
             Duration::from_millis(100),
+            None,
         );
 
         hooks.session_started();
@@ -444,7 +485,7 @@ mod tests {
             log.display(),
             log.display()
         );
-        let mut hooks = SessionHooks::spawn(Some(command), None, Duration::from_secs(10));
+        let mut hooks = SessionHooks::spawn(Some(command), None, Duration::from_secs(10), None);
 
         hooks.session_started();
         hooks.session_ended(); // no end command: must hold the running start
@@ -479,6 +520,7 @@ mod tests {
         let mut hooks = session_hooks_from_config(
             Some(echo_to_log(&log, "start")),
             Some(echo_to_log(&log, "end")),
+            None,
         )
         .expect("both commands configured");
 
@@ -523,6 +565,7 @@ mod tests {
             Some(echo_to_log(&log, "start")),
             Some("exec sleep 30 >/dev/null 2>&1".into()),
             Duration::from_millis(200),
+            None,
         );
 
         hooks.session_started();
@@ -560,6 +603,7 @@ mod tests {
             Some(format!("echo $$ >> '{}'", log.display())),
             None,
             Duration::from_secs(10),
+            None,
         );
 
         hooks.session_started();
@@ -654,6 +698,7 @@ mod tests {
             Some(format!("readlink /proc/self/fd/0 >> '{}'", log.display())),
             None,
             Duration::from_secs(10),
+            None,
         );
 
         hooks.session_started();

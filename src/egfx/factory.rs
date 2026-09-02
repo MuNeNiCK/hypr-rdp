@@ -235,6 +235,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
         if !was_ready || previous_avc != avc || previous_avc444 != avc444 {
             self.shared.ready_generation.fetch_add(1, Ordering::Release);
         }
+        self.shared.note_gfx_ready();
         self.shared.ready.store(true, Ordering::Release);
     }
 
