@@ -16,14 +16,7 @@ use super::pipewire::run_capture;
 use super::routing::{ActiveAudioRouting, AudioMode, AudioRoutingRunner, PipeWireRoutingRunner};
 
 const AUDIO_STARTUP_TIMEOUT: Duration = Duration::from_secs(2);
-/// How long teardown may hold the thread it runs on.
-///
-/// `stop()` is reached from `Drop`, and the drop happens inside the accept
-/// loop -- IronRDP replaces the static channel set between one connection
-/// ending and the next `accept()` -- on the `LocalSet` thread that runs the
-/// whole server. Every millisecond spent here is a millisecond the listener is
-/// not accepting, so this is a budget, not a hope: past it the capture thread
-/// is left to finish on its own rather than waited for.
+// Static-channel teardown runs before IronRDP accepts the next connection.
 const AUDIO_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 type AudioStartupStatus = Result<(), String>;
 
@@ -220,13 +213,6 @@ impl RdpsndServerHandler for HyprSoundHandler {
     }
 }
 
-/// Wait for the capture thread, but not past `budget`.
-///
-/// `std::thread::JoinHandle` has no timed join, so the join happens on a helper
-/// thread and this waits on its result instead. Past the budget the helper is
-/// left running: it finishes whenever the capture thread does and then goes
-/// away by itself. Leaving a thread to finish is a leak of one thread until
-/// PipeWire returns; blocking here is a listener that never accepts again.
 fn join_within(handle: thread::JoinHandle<()>, budget: Duration) {
     let (done_tx, done_rx) = std_mpsc::channel();
     if thread::Builder::new()
@@ -324,8 +310,6 @@ mod tests {
         }
     }
 
-    /// A capture thread that does not notice the stop signal promptly -- what a
-    /// PipeWire loop blocked inside a library call looks like from here.
     struct SlowToStopRunner {
         delay: Duration,
     }
@@ -403,27 +387,9 @@ mod tests {
         }
     }
 
-    /// Issue #66: the server wedges with the accept backlog full and CPU at 0%.
-    ///
-    /// `stop()` is reached from `Drop`, and the drop happens inside
-    /// `RdpServer::run`'s accept loop -- the pinned IronRDP clears the static
-    /// channel set between `run_connection` returning and the next `accept()`.
-    /// Everything `stop()` does is therefore on the loop's own thread, and the
-    /// loop runs on a `LocalSet`, so nothing else in the server progresses
-    /// meanwhile.
-    ///
-    /// Startup is already bounded by `AUDIO_STARTUP_TIMEOUT`. Teardown is not
-    /// bounded at all: `handle.join()` waits for the capture thread however
-    /// long it takes, and the routing guard then runs several `pactl`
-    /// subprocesses through a blocking `Command::output()` with no timeout
-    /// either. A capture thread that stops noticing the flag -- or a `pactl`
-    /// that never returns -- wedges the listener while the process stays alive,
-    /// which is why `Restart=always` does not recover it.
     #[test]
     fn stopping_capture_does_not_wait_on_the_capture_thread_forever() {
         let (event_tx, _event_rx) = mpsc::unbounded_channel();
-        // Three times the budget, so the assertion below cannot pass by luck:
-        // without a deadline `stop()` waits the whole delay.
         let mut handler = handler_with_runner(
             Some(event_tx),
             Arc::new(SlowToStopRunner {
@@ -436,8 +402,6 @@ mod tests {
         handler.stop();
         let elapsed = started.elapsed();
 
-        // Expressed against the constant rather than a literal, so raising the
-        // budget cannot quietly leave this test passing on a wider one.
         assert!(
             elapsed < AUDIO_SHUTDOWN_TIMEOUT * 2,
             "stop() held the accept loop for {elapsed:?}, past its {AUDIO_SHUTDOWN_TIMEOUT:?} budget"

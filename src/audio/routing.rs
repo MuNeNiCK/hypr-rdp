@@ -1,4 +1,4 @@
-use std::io::{BufRead, Read};
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -11,20 +11,9 @@ use super::format::{BITS_PER_SAMPLE, CHANNELS, SAMPLE_RATE};
 
 const DEFAULT_REMOTE_SINK_NAME: &str = "hypr_rdp_remote_audio";
 
-/// How long any one `pactl` call may take. These run on the thread that tears a
-/// session down, which is the thread that goes back to accepting connections, so
-/// a sound server that has stopped answering must not be able to hold it.
+// Routing teardown runs before IronRDP accepts the next connection.
 const ROUTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 const ROUTE_COMMAND_POLL: Duration = Duration::from_millis(10);
-
-/// How long undoing the routing may take in total.
-///
-/// The per-call deadline bounds one `pactl`; it does not bound their sum, and
-/// teardown is the one path that keeps going after a failure instead of
-/// returning. It runs one command per stream that was moved, so a machine with
-/// several players and a sound server that answers slowly could hold the thread
-/// that goes back to accepting connections for far longer than any single
-/// deadline suggests.
 const ROUTE_RESTORE_BUDGET: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,7 +32,6 @@ pub(super) trait AudioRoutingRunner: Send + Sync {
 pub(super) struct PipeWireRoutingRunner {
     command_runner: Arc<dyn RouteCommandRunner>,
     sink_name: String,
-    stream_watcher: Arc<dyn SinkInputWatcher>,
 }
 
 impl PipeWireRoutingRunner {
@@ -51,34 +39,19 @@ impl PipeWireRoutingRunner {
         Self {
             command_runner: Arc::new(SystemCommandRunner),
             sink_name: next_remote_sink_name(),
-            stream_watcher: Arc::new(PactlSubscribeWatcher),
         }
     }
 
     #[cfg(test)]
     pub(super) fn with_runner(command_runner: Arc<dyn RouteCommandRunner>) -> Self {
-        struct NoWatchWatcher;
-        impl SinkInputWatcher for NoWatchWatcher {
-            fn start(
-                &self,
-                _command_runner: Arc<dyn RouteCommandRunner>,
-                _sink_name: &str,
-            ) -> Option<StreamWatch> {
-                None
-            }
-        }
         Self {
             command_runner,
             sink_name: DEFAULT_REMOTE_SINK_NAME.to_owned(),
-            stream_watcher: Arc::new(NoWatchWatcher),
         }
     }
 
     fn start_redirect(&self) -> Result<RedirectRouteGuard> {
-        // A teardown that ran out of budget, or a process that was killed
-        // outright, leaves its null sink loaded and the machine's default
-        // pointing at it. Take those out first, or they accumulate: the module
-        // stays forever, and each new session finds one more of them.
+        // Recover null sinks left by an interrupted or timed-out teardown.
         unload_orphaned_remote_sinks(self.command_runner.as_ref());
 
         let previous_default_sink =
@@ -90,7 +63,6 @@ impl PipeWireRoutingRunner {
             previous_default_sink,
             moved_sink_inputs: Vec::new(),
             module_id: Some(module_id),
-            stream_watch: None,
             restored: false,
         };
 
@@ -99,137 +71,14 @@ impl PipeWireRoutingRunner {
             return Err(error);
         }
 
-        // Streams that start after activation follow WirePlumber's
-        // remembered per-application targets, not the changed default sink,
-        // so they would play on the physical output. Follow their creation
-        // and move them over; losing the watch degrades to the previous
-        // behavior, so it is not fatal.
-        guard.stream_watch = self
-            .stream_watcher
-            .start(Arc::clone(&self.command_runner), &self.sink_name);
-
         Ok(guard)
     }
 }
 
-/// Moves sink-inputs that appear while the redirect is active onto the
-/// remote sink. Only `new` events are followed: a stream the user manually
-/// re-routes mid-session afterwards stays where it was put.
-pub(super) trait SinkInputWatcher: Send + Sync {
-    fn start(
-        &self,
-        command_runner: Arc<dyn RouteCommandRunner>,
-        sink_name: &str,
-    ) -> Option<StreamWatch>;
-}
-
-struct PactlSubscribeWatcher;
-
-impl SinkInputWatcher for PactlSubscribeWatcher {
-    fn start(
-        &self,
-        command_runner: Arc<dyn RouteCommandRunner>,
-        sink_name: &str,
-    ) -> Option<StreamWatch> {
-        let mut child = match Command::new("pactl")
-            .arg("subscribe")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(error) => {
-                tracing::warn!("Audio: failed to start pactl subscribe: {}", error);
-                return None;
-            }
-        };
-        let stdout = child.stdout.take()?;
-        let sink_name = sink_name.to_owned();
-        let thread = thread::Builder::new()
-            .name("hypr-rdp-audio-route".into())
-            .spawn(move || {
-                let lines = std::io::BufReader::new(stdout)
-                    .lines()
-                    .map_while(Result::ok);
-                follow_new_sink_inputs(lines, command_runner.as_ref(), &sink_name);
-            })
-            .ok()?;
-        Some(StreamWatch {
-            child: Some(child),
-            thread: Some(thread),
-        })
-    }
-}
-
-/// Owns the `pactl subscribe` child and its reader thread; killing the
-/// child ends the reader's stream, so stop() is bounded.
-pub(super) struct StreamWatch {
-    child: Option<Child>,
-    thread: Option<thread::JoinHandle<()>>,
-}
-
-impl StreamWatch {
-    fn stop(&mut self) {
-        if let Some(mut child) = self.child.take() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
-impl Drop for StreamWatch {
-    fn drop(&mut self) {
-        self.stop();
-    }
-}
-
-fn follow_new_sink_inputs(
-    lines: impl Iterator<Item = String>,
-    command_runner: &dyn RouteCommandRunner,
-    sink_name: &str,
-) {
-    for line in lines {
-        let Some(input_id) = parse_new_sink_input_event(&line) else {
-            continue;
-        };
-        // Short-lived streams can vanish before the move lands; that is
-        // not worth a warning.
-        if let Err(error) = move_sink_input(command_runner, input_id, sink_name) {
-            tracing::debug!(
-                input_id,
-                "Audio: failed to move new sink input: {:#}",
-                error
-            );
-        } else {
-            tracing::debug!(input_id, sink_name, "Audio: moved new sink input");
-        }
-    }
-}
-
-fn parse_new_sink_input_event(line: &str) -> Option<&str> {
-    let id = line.trim().strip_prefix("Event 'new' on sink-input #")?;
-    (!id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())).then_some(id)
-}
-
-/// The default sink to go back to, if it is one worth going back to.
-///
-/// A default that is one of our own null sinks is a leftover from a teardown
-/// that could not finish. Recording it would spread the failure: this session
-/// would end cleanly and dutifully "restore" the orphan, so every session
-/// after the broken one inherits it. Better to record nothing and let the
-/// sound server pick, which is what it does when a default disappears.
 fn usable_previous_sink(name: Option<String>) -> Option<String> {
     name.filter(|name| !name.starts_with(DEFAULT_REMOTE_SINK_NAME))
 }
 
-/// The pid embedded in one of our sink names, if that is what this is.
-///
-/// The name is `<prefix>_<pid>_<counter>`, so a sink whose pid is gone belongs
-/// to nobody. A recycled pid makes this answer "still alive" and the module is
-/// left alone, which is the safe direction to be wrong in.
 fn owner_pid_of_remote_sink(sink_name: &str) -> Option<u32> {
     let tail = sink_name
         .strip_prefix(DEFAULT_REMOTE_SINK_NAME)?
@@ -238,11 +87,12 @@ fn owner_pid_of_remote_sink(sink_name: &str) -> Option<u32> {
     pid.parse().ok()
 }
 
-/// Module ids of our null sinks whose owning process is gone.
-///
-/// Parses `pactl list short modules`, whose lines are id, name and arguments
-/// separated by tabs.
-fn orphaned_remote_sink_modules(modules: &str, is_alive: impl Fn(u32) -> bool) -> Vec<String> {
+// The server handles one session at a time, so its own pre-existing sinks are stale.
+fn orphaned_remote_sink_modules(
+    modules: &str,
+    current_pid: u32,
+    is_alive: impl Fn(u32) -> bool,
+) -> Vec<String> {
     modules
         .lines()
         .filter_map(|line| {
@@ -256,20 +106,17 @@ fn orphaned_remote_sink_modules(modules: &str, is_alive: impl Fn(u32) -> bool) -
                 .split_whitespace()
                 .find_map(|pair| pair.strip_prefix("sink_name="))?;
             let pid = owner_pid_of_remote_sink(sink_name)?;
-            (!is_alive(pid)).then(|| id.to_owned())
+            (pid == current_pid || !is_alive(pid)).then(|| id.to_owned())
         })
         .collect()
 }
 
 fn process_is_alive(pid: u32) -> bool {
     // Signal 0 asks about the process without touching it.
-    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+    let result = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Take out null sinks left behind by a hypr-rdp that is no longer running.
-///
-/// Best effort on purpose: this runs on the way into a session, and a sound
-/// server that will not answer is not a reason to refuse the session.
 fn unload_orphaned_remote_sinks(command_runner: &dyn RouteCommandRunner) {
     let modules = match pactl(
         command_runner,
@@ -285,7 +132,7 @@ fn unload_orphaned_remote_sinks(command_runner: &dyn RouteCommandRunner) {
         }
     };
 
-    for module_id in orphaned_remote_sink_modules(&modules, process_is_alive) {
+    for module_id in orphaned_remote_sink_modules(&modules, std::process::id(), process_is_alive) {
         match pactl(command_runner, &["unload-module".into(), module_id.clone()]) {
             Ok(_) => tracing::info!(module_id, "Audio: unloaded an orphaned remote sink"),
             Err(error) => {
@@ -321,13 +168,11 @@ pub(super) struct RouteCommandOutput {
 }
 
 pub(super) trait RouteCommandRunner: Send + Sync {
-    fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput>;
+    fn run(&self, program: &str, args: &[String], timeout: Duration) -> Result<RouteCommandOutput>;
 }
 
 struct SystemCommandRunner;
 
-/// Reads a child pipe to the end on its own thread, so a child that outruns the
-/// pipe buffer cannot block waiting for us while we wait for it.
 fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String> {
     thread::spawn(move || {
         let mut text = String::new();
@@ -338,26 +183,27 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<String>
     })
 }
 
-/// Waits for `child`, giving up after `ROUTE_COMMAND_TIMEOUT`.
-///
-/// The child is polled here rather than waited on in a helper thread so that the
-/// timeout path still owns it: `Child::kill` is safe only while the process has
-/// not been reaped, and nothing else reaps it.
-fn wait_within(child: &mut Child, description: &str) -> Result<std::process::ExitStatus> {
-    let deadline = Instant::now() + ROUTE_COMMAND_TIMEOUT;
+fn wait_within(
+    child: &mut Child,
+    description: &str,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Ok(status),
             Ok(None) => {}
             Err(error) => {
-                return Err(error).with_context(|| format!("failed to wait for {description}"))
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).with_context(|| format!("failed to wait for {description}"));
             }
         }
 
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            bail!("{description} did not finish within {ROUTE_COMMAND_TIMEOUT:?}");
+            bail!("{description} did not finish within {timeout:?}");
         }
 
         thread::sleep(ROUTE_COMMAND_POLL);
@@ -365,7 +211,7 @@ fn wait_within(child: &mut Child, description: &str) -> Result<std::process::Exi
 }
 
 impl RouteCommandRunner for SystemCommandRunner {
-    fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
+    fn run(&self, program: &str, args: &[String], timeout: Duration) -> Result<RouteCommandOutput> {
         let description = format!("{program} {}", args.join(" "));
         let mut child = Command::new(program)
             .args(args)
@@ -377,7 +223,7 @@ impl RouteCommandRunner for SystemCommandRunner {
 
         let stdout = drain(child.stdout.take());
         let stderr = drain(child.stderr.take());
-        let status = wait_within(&mut child, &description)?;
+        let status = wait_within(&mut child, &description, timeout)?;
 
         let stdout = stdout.join().unwrap_or_default();
         let stderr = stderr.join().unwrap_or_default();
@@ -396,20 +242,18 @@ struct RedirectRouteGuard {
     previous_default_sink: Option<String>,
     moved_sink_inputs: Vec<SinkInputRoute>,
     module_id: Option<String>,
-    stream_watch: Option<StreamWatch>,
     restored: bool,
 }
 
-/// Wraps a runner with a shared deadline, so a sequence of commands is bounded
-/// as a sequence and not only one command at a time.
 struct BudgetedRunner<'a> {
     inner: &'a dyn RouteCommandRunner,
     deadline: Instant,
 }
 
 impl RouteCommandRunner for BudgetedRunner<'_> {
-    fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
-        if Instant::now() >= self.deadline {
+    fn run(&self, program: &str, args: &[String], timeout: Duration) -> Result<RouteCommandOutput> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             bail!(
                 "{} {} skipped: the audio teardown budget of {:?} is spent",
                 program,
@@ -417,7 +261,7 @@ impl RouteCommandRunner for BudgetedRunner<'_> {
                 ROUTE_RESTORE_BUDGET
             );
         }
-        self.inner.run(program, args)
+        self.inner.run(program, args, timeout.min(remaining))
     }
 }
 
@@ -444,19 +288,8 @@ impl RedirectRouteGuard {
         }
         self.restored = true;
 
-        // Stop following new streams before moving anything back, so the
-        // watcher cannot re-route an input the restore just moved. This is
-        // outside the budget below on purpose: it kills a child and joins a
-        // thread, and the one command that thread can be inside is already
-        // bounded on its own.
-        if let Some(mut watch) = self.stream_watch.take() {
-            watch.stop();
-        }
-
-        // Everything below this point except unloading the module shares one
-        // deadline. Unloading does not: while the module is loaded the
-        // machine's default output is a sink nobody is listening to, so that
-        // command is worth its own wait even when the rest gave up.
+        // Module unload gets its own timeout so a spent restore budget does not
+        // leave the default pointing at an unused null sink.
         let budgeted = BudgetedRunner {
             inner: self.command_runner.as_ref(),
             deadline: Instant::now() + ROUTE_RESTORE_BUDGET,
@@ -530,7 +363,7 @@ impl Drop for RedirectRouteGuard {
 }
 
 fn pactl(command_runner: &dyn RouteCommandRunner, args: &[String]) -> Result<RouteCommandOutput> {
-    command_runner.run("pactl", args)
+    command_runner.run("pactl", args, ROUTE_COMMAND_TIMEOUT)
 }
 
 fn default_sink(command_runner: &dyn RouteCommandRunner) -> Result<Option<String>> {
@@ -738,8 +571,6 @@ mod tests {
         }
     }
 
-    /// A runner that takes `delay` on its first call and is instant after, so a
-    /// test can spend the teardown budget without spending its own time.
     struct SlowFirstRunner {
         delay: Duration,
         calls: Mutex<Vec<Vec<String>>>,
@@ -747,7 +578,12 @@ mod tests {
     }
 
     impl RouteCommandRunner for SlowFirstRunner {
-        fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            timeout: Duration,
+        ) -> Result<RouteCommandOutput> {
             let mut call = vec![program.to_owned()];
             call.extend(args.iter().cloned());
             self.calls.lock().unwrap().push(call);
@@ -758,7 +594,10 @@ mod tests {
             drop(served);
 
             if first {
-                std::thread::sleep(self.delay);
+                std::thread::sleep(self.delay.min(timeout));
+                if self.delay > timeout {
+                    bail!("command timed out after {timeout:?}");
+                }
             }
             Ok(RouteCommandOutput {
                 stdout: "other_sink".to_owned(),
@@ -766,10 +605,6 @@ mod tests {
         }
     }
 
-    /// The per-call deadline bounds one command; this bounds their sum. Without
-    /// it, teardown runs one command per moved stream and keeps going after
-    /// each failure, so a slow sound server holds the thread that returns to
-    /// accepting connections for as long as it likes.
     #[test]
     fn a_spent_budget_refuses_further_commands_without_running_them() {
         let inner = ScriptedRunner::with_outputs(vec![Ok("never used")]);
@@ -779,7 +614,11 @@ mod tests {
         };
 
         let error = spent
-            .run("pactl", &["get-default-sink".to_owned()])
+            .run(
+                "pactl",
+                &["get-default-sink".to_owned()],
+                ROUTE_COMMAND_TIMEOUT,
+            )
             .expect_err("a spent budget must refuse");
 
         assert!(
@@ -792,13 +631,31 @@ mod tests {
         );
     }
 
-    /// Unloading the module is not under the shared budget. While it is loaded
-    /// the machine's default output is a sink nobody is listening to, so it is
-    /// worth its own wait even when everything before it gave up.
     #[test]
-    fn the_module_is_unloaded_even_when_the_budget_is_spent() {
+    fn an_active_budget_caps_the_command_timeout_to_its_remaining_time() {
+        let inner = SlowFirstRunner {
+            delay: Duration::from_secs(1),
+            calls: Mutex::new(Vec::new()),
+            served: Mutex::new(0),
+        };
+        let budget = Duration::from_millis(100);
+        let runner = BudgetedRunner {
+            inner: &inner,
+            deadline: Instant::now() + budget,
+        };
+
+        let started = Instant::now();
+        runner
+            .run("pactl", &["get-default-sink".to_owned()], Duration::MAX)
+            .expect_err("the shared deadline must cap a running command");
+
+        assert!(started.elapsed() < budget + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn the_module_is_unloaded_after_a_restore_command_times_out() {
         let runner = Arc::new(SlowFirstRunner {
-            delay: ROUTE_RESTORE_BUDGET + Duration::from_millis(100),
+            delay: ROUTE_COMMAND_TIMEOUT + Duration::from_millis(100),
             calls: Mutex::new(Vec::new()),
             served: Mutex::new(0),
         });
@@ -808,7 +665,6 @@ mod tests {
             previous_default_sink: Some("previous_sink".to_owned()),
             moved_sink_inputs: Vec::new(),
             module_id: Some("42".to_owned()),
-            stream_watch: None,
             restored: false,
         };
 
@@ -829,9 +685,6 @@ mod tests {
         );
     }
 
-    /// A default sink that is one of ours is a leftover from a teardown that
-    /// could not finish. Recording it would spread the failure: this session
-    /// would end cleanly and "restore" the orphan, and so would the next.
     #[test]
     fn our_own_sink_is_not_a_default_worth_restoring() {
         assert_eq!(
@@ -857,9 +710,6 @@ mod tests {
         );
     }
 
-    /// Only our own sinks, and only those whose process is gone. Somebody
-    /// else's null sink is not ours to unload, and a live hypr-rdp is using
-    /// its own.
     #[test]
     fn only_our_orphans_are_collected() {
         let modules = format!(
@@ -870,12 +720,11 @@ mod tests {
             p = DEFAULT_REMOTE_SINK_NAME
         );
 
-        let orphans = orphaned_remote_sink_modules(&modules, |pid| pid == 222);
+        let orphans = orphaned_remote_sink_modules(&modules, 333, |pid| pid == 222);
 
         assert_eq!(orphans, vec!["7".to_string()]);
     }
 
-    /// Nothing to collect is the ordinary case and must stay silent.
     #[test]
     fn a_clean_machine_has_no_orphans() {
         let modules = format!(
@@ -883,19 +732,27 @@ mod tests {
             p = DEFAULT_REMOTE_SINK_NAME
         );
 
-        assert!(orphaned_remote_sink_modules(&modules, |_| true).is_empty());
+        assert!(orphaned_remote_sink_modules(&modules, 333, |_| true).is_empty());
     }
 
-    /// The real runner, not the scripted one: these spawn processes.
-    ///
-    /// `pactl` is run on the thread that tears a session down and then goes back
-    /// to accepting connections, so the failure this bounds is a sound server
-    /// that accepts the request and never answers -- which is what issue #66
-    /// describes on the other side of the teardown.
+    #[test]
+    fn a_sink_from_an_earlier_session_in_this_process_is_collected() {
+        let modules = format!(
+            "6\tmodule-null-sink\tsink_name={p}_999_1\n",
+            p = DEFAULT_REMOTE_SINK_NAME
+        );
+
+        assert_eq!(
+            orphaned_remote_sink_modules(&modules, 999, |_| true),
+            vec!["6".to_owned()]
+        );
+    }
+
     #[test]
     fn a_command_that_never_finishes_is_given_up_on() {
+        let timeout = Duration::from_millis(100);
         let started = Instant::now();
-        let result = SystemCommandRunner.run("sleep", &["30".to_owned()]);
+        let result = SystemCommandRunner.run("sleep", &["30".to_owned()], timeout);
         let elapsed = started.elapsed();
 
         let error = result.expect_err("a command that outlives the budget must fail");
@@ -904,27 +761,28 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            elapsed < ROUTE_COMMAND_TIMEOUT + Duration::from_secs(1),
-            "gave up after {elapsed:?}, budget is {ROUTE_COMMAND_TIMEOUT:?}"
+            elapsed < timeout + Duration::from_secs(1),
+            "gave up after {elapsed:?}, budget is {timeout:?}"
         );
     }
 
     #[test]
     fn a_command_that_finishes_still_returns_its_output() {
         let output = SystemCommandRunner
-            .run("echo", &["hello".to_owned()])
+            .run("echo", &["hello".to_owned()], ROUTE_COMMAND_TIMEOUT)
             .expect("echo should succeed");
 
         assert_eq!(output.stdout.trim(), "hello");
     }
 
-    /// More output than a pipe buffer holds. Waiting for the child while nothing
-    /// reads its stdout would deadlock until the budget expired, turning a
-    /// working command into a timeout.
     #[test]
     fn output_larger_than_a_pipe_buffer_does_not_deadlock() {
         let output = SystemCommandRunner
-            .run("sh", &["-c".to_owned(), "printf '%0999999d' 0".to_owned()])
+            .run(
+                "sh",
+                &["-c".to_owned(), "printf '%0999999d' 0".to_owned()],
+                ROUTE_COMMAND_TIMEOUT,
+            )
             .expect("sh should succeed");
 
         assert_eq!(output.stdout.len(), 999_999);
@@ -933,14 +791,23 @@ mod tests {
     #[test]
     fn a_failing_command_reports_its_stderr() {
         let error = SystemCommandRunner
-            .run("sh", &["-c".to_owned(), "echo nope >&2; exit 1".to_owned()])
+            .run(
+                "sh",
+                &["-c".to_owned(), "echo nope >&2; exit 1".to_owned()],
+                ROUTE_COMMAND_TIMEOUT,
+            )
             .expect_err("a non-zero exit must fail");
 
         assert!(error.to_string().contains("nope"), "unexpected: {error}");
     }
 
     impl RouteCommandRunner for ScriptedRunner {
-        fn run(&self, program: &str, args: &[String]) -> Result<RouteCommandOutput> {
+        fn run(
+            &self,
+            program: &str,
+            args: &[String],
+            _timeout: Duration,
+        ) -> Result<RouteCommandOutput> {
             let mut call = Vec::with_capacity(args.len() + 1);
             call.push(program.to_owned());
             call.extend(args.iter().cloned());
@@ -955,59 +822,6 @@ mod tests {
 
             output.map_err(anyhow::Error::msg)
         }
-    }
-
-    #[test]
-    fn new_sink_input_events_are_parsed_and_others_ignored() {
-        assert_eq!(
-            parse_new_sink_input_event("Event 'new' on sink-input #123"),
-            Some("123")
-        );
-        assert_eq!(
-            parse_new_sink_input_event("Event 'change' on sink-input #123"),
-            None
-        );
-        assert_eq!(parse_new_sink_input_event("Event 'new' on sink #4"), None);
-        assert_eq!(
-            parse_new_sink_input_event("Event 'new' on sink-input #"),
-            None
-        );
-        assert_eq!(
-            parse_new_sink_input_event("Event 'new' on sink-input #12x"),
-            None
-        );
-    }
-
-    #[test]
-    fn follow_moves_each_new_sink_input_and_survives_move_failures() {
-        let runner = ScriptedRunner::with_outputs(vec![Err("gone already"), Ok("")]);
-        let lines = vec![
-            "Event 'new' on sink-input #9".to_owned(),
-            "Event 'change' on sink-input #9".to_owned(),
-            "Event 'new' on source-output #4".to_owned(),
-            "Event 'new' on sink-input #10".to_owned(),
-        ];
-
-        follow_new_sink_inputs(lines.into_iter(), runner.as_ref(), DEFAULT_REMOTE_SINK_NAME);
-
-        let calls = runner.calls();
-        assert_eq!(
-            calls,
-            vec![
-                vec![
-                    "pactl".to_owned(),
-                    "move-sink-input".to_owned(),
-                    "9".to_owned(),
-                    DEFAULT_REMOTE_SINK_NAME.to_owned()
-                ],
-                vec![
-                    "pactl".to_owned(),
-                    "move-sink-input".to_owned(),
-                    "10".to_owned(),
-                    DEFAULT_REMOTE_SINK_NAME.to_owned()
-                ],
-            ]
-        );
     }
 
     #[test]
@@ -1042,7 +856,6 @@ mod tests {
     #[test]
     fn redirect_mode_creates_routes_and_restores_remote_sink() {
         let runner = ScriptedRunner::with_outputs(vec![
-            // The orphan sweep that now runs before anything else.
             Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
@@ -1119,7 +932,6 @@ mod tests {
     #[test]
     fn redirect_restore_preserves_user_changed_default_sink() {
         let runner = ScriptedRunner::with_outputs(vec![
-            // The orphan sweep that now runs before anything else.
             Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
@@ -1167,7 +979,6 @@ mod tests {
     #[test]
     fn redirect_start_failure_restores_inputs_moved_before_failure() {
         let runner = ScriptedRunner::with_outputs(vec![
-            // The orphan sweep that now runs before anything else.
             Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
@@ -1216,7 +1027,6 @@ mod tests {
     #[test]
     fn redirect_restore_treats_activation_remote_inputs_as_untracked() {
         let runner = ScriptedRunner::with_outputs(vec![
-            // The orphan sweep that now runs before anything else.
             Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
@@ -1266,7 +1076,6 @@ mod tests {
     #[test]
     fn redirect_start_failure_unloads_created_sink() {
         let runner = ScriptedRunner::with_outputs(vec![
-            // The orphan sweep that now runs before anything else.
             Ok(""),
             Ok("alsa_output\n"),
             Ok("55\n"),
