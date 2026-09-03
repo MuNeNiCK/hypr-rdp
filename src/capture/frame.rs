@@ -700,7 +700,7 @@ impl FrameProcessor {
                     let codec = self.egfx_codec.unwrap_or(EgfxCodec::Avc420);
                     if force_full_frame {
                         if let Some(enc) = &mut self.h264_encoder {
-                            enc.force_idr();
+                            enc.force_full_frame();
                         }
                     }
                     let encode_result = self.h264_encoder.as_mut().map(|enc| {
@@ -1868,7 +1868,12 @@ mod tests {
             TestQueueDepth::AvailableBytes(1),
         );
 
+        let force_idr_requests = processor
+            .h264_encoder
+            .as_ref()
+            .and_then(crate::egfx::FrameEncoder::force_idr_requests_for_test);
         shared.request_full_frame();
+        assert!(shared.full_frame_requested());
         assert!(processor.process(&frame, &display_tx));
         assert!(!shared.full_frame_requested());
         assert!(!processor.has_pending_damage());
@@ -1884,6 +1889,13 @@ mod tests {
         let full_frame = [(0, 0, width as i32, height as i32)];
         assert_eq!(last_luma_regions, full_frame);
         assert_eq!(last_chroma_regions, full_frame);
+        assert_eq!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .and_then(crate::egfx::FrameEncoder::force_idr_requests_for_test),
+            force_idr_requests
+        );
     }
 
     #[test]
