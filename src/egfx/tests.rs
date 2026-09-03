@@ -1113,7 +1113,7 @@ fn new_gfx_server_requires_fresh_capabilities_and_surface_setup() {
 }
 
 #[test]
-fn repeated_compatible_capabilities_keep_surface_generation() {
+fn repeated_compatible_capabilities_reinitialize_surface_generation() {
     let mut session = unnegotiated_egfx_session(64, 64, EgfxCodecPolicy::Auto);
     session
         .bridge
@@ -1134,14 +1134,41 @@ fn repeated_compatible_capabilities_keep_surface_generation() {
         .expect("initial capabilities process");
     let first_generation = session.shared.generation();
     assert!(!session.shared.full_frame_requested());
+    let first_surface_id = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 64, 64)
+        .expect("initial surface setup");
+    let initial_pdus = drain_gfx_pdus(&mut session.event_rx);
+    assert_eq!(initial_pdus.len(), 3);
 
     let _ = session
         .bridge
         .process(TEST_CHANNEL_ID, &caps)
         .expect("repeated capabilities process");
 
-    assert_eq!(session.shared.generation(), first_generation);
+    assert!(session.shared.generation() > first_generation);
     assert!(session.shared.full_frame_requested());
+
+    let reset_surface_id = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 64, 64)
+        .expect("surface setup after protocol reset");
+    let reset_pdus = drain_gfx_pdus(&mut session.event_rx);
+
+    assert_eq!(reset_surface_id, first_surface_id);
+    assert_eq!(reset_pdus.len(), 3);
+    assert!(matches!(
+        &reset_pdus.as_slice()[0],
+        GfxPdu::ResetGraphics(reset) if reset.width == 64 && reset.height == 64
+    ));
+    assert!(matches!(
+        &reset_pdus.as_slice()[1],
+        GfxPdu::CreateSurface(create) if create.surface_id == reset_surface_id
+    ));
+    assert!(matches!(
+        &reset_pdus.as_slice()[2],
+        GfxPdu::MapSurfaceToOutput(map) if map.surface_id == reset_surface_id
+    ));
 }
 
 #[test]

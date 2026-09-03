@@ -206,21 +206,14 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
         self.shared.avc444_enabled.store(avc444, Ordering::Release);
 
         if was_ready {
-            if previous_avc == avc && previous_avc444 == avc444 {
-                tracing::info!(
-                    ?cap,
-                    avc420,
-                    avc444,
-                    "EGFX: client repeated compatible capabilities; keeping surface"
-                );
-            } else {
-                tracing::info!(
-                    ?cap,
-                    avc420,
-                    avc444,
-                    "EGFX: client capability changed; reinitializing surface"
-                );
-            }
+            let capabilities_changed = previous_avc != avc || previous_avc444 != avc444;
+            tracing::info!(
+                ?cap,
+                avc420,
+                avc444,
+                capabilities_changed,
+                "EGFX: client reset graphics capabilities; reinitializing surface"
+            );
         } else {
             tracing::info!(?cap, avc420, avc444, "EGFX: channel ready (first time)");
         }
@@ -232,9 +225,7 @@ impl GraphicsPipelineHandler for HyprGraphicsHandler {
             );
         }
         self.shared.clear_frame_queue();
-        if !was_ready || previous_avc != avc || previous_avc444 != avc444 {
-            self.shared.ready_generation.fetch_add(1, Ordering::Release);
-        }
+        self.shared.ready_generation.fetch_add(1, Ordering::Release);
         self.shared.note_gfx_ready();
         self.shared.ready.store(true, Ordering::Release);
     }
