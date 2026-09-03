@@ -522,6 +522,10 @@ impl Avc444Encoder {
 
     pub fn force_idr(&mut self) {
         self.encoder.force_idr();
+        self.force_full_frame();
+    }
+
+    pub fn force_full_frame(&mut self) {
         self.force_chroma_on_next_frame = true;
     }
 

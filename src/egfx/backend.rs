@@ -342,6 +342,12 @@ impl FrameEncoder {
         }
     }
 
+    pub fn force_full_frame(&mut self) {
+        if let Self::SoftwareAvc444(enc) = self {
+            enc.force_full_frame();
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn force_idr_requests_for_test(&self) -> Option<u32> {
         match self {
