@@ -107,6 +107,7 @@ hypr-rdp -u user -p pass --capture-mode ext
 bind = "0.0.0.0:3389"
 username = "user"
 password = "pass"
+# password_file = "/run/secrets/hypr-rdp-password"  # conflicts with `password`
 # resolution = "1920x1080"
 # scale = 1
 capture_mode = "wlr"
@@ -122,7 +123,18 @@ egfx_codec = "avc420"
 # on_session_end = "hyprctl dispatch dpms on eDP-1"
 ```
 
-CLI arguments override config file values.
+CLI arguments override config file values. `--password`/`--password-file` and
+`password`/`password_file` are each mutually exclusive within their source;
+supplying either one on the CLI overrides whichever password source (literal
+or file) is set in the config file. A selected password file is read once at
+startup, with exactly one trailing line ending (`\n` or `\r\n`) removed; if it
+is missing, unreadable, or empty after that, hypr-rdp fails to start rather
+than falling back to unauthenticated operation.
+
+Setting only `-u`/`--username`/`username` or only
+`-p`/`--password`/`--password-file`/`password`/`password_file` (not both) is
+accepted: the missing half is treated as empty, hypr-rdp logs a warning, and
+the client must match that empty value to authenticate.
 
 ### Session hooks
 
@@ -171,7 +183,8 @@ remote input wakes it again unless `misc:mouse_move_enables_dpms` and
 | `--cert` | TLS certificate (PEM) | Auto-generated, RSA-2048 |
 | `--key` | TLS private key (PEM) | Auto-generated |
 | `-u`, `--username` | RDP username | _(none)_ |
-| `-p`, `--password` | RDP password | _(none)_ |
+| `-p`, `--password` | RDP password. Conflicts with `--password-file`. | _(none)_ |
+| `--password-file` | Read the RDP password from a file, with one trailing line ending removed. Conflicts with `--password`. | _(none)_ |
 | `--resolution`, `-r` | Fixed session resolution, used as-is including above a captured output's size. When omitted for a managed headless output, the session starts at `1920x1080` and may resize to the client-requested size. | Auto client size |
 | `--scale` | Scale of the managed headless output, e.g. `2` for a HiDPI client. Hyprland only accepts scales that divide the mode into whole logical pixels. Ignored when `--output` captures an existing monitor. | `1` |
 | `--capture-mode` | `wlr` or `ext` | `wlr` |
