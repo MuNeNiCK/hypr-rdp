@@ -11,6 +11,7 @@
   libxkbcommon,
   mesa,
   pipewire,
+  pam,
   pulseaudio,
   wayland,
 }:
@@ -24,7 +25,7 @@ rustPlatform.buildRustPackage {
 
   src = lib.cleanSource ../..;
 
-  cargoHash = "sha256-J+VeMTisUF6mSUU1Dp/6YzHTgppAWQI2dbsmZMJRCRo=";
+  cargoHash = "sha256-BTpqBnHCoXtCQBuL42l9ZAaqnSw/Igb5koH9qtWZk3U=";
 
   nativeBuildInputs = [
     pkg-config
@@ -41,6 +42,7 @@ rustPlatform.buildRustPackage {
     libxkbcommon
     mesa
     pipewire
+    pam
     wayland
   ];
 

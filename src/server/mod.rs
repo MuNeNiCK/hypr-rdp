@@ -5,19 +5,25 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use ironrdp_server::{
-    ConnectionHandler, ConnectionInfo, Credentials, PostConnectionAction, RdpServer, ServerError,
+    ConnectionHandler, ConnectionInfo, PostConnectionAction, RdpServer, ServerError,
     SoundServerFactory, TlsIdentityCtx,
 };
 
 use crate::audio::{AudioMode, HyprSoundFactory};
 use crate::capture::{HyprDisplay, HyprDisplayHandle};
 use crate::clipboard::HyprCliprdrFactory;
-use crate::config::{ConfigCredentials, RuntimeConfig};
+#[cfg(test)]
+use crate::config::ConfigCredentials;
+use crate::config::RuntimeConfig;
 use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::{HyprInputHandler, RdpInputSessionSink, SharedOutputLayout};
 
+pub(crate) mod auth;
 mod session_hooks;
 mod tls;
+#[cfg(test)]
+use auth::{ironrdp_credentials, security_mode_for_credentials};
+use auth::{PreparedAuthentication, ServerSecurityMode};
 
 use session_hooks::{session_hooks_from_config, SessionHooks};
 
@@ -27,13 +33,14 @@ pub struct ServerContext {
 }
 
 pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
+    let authentication = PreparedAuthentication::new(config.authentication)?;
     let hyprland_instance =
         crate::hyprland::initialize().context("failed to select the Hyprland instance")?;
     let RuntimeConfig {
         bind,
         cert,
         key,
-        credentials,
+        authentication: _,
         resolution,
         headless_scale,
         capture_mode,
@@ -106,8 +113,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .make_acceptor()
         .context("failed to create TLS acceptor")?;
 
-    let credentials = ironrdp_credentials(credentials);
-    let security_mode = security_mode_for_credentials(&credentials);
+    let security_mode = authentication.security;
     let secured_builder = match security_mode {
         ServerSecurityMode::Tls => builder.with_tls(acceptor),
         ServerSecurityMode::Hybrid => builder.with_hybrid(acceptor, tls_ctx.pub_key),
@@ -116,6 +122,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
     let mut server = secured_builder
         .with_input_handler(input_handler)
         .with_display_handler(display)
+        .with_credential_validator(authentication.validator)
         .with_preempt_existing_session(security_mode.allows_authenticated_replacement())
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
             input_session_sink,
@@ -126,7 +133,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_sound_factory(sound_factory)
         .build();
 
-    server.set_credentials(credentials);
+    server.set_credentials(authentication.credentials);
 
     tracing::info!("RDP server configured for {}", bind);
 
@@ -194,36 +201,6 @@ impl ConnectionHandler for ClientConnectionHandler {
             hooks.session_ended();
         }
         PostConnectionAction::Continue
-    }
-}
-
-fn ironrdp_credentials(credentials: Option<ConfigCredentials>) -> Option<Credentials> {
-    credentials.map(|credentials| Credentials {
-        username: credentials.username,
-        password: credentials.password,
-        domain: None,
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ServerSecurityMode {
-    Tls,
-    Hybrid,
-}
-
-impl ServerSecurityMode {
-    fn allows_authenticated_replacement(self) -> bool {
-        // IronRDP authenticates Hybrid candidates through CredSSP before eviction.
-        // TLS alone only proves the handshake, so keep its existing queue policy.
-        matches!(self, Self::Hybrid)
-    }
-}
-
-fn security_mode_for_credentials(credentials: &Option<Credentials>) -> ServerSecurityMode {
-    if credentials.is_some() {
-        ServerSecurityMode::Hybrid
-    } else {
-        ServerSecurityMode::Tls
     }
 }
 

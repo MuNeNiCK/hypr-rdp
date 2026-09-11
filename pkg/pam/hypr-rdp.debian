@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Authenticate access to the existing desktop; no login session is opened.
+@include common-auth
+@include common-account

@@ -19,7 +19,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev
+          sudo apt-get install -y libpipewire-0.3-dev libva-dev libxkbcommon-dev libwayland-dev libgbm-dev libpam0g-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -41,9 +41,10 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p dist
+          mkdir -p dist/pkg/pam
           cp target/release/hypr-rdp dist/
           cp LICENSE README.md CHANGELOG.md dist/
+          cp pkg/pam/hypr-rdp.* dist/pkg/pam/
           cd dist && tar czf ../hypr-rdp-${GITHUB_REF_NAME}-x86_64-linux.tar.gz *
 
       - name: Create GitHub Release

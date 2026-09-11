@@ -1,0 +1,4 @@
+#%PAM-1.0
+# Authenticate access to the existing desktop; no login session is opened.
+auth    include system-auth
+account include system-auth

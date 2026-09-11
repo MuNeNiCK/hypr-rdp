@@ -13,6 +13,9 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    if let Some(status) = server::auth::dispatch_helper() {
+        std::process::exit(status);
+    }
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     tracing_subscriber::fmt()

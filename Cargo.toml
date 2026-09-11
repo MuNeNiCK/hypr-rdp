@@ -48,6 +48,7 @@ pipewire = "0.9"
 
 # System
 libc = "0.2"
+pam-client = { version = "0.5.0", default-features = false }
 
 # TLS auto-cert generation
 # RSA key generation requires rcgen's aws-lc backend.
@@ -75,3 +76,8 @@ fuser = { version = "0.18", default-features = false, optional = true }
 [dev-dependencies]
 png = "0.18.1"
 proptest = "1"
+
+[build-dependencies]
+# pam-sys uses bindgen 0.69 without default features. Match PipeWire's
+# clang-sys runtime loading so this bindgen instance loads libclang too.
+bindgen = { version = "0.69", default-features = false, features = ["runtime"] }
