@@ -83,6 +83,14 @@ struct Args {
     #[arg(long)]
     key: Option<String>,
 
+    /// Authentication mode: configured credentials or Linux PAM
+    #[arg(long)]
+    auth_mode: Option<String>,
+
+    /// PAM service name (only with --auth-mode pam)
+    #[arg(long)]
+    pam_service: Option<String>,
+
     /// Username for RDP authentication
     #[arg(short, long)]
     username: Option<String>,
@@ -178,6 +186,8 @@ struct Args {
 
 #[derive(Debug, Deserialize, Default)]
 struct ConfigFile {
+    auth_mode: Option<String>,
+    pam_service: Option<String>,
     bind: Option<String>,
     cert: Option<String>,
     key: Option<String>,
@@ -253,7 +263,7 @@ pub struct RuntimeConfig {
     pub bind: SocketAddr,
     pub cert: Option<String>,
     pub key: Option<String>,
-    pub credentials: Option<ConfigCredentials>,
+    pub authentication: AuthConfig,
     pub resolution: (u32, u32),
     pub headless_scale: f64,
     pub capture_mode: CaptureMode,
@@ -273,6 +283,58 @@ pub struct RuntimeConfig {
     pub file_transfer_mode: FileTransferMode,
     pub file_transfer_max_chunk_bytes: u32,
     pub file_transfer_max_entries: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuthConfig {
+    Configured(Option<ConfigCredentials>),
+    Pam { service: String },
+}
+
+fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::Result<AuthConfig> {
+    let mode = args
+        .auth_mode
+        .take()
+        .or(config.auth_mode.take())
+        .unwrap_or_else(|| "configured".into());
+    let service = args.pam_service.take().or(config.pam_service.take());
+    match mode.as_str() {
+        "configured" => {
+            anyhow::ensure!(service.is_none(), "pam-service requires auth-mode pam");
+            let username = args
+                .username
+                .take()
+                .or(config.username.take())
+                .unwrap_or_default();
+            let password = resolve_password(
+                args.password.take(),
+                args.password_file.take(),
+                config.password.take(),
+                config.password_file.take(),
+            )?;
+            Ok(AuthConfig::Configured(ConfigCredentials::from_parts(
+                username, password,
+            )))
+        }
+        "pam" => {
+            anyhow::ensure!(
+                args.username.is_none()
+                    && config.username.is_none()
+                    && args.password.is_none()
+                    && config.password.is_none()
+                    && args.password_file.is_none()
+                    && config.password_file.is_none(),
+                "auth-mode pam cannot be combined with username, password or password-file"
+            );
+            let service = service.unwrap_or_else(|| "hypr-rdp".into());
+            anyhow::ensure!(
+                crate::server::auth::valid_pam_service(&service),
+                "invalid PAM service name"
+            );
+            Ok(AuthConfig::Pam { service })
+        }
+        _ => anyhow::bail!("unknown auth-mode; expected configured or pam"),
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -322,8 +384,9 @@ fn startup_warnings(
 
 impl RuntimeConfig {
     pub fn load() -> anyhow::Result<Self> {
-        let args = Args::parse();
-        let config = ConfigFile::load(args.config.as_deref())?;
+        let mut args = Args::parse();
+        let mut config = ConfigFile::load(args.config.as_deref())?;
+        let authentication = resolve_authentication(&mut args, &mut config)?;
 
         let bind = args
             .bind
@@ -332,14 +395,6 @@ impl RuntimeConfig {
         let bind = parse_bind_addr(&bind)?;
         let cert = args.cert.or(config.cert);
         let key = args.key.or(config.key);
-        let username = args.username.or(config.username).unwrap_or_default();
-        let password = resolve_password(
-            args.password,
-            args.password_file,
-            config.password,
-            config.password_file,
-        )?;
-        let credentials = ConfigCredentials::from_parts(username, password);
         let requested_file_transfer_mode =
             resolve_file_transfer_mode(args.file_transfer_mode, config.file_transfer_mode)?;
         let file_transfer_mode = requested_file_transfer_mode.for_build();
@@ -348,7 +403,11 @@ impl RuntimeConfig {
                 "Client-to-server file transfer is not compiled in; disabling the unavailable direction");
         }
 
-        for warning in startup_warnings(credentials.as_ref(), bind) {
+        let warnings = match &authentication {
+            AuthConfig::Configured(credentials) => startup_warnings(credentials.as_ref(), bind),
+            AuthConfig::Pam { .. } => Vec::new(),
+        };
+        for warning in warnings {
             match warning {
                 StartupWarning::AuthenticationOff => tracing::warn!(
                     "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
@@ -425,7 +484,7 @@ impl RuntimeConfig {
             bind,
             cert,
             key,
-            credentials,
+            authentication,
             resolution,
             headless_scale,
             capture_mode,
@@ -1314,5 +1373,93 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod pam_config_tests {
+    use super::*;
+
+    fn resolve(cli: &[&str], file: &str) -> anyhow::Result<AuthConfig> {
+        let mut args = Args::try_parse_from(cli)?;
+        let mut config = toml::from_str(file)?;
+        resolve_authentication(&mut args, &mut config)
+    }
+
+    #[test]
+    fn pam_is_explicit_and_configured_credentials_remain_the_default() {
+        assert_eq!(
+            resolve(&["hypr-rdp"], "").unwrap(),
+            AuthConfig::Configured(None)
+        );
+        assert_eq!(
+            resolve(&["hypr-rdp", "--auth-mode", "pam"], "").unwrap(),
+            AuthConfig::Pam {
+                service: "hypr-rdp".into()
+            }
+        );
+        assert!(matches!(
+            resolve(&["hypr-rdp", "-u", "alice", "-p", "secret"], "").unwrap(),
+            AuthConfig::Configured(Some(_))
+        ));
+        assert_eq!(
+            resolve(
+                &["hypr-rdp", "--pam-service", "custom"],
+                "auth_mode = 'pam'"
+            )
+            .unwrap(),
+            AuthConfig::Pam {
+                service: "custom".into()
+            }
+        );
+    }
+
+    #[test]
+    fn pam_conflicts_and_invalid_modes_never_downgrade_authentication() {
+        for field in ["username", "password", "password_file"] {
+            assert!(resolve(
+                &["hypr-rdp", "--auth-mode", "pam"],
+                &format!("{field} = ''")
+            )
+            .is_err());
+        }
+        for cli in [
+            vec!["hypr-rdp", "--auth-mode", "pam", "-u", "alice"],
+            vec!["hypr-rdp", "--auth-mode", "pam", "-p", "secret"],
+            vec![
+                "hypr-rdp",
+                "--auth-mode",
+                "pam",
+                "--password-file",
+                "/nonexistent",
+            ],
+            vec!["hypr-rdp", "--auth-mode", "typo"],
+            vec!["hypr-rdp", "--pam-service", "hypr-rdp"],
+            vec![
+                "hypr-rdp",
+                "--auth-mode",
+                "pam",
+                "--pam-service",
+                "../login",
+            ],
+        ] {
+            assert!(resolve(&cli, "").is_err(), "{cli:?}");
+        }
+    }
+
+    #[test]
+    fn configured_mode_override_preserves_existing_password_precedence() {
+        let actual = resolve(
+            &["hypr-rdp", "--auth-mode", "configured", "-p", "cli"],
+            "auth_mode = 'pam'\nusername = 'alice'\npassword = 'config'",
+        )
+        .unwrap();
+        assert_eq!(
+            actual,
+            AuthConfig::Configured(Some(ConfigCredentials {
+                username: "alice".into(),
+                password: "cli".into()
+            }))
+        );
     }
 }

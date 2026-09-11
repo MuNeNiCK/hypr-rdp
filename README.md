@@ -38,7 +38,7 @@ tar xzf hypr-rdp-v*.tar.gz
 sudo install -Dm755 hypr-rdp /usr/local/bin/hypr-rdp
 ```
 
-Runtime dependencies: `libva`, `pipewire`, `libxkbcommon`,
+Runtime dependencies: `libva`, `pipewire`, `libxkbcommon`, Linux-PAM,
 and `pactl` for the default audio routing mode. Hardware encoding also needs
 an appropriate VA-API driver. The software encoder uses bundled OpenH264.
 Receiving clipboard files on the desktop also needs FUSE and `fusermount3`
@@ -47,7 +47,7 @@ Receiving clipboard files on the desktop also needs FUSE and `fusermount3`
 ### Build from source
 
 Install a current stable Rust toolchain, a C/C++ compiler, and development headers
-for libva, PipeWire, libxkbcommon, Wayland, and GBM.
+for libva, PipeWire, libxkbcommon, Wayland, GBM, and Linux-PAM (Debian/Ubuntu: `libpam0g-dev`).
 
 ```sh
 git clone https://github.com/MuNeNICK/hypr-rdp.git
@@ -85,8 +85,9 @@ hypr-rdp -u user -p pass --resolution 3024x1896 --scale 2
 session, set `WAYLAND_DISPLAY`; set `HYPRLAND_INSTANCE_SIGNATURE` too if instance
 discovery is ambiguous.
 
-With credentials configured, a new authenticated connection replaces the current
-one. Without credentials, connections are unauthenticated and served one at a time.
+With configured username/password credentials, a new authenticated connection
+replaces the current one. In the default authentication mode, omitting credentials
+allows unauthenticated connections, served one at a time.
 
 ## Configuration
 
@@ -107,11 +108,19 @@ fps = 30
 CLI arguments override the config file. Use `password_file` instead of `password`
 to read a password from a file, or `--password-file` on the command line.
 
+To use the desktop user's Linux password, set `auth_mode = "pam"` and remove
+`username`, `password`, and `password_file`. Install the appropriate
+[PAM service](pkg/pam/) as `/etc/pam.d/hypr-rdp` (included in Arch packages).
+PAM requires a TLS-capable client (FreeRDP: `/sec:tls`, without NLA) and allows
+only the user running the existing desktop, one connection at a time.
+
 Common settings are listed below. Config keys use underscores in place of hyphens.
 Run `hypr-rdp --help` for all options.
 
 | Option | Values / purpose | Default |
 | --- | --- | --- |
+| `--auth-mode` | `configured` credentials or Linux `pam` | `configured` |
+| `--pam-service` | PAM service name | `hypr-rdp` |
 | `--capture-mode` | `wlr` or `ext` capture protocol | `wlr` |
 | `--egfx-codec` | `avc420`, experimental `avc444`, or `auto` | `avc420` |
 | `--h264-backend` | `auto`, `software`, or `vaapi` | `auto` |
