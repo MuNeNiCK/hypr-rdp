@@ -1,4 +1,7 @@
 //! Same-UID PAM authentication, isolated from the server's async runtime.
+//!
+//! Validation diagnostics emit only fixed static reasons; credentials,
+//! usernames, domains, and secret lengths are never logged.
 use std::ffi::{CStr, CString};
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -44,6 +47,20 @@ fn valid_credentials(username: &str, password: &str) -> bool {
         && !password.is_empty()
         && password.len() <= 4096
         && !password.contains('\0')
+}
+
+// Deterministic validator-entry reason for rejecting a presented credential
+// set. None means the set passes the syntactic checks and proceeds to PAM.
+fn credential_rejection_reason(username: &str, password: &str) -> Option<&'static str> {
+    if username.is_empty() {
+        Some("missing username")
+    } else if password.is_empty() {
+        Some("missing password")
+    } else if valid_credentials(username, password) {
+        None
+    } else {
+        Some("invalid credentials")
+    }
 }
 
 fn service_exists(service: &str) -> bool {
@@ -202,10 +219,14 @@ impl CredentialValidator for PamValidator {
         &self,
         credentials: &Credentials,
     ) -> std::result::Result<CredentialDecision, CredentialValidationError> {
-        if !valid_credentials(&credentials.username, &credentials.password) {
+        if let Some(reason) =
+            credential_rejection_reason(&credentials.username, &credentials.password)
+        {
+            tracing::warn!(reason, "PAM credentials rejected at validator entry");
             return Ok(CredentialDecision::Reject);
         }
         let Ok(_slot) = self.slots.try_acquire() else {
+            tracing::warn!(reason = "PAM validation busy", "PAM credentials rejected");
             return Ok(CredentialDecision::Reject);
         };
         let request = Request {
@@ -214,20 +235,42 @@ impl CredentialValidator for PamValidator {
             password: credentials.password.clone(),
         };
         // Domain does not select a separate provider: PAM resolves a Linux name.
-        let payload = serde_json::to_vec(&request).map_err(CredentialValidationError::new)?;
+        let payload = serde_json::to_vec(&request).map_err(|error| {
+            tracing::warn!(reason = "PAM helper failure", "PAM credentials rejected");
+            CredentialValidationError::new(error)
+        })?;
         let status = run_helper(&self.executable, &[HELPER_ARG], &payload, AUTH_TIMEOUT)
             .await
             .map_err(|_| {
+                tracing::warn!(
+                    reason = "PAM helper failure or timeout",
+                    "PAM credentials rejected"
+                );
                 CredentialValidationError::new(std::io::Error::other(
                     "PAM helper failed or timed out",
                 ))
             })?;
         match status.code() {
-            Some(0) => Ok(CredentialDecision::Accept),
-            Some(1) => Ok(CredentialDecision::Reject),
-            _ => Err(CredentialValidationError::new(std::io::Error::other(
-                "PAM backend unavailable",
-            ))),
+            Some(0) => {
+                tracing::info!("PAM credentials accepted");
+                Ok(CredentialDecision::Accept)
+            }
+            Some(1) => {
+                tracing::warn!(
+                    reason = "authentication or account policy rejected",
+                    "PAM credentials rejected"
+                );
+                Ok(CredentialDecision::Reject)
+            }
+            _ => {
+                tracing::warn!(
+                    reason = "PAM backend unavailable",
+                    "PAM credentials rejected"
+                );
+                Err(CredentialValidationError::new(std::io::Error::other(
+                    "PAM backend unavailable",
+                )))
+            }
         }
     }
 }
@@ -307,6 +350,39 @@ mod tests {
         assert!(!valid_credentials(&"a".repeat(257), "secret"));
         assert!(!valid_credentials("alice", &"x".repeat(4097)));
         assert!(valid_credentials("alice", "a password with spaces"));
+    }
+
+    #[test]
+    fn pam_credential_rejection_reasons_are_deterministic() {
+        assert_eq!(
+            credential_rejection_reason("", "secret"),
+            Some("missing username")
+        );
+        assert_eq!(
+            credential_rejection_reason("", ""),
+            Some("missing username")
+        );
+        assert_eq!(
+            credential_rejection_reason("alice", ""),
+            Some("missing password")
+        );
+        assert_eq!(
+            credential_rejection_reason("a\0b", "secret"),
+            Some("invalid credentials")
+        );
+        assert_eq!(
+            credential_rejection_reason("alice", "s\0s"),
+            Some("invalid credentials")
+        );
+        assert_eq!(
+            credential_rejection_reason(&"a".repeat(257), "secret"),
+            Some("invalid credentials")
+        );
+        assert_eq!(
+            credential_rejection_reason("alice", &"x".repeat(4097)),
+            Some("invalid credentials")
+        );
+        assert_eq!(credential_rejection_reason("alice", "secret"), None);
     }
 
     proptest! {

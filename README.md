@@ -113,6 +113,8 @@ To use the desktop user's Linux password, set `auth_mode = "pam"` and remove
 [PAM service](pkg/pam/) as `/etc/pam.d/hypr-rdp` (included in Arch packages).
 PAM requires a TLS-capable client (FreeRDP: `/sec:tls`, without NLA) and allows
 only the user running the existing desktop, one connection at a time.
+If no password prompt appears, use `mstsc your-connection.rdp /prompt`
+(FreeRDP: `/from-stdin:force`).
 
 Common settings are listed below. Config keys use underscores in place of hyphens.
 Run `hypr-rdp --help` for all options.
