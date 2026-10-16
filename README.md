@@ -114,13 +114,32 @@ To use the desktop user's Linux password, set `auth_mode = "pam"` and remove
 PAM requires a TLS-capable client (FreeRDP: `/sec:tls`, without NLA) and allows
 only the user running the existing desktop, one connection at a time.
 
+To log in with an SSH key instead, set `auth_mode = "ssh"` and remove `username`,
+`password`, and `password_file`. The server keeps no secret: it accepts an Ed25519
+signature made by a key listed in the desktop user's `~/.ssh/authorized_keys`
+(`authorized_keys` / `--authorized-keys` names another file). The client signs
+`hypr-rdp:<user>:<unix minute>` and sends the raw signature as the password:
+
+```sh
+user=$USER; minute=$(( $(date +%s) / 60 ))
+password=$(printf '%s' "hypr-rdp:$user:$minute" \
+  | ssh-keygen -Y sign -f ~/.ssh/id_ed25519 -n hypr-rdp \
+  | sed '1d;$d' | base64 -d | tail -c 64 | base64 -w0)
+xfreerdp /v:host /sec:tls /u:"$user" /p:"$password"
+```
+
+A signature is valid for the current minute and one either side, and logs in once.
+Like PAM, SSH keys require a TLS-capable client (`/sec:tls`, without NLA) and allow
+only the user running the existing desktop.
+
 Common settings are listed below. Config keys use underscores in place of hyphens.
 Run `hypr-rdp --help` for all options.
 
 | Option | Values / purpose | Default |
 | --- | --- | --- |
-| `--auth-mode` | `configured` credentials or Linux `pam` | `configured` |
+| `--auth-mode` | `configured` credentials, Linux `pam`, or `ssh` keys | `configured` |
 | `--pam-service` | PAM service name | `hypr-rdp` |
+| `--authorized-keys` | Public keys for `--auth-mode ssh` | `~/.ssh/authorized_keys` |
 | `--capture-mode` | `wlr` or `ext` capture protocol | `wlr` |
 | `--egfx-codec` | `avc420`, experimental `avc444`, or `auto` | `avc420` |
 | `--h264-backend` | `auto`, `software`, or `vaapi` | `auto` |
