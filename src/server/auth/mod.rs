@@ -1,5 +1,6 @@
 //! Authentication policy for access to the existing desktop.
 mod pam;
+mod ssh;
 
 use crate::config::{AuthConfig, ConfigCredentials};
 use ironrdp_server::{CredentialValidator, Credentials};
@@ -26,6 +27,15 @@ impl PreparedAuthentication {
             }
             AuthConfig::Pam { service } => {
                 let validator = pam::PamValidator::new(service)?;
+                Ok(Self {
+                    security: ServerSecurityMode::Tls,
+                    credentials: None,
+                    validator: Some(Arc::new(validator)),
+                })
+            }
+            AuthConfig::Ssh { authorized_keys } => {
+                // Signatures must reach the validator in clear text, so TLS, never NLA.
+                let validator = ssh::SshKeyValidator::new(authorized_keys)?;
                 Ok(Self {
                     security: ServerSecurityMode::Tls,
                     credentials: None,

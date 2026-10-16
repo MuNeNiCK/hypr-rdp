@@ -83,13 +83,17 @@ struct Args {
     #[arg(long)]
     key: Option<String>,
 
-    /// Authentication mode: configured credentials or Linux PAM
+    /// Authentication mode: configured credentials, Linux PAM or SSH keys
     #[arg(long)]
     auth_mode: Option<String>,
 
     /// PAM service name (only with --auth-mode pam)
     #[arg(long)]
     pam_service: Option<String>,
+
+    /// authorized_keys file for --auth-mode ssh (default: ~/.ssh/authorized_keys)
+    #[arg(long)]
+    authorized_keys: Option<String>,
 
     /// Username for RDP authentication
     #[arg(short, long)]
@@ -188,6 +192,7 @@ struct Args {
 struct ConfigFile {
     auth_mode: Option<String>,
     pam_service: Option<String>,
+    authorized_keys: Option<String>,
     bind: Option<String>,
     cert: Option<String>,
     key: Option<String>,
@@ -289,6 +294,7 @@ pub struct RuntimeConfig {
 pub(crate) enum AuthConfig {
     Configured(Option<ConfigCredentials>),
     Pam { service: String },
+    Ssh { authorized_keys: Option<PathBuf> },
 }
 
 fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::Result<AuthConfig> {
@@ -298,6 +304,15 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
         .or(config.auth_mode.take())
         .unwrap_or_else(|| "configured".into());
     let service = args.pam_service.take().or(config.pam_service.take());
+    let authorized_keys = args
+        .authorized_keys
+        .take()
+        .or(config.authorized_keys.take())
+        .map(PathBuf::from);
+    anyhow::ensure!(
+        authorized_keys.is_none() || mode == "ssh",
+        "authorized-keys requires auth-mode ssh"
+    );
     match mode.as_str() {
         "configured" => {
             anyhow::ensure!(service.is_none(), "pam-service requires auth-mode pam");
@@ -333,7 +348,20 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
             );
             Ok(AuthConfig::Pam { service })
         }
-        _ => anyhow::bail!("unknown auth-mode; expected configured or pam"),
+        "ssh" => {
+            anyhow::ensure!(service.is_none(), "pam-service requires auth-mode pam");
+            anyhow::ensure!(
+                args.username.is_none()
+                    && config.username.is_none()
+                    && args.password.is_none()
+                    && config.password.is_none()
+                    && args.password_file.is_none()
+                    && config.password_file.is_none(),
+                "auth-mode ssh cannot be combined with username, password or password-file"
+            );
+            Ok(AuthConfig::Ssh { authorized_keys })
+        }
+        _ => anyhow::bail!("unknown auth-mode; expected configured, pam or ssh"),
     }
 }
 
@@ -405,7 +433,7 @@ impl RuntimeConfig {
 
         let warnings = match &authentication {
             AuthConfig::Configured(credentials) => startup_warnings(credentials.as_ref(), bind),
-            AuthConfig::Pam { .. } => Vec::new(),
+            AuthConfig::Pam { .. } | AuthConfig::Ssh { .. } => Vec::new(),
         };
         for warning in warnings {
             match warning {
@@ -1441,6 +1469,47 @@ mod pam_config_tests {
                 "pam",
                 "--pam-service",
                 "../login",
+            ],
+        ] {
+            assert!(resolve(&cli, "").is_err(), "{cli:?}");
+        }
+    }
+
+    #[test]
+    fn ssh_mode_takes_an_optional_key_file_and_no_credentials() {
+        assert_eq!(
+            resolve(&["hypr-rdp", "--auth-mode", "ssh"], "").unwrap(),
+            AuthConfig::Ssh {
+                authorized_keys: None
+            }
+        );
+        assert_eq!(
+            resolve(
+                &["hypr-rdp"],
+                "auth_mode = 'ssh'\nauthorized_keys = '/etc/keys'"
+            )
+            .unwrap(),
+            AuthConfig::Ssh {
+                authorized_keys: Some(PathBuf::from("/etc/keys"))
+            }
+        );
+        for cli in [
+            vec!["hypr-rdp", "--auth-mode", "ssh", "-u", "alice"],
+            vec!["hypr-rdp", "--auth-mode", "ssh", "-p", "secret"],
+            vec![
+                "hypr-rdp",
+                "--auth-mode",
+                "ssh",
+                "--pam-service",
+                "hypr-rdp",
+            ],
+            vec!["hypr-rdp", "--authorized-keys", "/etc/keys"],
+            vec![
+                "hypr-rdp",
+                "--auth-mode",
+                "pam",
+                "--authorized-keys",
+                "/etc/keys",
             ],
         ] {
             assert!(resolve(&cli, "").is_err(), "{cli:?}");

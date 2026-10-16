@@ -57,6 +57,11 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem
 # Clipboard image support (DIB/PNG conversion)
 ironrdp-cliprdr-format = { git = "https://github.com/Devolutions/IronRDP.git", rev = "5198cde0f73485f3fbd999ea7c49293c86b80387" }
 
+# SSH-key authentication (--auth-mode ssh); already in the tree through IronRDP.
+ed25519-dalek = "3.0.0-rc.1"
+sha2 = "0.11"
+base64 = "0.22"
+
 # Config file
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
