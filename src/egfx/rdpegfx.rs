@@ -1,4 +1,5 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use ironrdp_dvc::DvcMessage;
 use ironrdp_egfx::pdu::{Avc420Region, Encoding};
@@ -6,6 +7,7 @@ use ironrdp_egfx::server::GraphicsPipelineServer;
 use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
+use super::output_queue::EgfxOutputLease;
 use super::{avc420, Avc444FrameEncoding, EgfxFrameReadiness, EgfxShared};
 use super::{EncodedEgfxFrame, EncodedFrameState};
 
@@ -175,6 +177,9 @@ impl EgfxShared {
             surface.width == width && surface.height == height,
             "ClearCodec surface size mismatch"
         );
+        let Some(lease) = self.output_queue.try_reserve() else {
+            return Ok(None);
+        };
         let encoded = state.encode(&input)?;
         let bytes = encoded.iter().map(|rect| rect.data.len()).sum();
         let tiles = encoded
@@ -192,7 +197,7 @@ impl EgfxShared {
             channel_id,
             dvc_messages: server.drain_output(),
         };
-        if !Self::send_rdpegfx_dvc_messages(sender, queued, "ClearCodec", "clearcodec") {
+        if !Self::send_rdpegfx_dvc_messages(sender, queued, lease, "ClearCodec", "clearcodec") {
             anyhow::bail!("ClearCodec transport closed after encode");
         }
         // Keep the server lock until local accounting exists, so an ACK callback
@@ -381,6 +386,9 @@ impl EgfxShared {
             };
         }
 
+        if let Some(readiness) = self.output_queue_readiness() {
+            return readiness;
+        }
         Self::transport_frame_readiness(handle)
     }
 
@@ -501,6 +509,9 @@ impl EgfxShared {
             tracing::trace!("queue_avc420_rdpegfx_frame: no regions");
             return false;
         }
+        let Some(lease) = self.output_queue.try_reserve() else {
+            return false;
+        };
 
         let Some(queued) =
             Self::queue_avc420_rdpegfx_frame(handle, surface_id, h264_data, regions, timestamp_ms)
@@ -509,7 +520,8 @@ impl EgfxShared {
         };
 
         let frame_id = queued.frame_id;
-        if Self::send_rdpegfx_dvc_messages(sender, queued, "AVC420", "avc420_rdpegfx_frame") {
+        if Self::send_rdpegfx_dvc_messages(sender, queued, lease, "AVC420", "avc420_rdpegfx_frame")
+        {
             self.record_frame_queued(frame_id);
             true
         } else {
@@ -543,6 +555,9 @@ impl EgfxShared {
         else {
             return false;
         };
+        let Some(lease) = self.output_queue.try_reserve() else {
+            return false;
+        };
 
         let Some(queued) = Self::queue_avc444_rdpegfx_frame(
             handle,
@@ -558,7 +573,8 @@ impl EgfxShared {
         };
 
         let frame_id = queued.frame_id;
-        if Self::send_rdpegfx_dvc_messages(sender, queued, "AVC444", "avc444_rdpegfx_frame") {
+        if Self::send_rdpegfx_dvc_messages(sender, queued, lease, "AVC444", "avc444_rdpegfx_frame")
+        {
             self.record_frame_queued(frame_id);
             true
         } else {
@@ -666,6 +682,7 @@ impl EgfxShared {
     pub(in crate::egfx) fn send_rdpegfx_dvc_messages(
         sender: &mpsc::UnboundedSender<ServerEvent>,
         queued: QueuedRdpegfxFrame,
+        lease: Arc<EgfxOutputLease>,
         codec_name: &'static str,
         trace_name: &'static str,
     ) -> bool {
@@ -673,7 +690,9 @@ impl EgfxShared {
             queued.channel_id,
             queued.dvc_messages,
             ironrdp_svc::ChannelFlags::SHOW_PROTOCOL,
-        ) {
+        )
+        .and_then(|messages| lease.retain_messages(messages))
+        {
             Ok(svc_messages) => {
                 if sender
                     .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {

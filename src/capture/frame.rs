@@ -62,6 +62,7 @@ pub(super) struct FrameStats {
     skipped_encoder: u32,
     skipped_backpressure: u32,
     skipped_local_backpressure: u32,
+    skipped_output_backpressure: u32,
     skipped_transport_unavailable: u32,
     skipped_transport_not_ready: u32,
     skipped_transport_no_channel: u32,
@@ -133,6 +134,7 @@ impl FrameStats {
             skipped_encoder: 0,
             skipped_backpressure: 0,
             skipped_local_backpressure: 0,
+            skipped_output_backpressure: 0,
             skipped_transport_unavailable: 0,
             skipped_transport_not_ready: 0,
             skipped_transport_no_channel: 0,
@@ -223,6 +225,10 @@ impl FrameStats {
         self.skipped_backpressure = self.skipped_backpressure.saturating_add(1);
         match readiness {
             EgfxFrameReadiness::Ready => {}
+            EgfxFrameReadiness::OutputBackpressure { .. } => {
+                self.skipped_output_backpressure =
+                    self.skipped_output_backpressure.saturating_add(1);
+            }
             EgfxFrameReadiness::LocalBackpressure { .. } => {
                 self.skipped_local_backpressure = self.skipped_local_backpressure.saturating_add(1);
             }
@@ -315,6 +321,7 @@ impl FrameStats {
                 skipped_encoder = self.skipped_encoder,
                 skipped_backpressure = self.skipped_backpressure,
                 skipped_local_backpressure = self.skipped_local_backpressure,
+                skipped_output_backpressure = self.skipped_output_backpressure,
                 skipped_transport_unavailable = self.skipped_transport_unavailable,
                 skipped_transport_not_ready = self.skipped_transport_not_ready,
                 skipped_transport_no_channel = self.skipped_transport_no_channel,
@@ -1262,10 +1269,17 @@ mod tests {
             64,
             64,
         );
+        stats.record_send_unavailable(
+            EgfxFrameReadiness::OutputBackpressure { queued: 3, max: 3 },
+            local_flow,
+            64,
+            64,
+        );
 
-        assert_eq!(stats.skipped_backpressure, 2);
+        assert_eq!(stats.skipped_backpressure, 3);
         assert_eq!(stats.skipped_transport_backpressure, 1);
         assert_eq!(stats.skipped_local_backpressure, 1);
+        assert_eq!(stats.skipped_output_backpressure, 1);
         assert_eq!(stats.last_frame_id, 11);
         assert_eq!(stats.last_acked_frame_id, 8);
         assert_eq!(stats.frames_in_flight, 3);
@@ -2591,6 +2605,100 @@ mod tests {
             .expect("AVC444 reference committed after backpressure recovery")
             .to_vec();
         assert_ne!(committed_after_recovery, committed_before);
+        assert!(display_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_refresh_waits_for_output_queue_without_advancing_reference() {
+        let (width, height, stride) = (64, 64, 256);
+        let mut session = tracked_avc444_session(width as u16, height as u16, 3);
+        let shared = Arc::clone(&session.shared);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new_with_h264_backend(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Cqp,
+            30,
+            H264BackendPolicy::Software,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&first, &display_tx));
+        let initial = drain_gfx_pdus(&mut session.event_rx);
+        ack_frame(
+            &mut session.bridge,
+            initial.frame_id(),
+            ironrdp_egfx::pdu::QueueDepth::Suspend,
+        );
+
+        for value in [32, 96, 160] {
+            let frame = solid_bgra_frame(width, height, stride, value, value, value);
+            shared.request_full_frame();
+            processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+            assert!(processor.process(&frame, &display_tx));
+            assert!(!shared.full_frame_requested());
+        }
+        assert_eq!(session.event_rx.len(), 3);
+        let before = processor
+            .h264_encoder
+            .as_ref()
+            .unwrap()
+            .avc444_luma_reference_y_for_test()
+            .unwrap()
+            .to_vec();
+        let idr_requests = processor
+            .h264_encoder
+            .as_ref()
+            .unwrap()
+            .force_idr_requests_for_test();
+        let queued = shared.frame_flow_snapshot().total_queued_frames;
+        let pending = solid_bgra_frame(width, height, stride, 240, 240, 240);
+        shared.request_full_frame();
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&pending, &display_tx));
+        assert_eq!(processor.stats.skipped_output_backpressure, 1);
+        assert!(processor.has_pending_damage());
+        assert!(shared.full_frame_requested());
+        assert_eq!(shared.frame_flow_snapshot().total_queued_frames, queued);
+        assert_eq!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .unwrap()
+                .force_idr_requests_for_test(),
+            idr_requests
+        );
+        assert_eq!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .unwrap()
+                .avc444_luma_reference_y_for_test()
+                .unwrap(),
+            before
+        );
+
+        // The transport consumes the queued messages; the client sends no ACK.
+        drain_gfx_pdus(&mut session.event_rx);
+        assert!(processor.process(&pending, &display_tx));
+        assert!(!processor.has_pending_damage());
+        assert!(!shared.full_frame_requested());
+        assert_ne!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .unwrap()
+                .avc444_luma_reference_y_for_test()
+                .unwrap(),
+            before
+        );
+        drain_gfx_pdus(&mut session.event_rx)
+            .assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         assert!(display_rx.try_recv().is_err());
     }
 

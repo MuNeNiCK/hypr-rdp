@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ironrdp_server::{GfxServerHandle, ServerEvent};
@@ -33,6 +33,10 @@ pub(in crate::egfx) fn avc444_disabled_by_env() -> bool {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum EgfxFrameReadiness {
     Ready,
+    OutputBackpressure {
+        queued: u32,
+        max: u32,
+    },
     LocalBackpressure {
         in_flight: u32,
         max: u32,
@@ -68,6 +72,7 @@ impl EgfxFrameReadiness {
     pub(crate) fn reason(self) -> &'static str {
         match self {
             Self::Ready => "ready",
+            Self::OutputBackpressure { .. } => "output_backpressure",
             Self::LocalBackpressure { .. } => "local_backpressure",
             Self::TransportUnavailable => "transport_unavailable",
             Self::TransportNotReady => "transport_not_ready",
@@ -79,6 +84,8 @@ impl EgfxFrameReadiness {
 
 /// Shared EGFX state accessible from factory, handler, and capture thread.
 pub struct EgfxShared {
+    // Keep charges for queued payloads across capability and client resets.
+    pub(in crate::egfx) output_queue: Arc<super::output_queue::EgfxOutputQueue>,
     pub(in crate::egfx) clearcodec: Mutex<super::clearcodec::ClearCodecState>,
     /// The GFX server handle (set once during build_server_with_handle)
     pub(in crate::egfx) handle: Mutex<Option<GfxServerHandle>>,
@@ -119,6 +126,7 @@ pub struct EgfxShared {
 impl EgfxShared {
     pub fn with_codec_policy(max_frames_in_flight: u32, codec_policy: EgfxCodecPolicy) -> Self {
         Self {
+            output_queue: Arc::new(Default::default()),
             handle: Mutex::new(None),
             ready: AtomicBool::new(false),
             avc_enabled: AtomicBool::new(false),
@@ -281,7 +289,9 @@ impl EgfxShared {
     pub(crate) fn full_frame_refresh_readiness(&self) -> EgfxFrameReadiness {
         let in_flight = self.frames_in_flight();
         if self.frame_ack_suspended() || in_flight == 0 {
-            return EgfxFrameReadiness::Ready;
+            return self
+                .output_queue_readiness()
+                .unwrap_or(EgfxFrameReadiness::Ready);
         }
 
         EgfxFrameReadiness::LocalBackpressure {
@@ -290,6 +300,12 @@ impl EgfxShared {
             client_queue_depth: self.client_queue_depth(),
             ack_suspended: false,
         }
+    }
+
+    pub(in crate::egfx) fn output_queue_readiness(&self) -> Option<EgfxFrameReadiness> {
+        let queued = self.output_queue.pending();
+        let max = super::output_queue::MAX_QUEUED_OUTPUT_FRAMES;
+        (queued >= max).then_some(EgfxFrameReadiness::OutputBackpressure { queued, max })
     }
 
     pub(in crate::egfx) fn record_frame_queued(&self, frame_id: u32) {
