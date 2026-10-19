@@ -18,11 +18,21 @@ impl EgfxOutputQueue {
     }
 
     pub(in crate::egfx) fn try_reserve(self: &Arc<Self>) -> Option<Arc<EgfxOutputLease>> {
-        self.pending
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-                (pending < MAX_QUEUED_OUTPUT_FRAMES).then_some(pending + 1)
-            })
-            .ok()?;
+        let mut pending = self.pending();
+        loop {
+            if pending >= MAX_QUEUED_OUTPUT_FRAMES {
+                return None;
+            }
+            match self.pending.compare_exchange_weak(
+                pending,
+                pending + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => pending = current,
+            }
+        }
         Some(Arc::new(EgfxOutputLease {
             queue: Arc::clone(self),
         }))
