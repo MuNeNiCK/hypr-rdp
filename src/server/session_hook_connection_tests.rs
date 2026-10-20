@@ -100,6 +100,7 @@ impl HookServer {
         let authentication = PreparedAuthentication::new(crate::config::AuthConfig::Configured(
             Some(crate::config::ConfigCredentials {
                 username: USER.into(),
+                domain: None,
                 password: PASSWORD.into(),
             }),
         ))

@@ -108,8 +108,27 @@ fps = 30
 CLI arguments override the config file. Use `password_file` instead of `password`
 to read a password from a file, or `--password-file` on the command line.
 
+### NTLM domain for Windows clients
+
+When connecting from Windows Remote Desktop (`mstsc.exe`) on a workgroup machine,
+mstsc unconditionally puts the client's hostname into the NTLM Type-3 `DomainName`
+field — no `.\user` or `\user` prefix, nor saved `.rdp` with `domain:s:`, overrides
+this. NTLMv2 HMAC requires an exact domain match, so authentication fails with
+`LogonDenied: "no candidate credential matched"` unless hypr-rdp is told the same
+domain. Set `domain = "<client-hostname>"` (uppercase as Windows sends it):
+
+```toml
+username = "user"
+domain = "MYPC"
+password = "pass"
+```
+
+FreeRDP clients can pass `/d:` explicitly instead, so they don't need this.
+
+### PAM
+
 To use the desktop user's Linux password, set `auth_mode = "pam"` and remove
-`username`, `password`, and `password_file`. Install the appropriate
+`username`, `domain`, `password`, and `password_file`. Install the appropriate
 [PAM service](pkg/pam/) as `/etc/pam.d/hypr-rdp` (included in Arch packages).
 PAM requires a TLS-capable client (FreeRDP: `/sec:tls`, without NLA) and allows
 only the user running the existing desktop, one connection at a time.

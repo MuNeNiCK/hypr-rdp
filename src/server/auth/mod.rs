@@ -40,7 +40,7 @@ pub(super) fn ironrdp_credentials(credentials: Option<ConfigCredentials>) -> Opt
     credentials.map(|credentials| Credentials {
         username: credentials.username,
         password: credentials.password,
-        domain: None,
+        domain: credentials.domain,
     })
 }
 
@@ -82,6 +82,7 @@ mod tests {
         assert!(none.validator.is_none());
         let fixed = PreparedAuthentication::new(AuthConfig::Configured(Some(ConfigCredentials {
             username: "user".into(),
+            domain: None,
             password: "secret".into(),
         })))
         .unwrap();

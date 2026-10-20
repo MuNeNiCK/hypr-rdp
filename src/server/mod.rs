@@ -343,6 +343,7 @@ mod tests {
         for (username, password) in [("user", "pass"), ("user", ""), ("", "pass")] {
             let credentials = ironrdp_credentials(Some(ConfigCredentials {
                 username: username.into(),
+                domain: None,
                 password: password.into(),
             }));
             assert_eq!(
@@ -358,6 +359,19 @@ mod tests {
     }
 
     #[test]
+    fn configured_domain_is_passed_through_to_ironrdp() {
+        let credentials = ironrdp_credentials(Some(ConfigCredentials {
+            username: "user".into(),
+            domain: Some("WORKGROUP".into()),
+            password: "pass".into(),
+        }))
+        .expect("configured credentials");
+        assert_eq!(credentials.username, "user");
+        assert_eq!(credentials.password, "pass");
+        assert_eq!(credentials.domain.as_deref(), Some("WORKGROUP"));
+    }
+
+    #[test]
     fn replacement_requires_nla_credentials() {
         assert_eq!(
             security_mode_for_credentials(&None).connection_policy(),
@@ -365,6 +379,7 @@ mod tests {
         );
         let credentials = ironrdp_credentials(Some(ConfigCredentials {
             username: "user".into(),
+            domain: None,
             password: "pass".into(),
         }));
         assert_eq!(
@@ -426,6 +441,7 @@ mod tests {
             if mode == ServerSecurityMode::Hybrid {
                 server.set_credentials(ironrdp_credentials(Some(ConfigCredentials {
                     username: "test".into(),
+                    domain: None,
                     password: "test".into(),
                 })));
             }

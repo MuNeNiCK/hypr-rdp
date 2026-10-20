@@ -95,6 +95,13 @@ struct Args {
     #[arg(short, long)]
     username: Option<String>,
 
+    /// NTLM domain for RDP authentication. Set this to the client machine's
+    /// name (as sent in the NTLM Type-3 DomainName field) when connecting
+    /// from Windows mstsc — on workgroup clients mstsc always stuffs the
+    /// local hostname there, and NTLMv2 HMAC requires an exact match.
+    #[arg(short, long)]
+    domain: Option<String>,
+
     /// Password for RDP authentication
     #[arg(short, long, conflicts_with = "password_file")]
     password: Option<String>,
@@ -193,6 +200,7 @@ struct ConfigFile {
     cert: Option<String>,
     key: Option<String>,
     username: Option<String>,
+    domain: Option<String>,
     password: Option<String>,
     password_file: Option<String>,
     resolution: Option<String>,
@@ -307,6 +315,7 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
                 .take()
                 .or(config.username.take())
                 .unwrap_or_default();
+            let domain = args.domain.take().or(config.domain.take());
             let password = resolve_password(
                 args.password.take(),
                 args.password_file.take(),
@@ -314,18 +323,20 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
                 config.password_file.take(),
             )?;
             Ok(AuthConfig::Configured(ConfigCredentials::from_parts(
-                username, password,
+                username, domain, password,
             )))
         }
         "pam" => {
             anyhow::ensure!(
                 args.username.is_none()
                     && config.username.is_none()
+                    && args.domain.is_none()
+                    && config.domain.is_none()
                     && args.password.is_none()
                     && config.password.is_none()
                     && args.password_file.is_none()
                     && config.password_file.is_none(),
-                "auth-mode pam cannot be combined with username, password or password-file"
+                "auth-mode pam cannot be combined with username, domain, password or password-file"
             );
             let service = service.unwrap_or_else(|| "hypr-rdp".into());
             anyhow::ensure!(
@@ -341,15 +352,20 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ConfigCredentials {
     pub username: String,
+    pub domain: Option<String>,
     pub password: String,
 }
 
 impl ConfigCredentials {
-    fn from_parts(username: String, password: String) -> Option<Self> {
+    fn from_parts(username: String, domain: Option<String>, password: String) -> Option<Self> {
         if username.is_empty() && password.is_empty() {
             None
         } else {
-            Some(Self { username, password })
+            Some(Self {
+                username,
+                domain: domain.filter(|d| !d.is_empty()),
+                password,
+            })
         }
     }
 }
@@ -766,20 +782,37 @@ mod tests {
     }
 
     fn warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
-        let credentials = ConfigCredentials::from_parts(username.to_owned(), password.to_owned());
+        let credentials =
+            ConfigCredentials::from_parts(username.to_owned(), None, password.to_owned());
         startup_warnings(credentials.as_ref(), parse_bind_addr(bind).unwrap())
     }
 
     #[test]
     fn credential_classification_preserves_every_configured_shape() {
-        assert!(ConfigCredentials::from_parts(String::new(), String::new()).is_none());
+        assert!(ConfigCredentials::from_parts(String::new(), None, String::new()).is_none());
 
         for (username, password) in [("user", "secret"), ("user", ""), ("", "secret")] {
             let credentials =
-                ConfigCredentials::from_parts(username.to_owned(), password.to_owned()).unwrap();
+                ConfigCredentials::from_parts(username.to_owned(), None, password.to_owned())
+                    .unwrap();
             assert_eq!(credentials.username, username);
             assert_eq!(credentials.password, password);
+            assert_eq!(credentials.domain, None);
         }
+    }
+
+    #[test]
+    fn configured_domain_round_trips_through_from_parts() {
+        let credentials =
+            ConfigCredentials::from_parts("user".into(), Some("WORKGROUP".into()), "pass".into())
+                .unwrap();
+        assert_eq!(credentials.domain.as_deref(), Some("WORKGROUP"));
+        // Empty-string domain is normalized to None so the deserializer sees
+        // `domain = ""` the same as the field being absent.
+        let credentials =
+            ConfigCredentials::from_parts("user".into(), Some(String::new()), "pass".into())
+                .unwrap();
+        assert_eq!(credentials.domain, None);
     }
 
     #[test]
@@ -1485,7 +1518,8 @@ mod pam_config_tests {
             actual,
             AuthConfig::Configured(Some(ConfigCredentials {
                 username: "alice".into(),
-                password: "cli".into()
+                domain: None,
+                password: "cli".into(),
             }))
         );
     }
