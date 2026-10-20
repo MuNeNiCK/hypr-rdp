@@ -243,15 +243,30 @@ impl VppConverter {
             "vaExportSurfaceHandle (VPP NV12 output)",
         )?;
 
-        if desc.num_layers == 0 || desc.num_objects == 0 {
-            bail!("vaExportSurfaceHandle returned empty descriptor");
-        }
-
-        let raw_fd = desc.objects[0].fd;
-        if raw_fd < 0 {
-            bail!("vaExportSurfaceHandle returned invalid fd");
-        }
-        let owned = unsafe { OwnedFd::from_raw_fd(raw_fd) };
+        // Every exported object FD belongs to the caller, including on a
+        // layout we cannot import. Adopt them before validating the descriptor.
+        let mut exported_fds: Vec<OwnedFd> = desc
+            .objects
+            .iter()
+            .take(desc.num_objects as usize)
+            .filter(|object| object.fd >= 0)
+            .map(|object| {
+                // SAFETY: a successful export transfers each distinct object FD.
+                unsafe { OwnedFd::from_raw_fd(object.fd) }
+            })
+            .collect();
+        anyhow::ensure!(
+            desc.num_layers != 0 && desc.num_objects != 0,
+            "vaExportSurfaceHandle returned empty descriptor"
+        );
+        anyhow::ensure!(
+            desc.num_objects == 1,
+            "VPP encoder import requires a single DMA-BUF object, got {}",
+            desc.num_objects
+        );
+        let owned = exported_fds
+            .pop()
+            .context("vaExportSurfaceHandle returned invalid fd")?;
         let fd = owned.as_raw_fd();
         self.nv12_export_fd = Some(owned);
 
@@ -351,11 +366,12 @@ impl VppConverter {
 impl Drop for VppConverter {
     fn drop(&mut self) {
         unsafe {
+            // libva requires all contexts using a surface to be destroyed first.
+            va::vaDestroyContext(self.va_display.raw(), self.context_id);
             for surface_id in &mut self.input_surfaces {
                 va::vaDestroySurfaces(self.va_display.raw(), surface_id, 1);
             }
             va::vaDestroySurfaces(self.va_display.raw(), &mut self.output_surface, 1);
-            va::vaDestroyContext(self.va_display.raw(), self.context_id);
             va::vaDestroyConfig(self.va_display.raw(), self.config_id);
         }
     }

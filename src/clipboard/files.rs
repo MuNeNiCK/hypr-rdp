@@ -31,6 +31,9 @@ const SIZE_RESPONSE_BYTES: u32 = 8;
 /// here — they wait in a single latest-wins slot — so this depth is entirely the
 /// client's read backlog.
 const READ_QUEUE_DEPTH: usize = 64;
+/// Match the protocol owner's incoming lock limit; never evict a live snapshot
+/// and then resolve its ID against a newer selection.
+const MAX_LOCKED_SELECTIONS: usize = 100;
 
 /// How long teardown waits for the worker before abandoning it.
 ///
@@ -50,22 +53,106 @@ pub(super) struct FrozenFile {
     pub(super) descriptor: FileDescriptor,
 }
 
-#[derive(Default)]
 pub(super) struct FrozenSelection {
     generation: u64,
     stream_enabled: bool,
     huge_files: bool,
-    pub(super) entries: Option<Vec<FrozenFile>>,
+    pub(super) entries: Option<Arc<Vec<FrozenFile>>>,
+    lock_enabled: bool,
+    /// One latest announcement plus a counter; no snapshot queue grows while
+    /// the protocol task or peer is stalled. None means counter overflow.
+    pending_announcements: Option<u64>,
+    announced: Option<Arc<Vec<FrozenFile>>>,
+    confirmed: Option<Arc<Vec<FrozenFile>>>,
+    locked: HashMap<u32, Arc<Vec<FrozenFile>>>,
+}
+
+impl Default for FrozenSelection {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            stream_enabled: false,
+            huge_files: false,
+            entries: None,
+            lock_enabled: false,
+            pending_announcements: Some(0),
+            announced: None,
+            confirmed: None,
+            locked: HashMap::new(),
+        }
+    }
+}
+
+impl FrozenSelection {
+    fn announce(&mut self, files: bool) {
+        self.pending_announcements = self.pending_announcements.and_then(|n| n.checked_add(1));
+        self.confirmed = None;
+        self.announced = if files { self.entries.clone() } else { None };
+    }
+}
+
+/// Every local FormatList producer must enqueue while holding this mutex, so
+/// an incoming LockData can never mistake a newly queued table for the one
+/// already known to the peer. This is application snapshot ownership only.
+pub(super) fn send_format_announcement(
+    files: &FrozenFiles,
+    sender: &UnboundedSender<ServerEvent>,
+    message: ClipboardMessage,
+) -> bool {
+    let Ok(mut current) = files.lock() else {
+        return false;
+    };
+    let is_file = matches!(message, ClipboardMessage::SendInitiateFileCopy(_));
+    current.announce(is_file);
+    sender.send(ServerEvent::Clipboard(message)).is_ok()
+}
+
+pub(super) fn file_format_list_response(files: &FrozenFiles, ok: bool) {
+    let Ok(mut current) = files.lock() else {
+        return;
+    };
+    if let Some(pending) = current.pending_announcements.as_mut() {
+        if *pending == 0 {
+            return;
+        }
+        *pending -= 1;
+        if *pending == 0 && ok {
+            current.confirmed = current.announced.clone();
+        }
+    }
+}
+
+pub(super) fn announce_file_formats(files: &FrozenFiles, sender: &UnboundedSender<ServerEvent>) {
+    let Ok(mut current) = files.lock() else {
+        return;
+    };
+    if !current.stream_enabled {
+        return;
+    }
+    let Some(entries) = &current.entries else {
+        return;
+    };
+    let descriptors = entries.iter().map(|file| file.descriptor.clone()).collect();
+    current.announce(true);
+    let _ = sender.send(ServerEvent::Clipboard(
+        ClipboardMessage::SendInitiateFileCopy(descriptors),
+    ));
 }
 
 #[cfg(test)]
 impl From<Option<Vec<FrozenFile>>> for FrozenSelection {
     fn from(entries: Option<Vec<FrozenFile>>) -> Self {
+        let entries = entries.map(Arc::new);
         Self {
             generation: 0,
             stream_enabled: true,
             huge_files: true,
-            entries,
+            entries: entries.clone(),
+            pending_announcements: Some(0),
+            announced: entries.clone(),
+            confirmed: entries,
+            lock_enabled: true,
+            locked: HashMap::new(),
         }
     }
 }
@@ -77,6 +164,9 @@ pub(super) fn set_file_capabilities(files: &FrozenFiles, stream_enabled: bool, h
         if current.stream_enabled != stream_enabled || current.huge_files != huge_files {
             current.generation = current.generation.wrapping_add(1);
             current.entries = None;
+            current.locked.clear();
+            current.confirmed = None;
+            current.announced = None;
         }
         current.stream_enabled = stream_enabled;
         current.huge_files = huge_files;
@@ -87,16 +177,48 @@ pub(super) fn file_stream_enabled(files: &FrozenFiles) -> bool {
     files.lock().is_ok_and(|current| current.stream_enabled)
 }
 
+pub(super) fn set_file_lock_capability(files: &FrozenFiles, enabled: bool) {
+    if let Ok(mut current) = files.lock() {
+        current.lock_enabled = enabled;
+        if !enabled {
+            current.locked.clear();
+            current.confirmed = None;
+        }
+    }
+}
+
+pub(super) fn lock_selection(files: &FrozenFiles, id: u32) {
+    if let Ok(mut current) = files.lock() {
+        if !current.stream_enabled
+            || !current.lock_enabled
+            || current.locked.contains_key(&id)
+            || current.locked.len() >= MAX_LOCKED_SELECTIONS
+        {
+            return;
+        }
+        if let Some(entries) = current.confirmed.clone() {
+            current.locked.insert(id, entries);
+        }
+    }
+}
+
+pub(super) fn unlock_selection(files: &FrozenFiles, id: u32) {
+    if let Ok(mut current) = files.lock() {
+        current.locked.remove(&id);
+    }
+}
+
 fn selected_file(files: &FrozenFiles, request: &FileContentsRequest) -> Option<FrozenFile> {
     let current = files.lock().ok()?;
     if !current.stream_enabled {
         return None;
     }
-    current
-        .entries
-        .as_ref()?
-        .get(usize::try_from(request.index).ok()?)
-        .cloned()
+    let entries = match request.data_id {
+        Some(id) if current.lock_enabled => current.locked.get(&id)?,
+        Some(_) => return None,
+        None => current.entries.as_ref()?,
+    };
+    entries.get(usize::try_from(request.index).ok()?).cloned()
 }
 
 pub(super) fn clear_selection(files: &FrozenFiles) {
@@ -304,9 +426,10 @@ fn publish_selection(
             return;
         }
         // Serialize publication with invalidation, including the event enqueue.
-        current.entries = (!frozen.is_empty()).then_some(frozen.clone());
+        current.entries = (!frozen.is_empty()).then(|| Arc::new(frozen.clone()));
         if !frozen.is_empty() {
             let descriptors = frozen.into_iter().map(|file| file.descriptor).collect();
+            current.announce(true);
             let _ = event_sender.send(ServerEvent::Clipboard(
                 ClipboardMessage::SendInitiateFileCopy(descriptors),
             ));
@@ -322,6 +445,7 @@ impl Drop for FileWorker {
         // A walk can return after the bounded wait. Invalidate its publication
         // before this session lets go of the worker.
         clear_selection(&self.handle.files);
+        set_file_lock_capability(&self.handle.files, false);
         // Wake a worker parked on an empty queue. Best effort: a full queue
         // means it is mid-command and will see the flag on its next turn.
         let _ = self.handle.commands.try_send(FileWorkerCommand::Wake);
@@ -348,6 +472,10 @@ pub(super) struct FileSelection {
 impl FileSelection {
     pub(super) fn new(frozen: FrozenFiles, worker: Option<FileWorkerHandle>) -> Self {
         Self { frozen, worker }
+    }
+
+    pub(super) fn files(&self) -> &FrozenFiles {
+        &self.frozen
     }
 
     /// Forget the frozen selection so the client can no longer read it.
@@ -1258,6 +1386,119 @@ mod outbound_regressions {
             std::env::temp_dir().join(format!("hypr-rdp-review-{label}-{}", std::process::id()));
         std::fs::create_dir(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn outbound_lock_limit_capability_loss_and_duplicate_ids_preserve_identity() {
+        let root = directory("lock-limit");
+        let path = root.join("a");
+        std::fs::write(&path, b"old-A").unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(Some(freeze_paths(vec![path], 100)).into()));
+        for id in 0..MAX_LOCKED_SELECTIONS as u32 {
+            lock_selection(&files, id);
+        }
+        clear_selection(&files);
+        let path = root.join("b");
+        std::fs::write(&path, b"new-B").unwrap();
+        files.lock().unwrap().entries = Some(Arc::new(freeze_paths(vec![path], 100)));
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        announce_file_formats(&files, &sender);
+        file_format_list_response(&files, true);
+        lock_selection(&files, 0); // Cannot rebind an existing ID.
+        lock_selection(&files, 999); // Cannot evict another lock to admit excess.
+        let mut req = request(1, 0);
+        req.requested_size = 5;
+        req.data_id = Some(0);
+        assert_eq!(read_file_contents(&files, req.clone(), 8).data(), b"old-A");
+        req.data_id = Some(999);
+        assert!(read_file_contents(&files, req.clone(), 8).is_error());
+        unlock_selection(&files, 0);
+        lock_selection(&files, 999);
+        assert_eq!(read_file_contents(&files, req.clone(), 8).data(), b"new-B");
+        set_file_lock_capability(&files, false);
+        assert!(read_file_contents(&files, req.clone(), 8).is_error());
+        assert!(files.lock().unwrap().locked.is_empty());
+        set_file_lock_capability(&files, true);
+        lock_selection(&files, 999);
+        set_file_capabilities(&files, false, false);
+        assert!(read_file_contents(&files, req, 8).is_error());
+        assert!(files.lock().unwrap().locked.is_empty());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn outbound_pending_advertisement_refuses_new_locks() {
+        let root = directory("pending-lock");
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::write(&a, b"old-A").unwrap();
+        std::fs::write(&b, b"new-B").unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(Some(freeze_paths(vec![a], 100)).into()));
+        lock_selection(&files, 77);
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        publish_selection(&files, 0, freeze_paths(vec![b], 100), &sender);
+        // B is queued but not yet dispatched or acknowledged by the peer.
+        lock_selection(&files, 88);
+        let mut req = request(1, 0);
+        req.requested_size = 5;
+        req.data_id = Some(88);
+        assert!(
+            read_file_contents(&files, req.clone(), 8).is_error(),
+            "an unconfirmed lock must not read newly queued B bytes"
+        );
+        req.data_id = Some(77);
+        assert_eq!(read_file_contents(&files, req.clone(), 8).data(), b"old-A");
+        file_format_list_response(&files, true);
+        lock_selection(&files, 88);
+        req.data_id = Some(88);
+        assert_eq!(read_file_contents(&files, req, 8).data(), b"new-B");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn outbound_format_acknowledgements_cover_text_rejection_backlog_and_recovery() {
+        let root = directory("format-acks");
+        let path = root.join("file");
+        std::fs::write(&path, b"bytes").unwrap();
+        let files: FrozenFiles = Arc::new(Mutex::new(Some(freeze_paths(vec![path], 100)).into()));
+        let (sender, _events) = tokio::sync::mpsc::unbounded_channel();
+        let mut req = request(1, 0);
+        req.requested_size = 5;
+        req.data_id = Some(77);
+        announce_file_formats(&files, &sender);
+        announce_file_formats(&files, &sender);
+        file_format_list_response(&files, true);
+        lock_selection(&files, 77);
+        assert!(read_file_contents(&files, req.clone(), 8).is_error());
+        assert!(send_format_announcement(
+            &files,
+            &sender,
+            ClipboardMessage::SendInitiateCopy(vec![ClipboardFormat::new(
+                ClipboardFormatId::CF_UNICODETEXT
+            )])
+        ));
+        file_format_list_response(&files, true);
+        file_format_list_response(&files, true);
+        lock_selection(&files, 77);
+        assert!(
+            read_file_contents(&files, req.clone(), 8).is_error(),
+            "text ACK is not a file ACK"
+        );
+        announce_file_formats(&files, &sender);
+        file_format_list_response(&files, false);
+        lock_selection(&files, 77);
+        assert!(read_file_contents(&files, req.clone(), 8).is_error());
+        announce_file_formats(&files, &sender);
+        file_format_list_response(&files, true);
+        lock_selection(&files, 77);
+        assert_eq!(read_file_contents(&files, req.clone(), 8).data(), b"bytes");
+        unlock_selection(&files, 77);
+        files.lock().unwrap().pending_announcements = Some(u64::MAX);
+        announce_file_formats(&files, &sender);
+        file_format_list_response(&files, true);
+        lock_selection(&files, 77);
+        assert!(read_file_contents(&files, req, 8).is_error());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

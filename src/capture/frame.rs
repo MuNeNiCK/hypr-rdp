@@ -62,6 +62,7 @@ pub(super) struct FrameStats {
     skipped_encoder: u32,
     skipped_backpressure: u32,
     skipped_local_backpressure: u32,
+    skipped_output_backpressure: u32,
     skipped_transport_unavailable: u32,
     skipped_transport_not_ready: u32,
     skipped_transport_no_channel: u32,
@@ -133,6 +134,7 @@ impl FrameStats {
             skipped_encoder: 0,
             skipped_backpressure: 0,
             skipped_local_backpressure: 0,
+            skipped_output_backpressure: 0,
             skipped_transport_unavailable: 0,
             skipped_transport_not_ready: 0,
             skipped_transport_no_channel: 0,
@@ -223,6 +225,10 @@ impl FrameStats {
         self.skipped_backpressure = self.skipped_backpressure.saturating_add(1);
         match readiness {
             EgfxFrameReadiness::Ready => {}
+            EgfxFrameReadiness::OutputBackpressure { .. } => {
+                self.skipped_output_backpressure =
+                    self.skipped_output_backpressure.saturating_add(1);
+            }
             EgfxFrameReadiness::LocalBackpressure { .. } => {
                 self.skipped_local_backpressure = self.skipped_local_backpressure.saturating_add(1);
             }
@@ -315,6 +321,7 @@ impl FrameStats {
                 skipped_encoder = self.skipped_encoder,
                 skipped_backpressure = self.skipped_backpressure,
                 skipped_local_backpressure = self.skipped_local_backpressure,
+                skipped_output_backpressure = self.skipped_output_backpressure,
                 skipped_transport_unavailable = self.skipped_transport_unavailable,
                 skipped_transport_not_ready = self.skipped_transport_not_ready,
                 skipped_transport_no_channel = self.skipped_transport_no_channel,
@@ -1049,9 +1056,10 @@ mod tests {
     use crate::display::geometry::{PresentationGeometry, Size};
     use crate::egfx::test_support::{
         ack_frame, drain_gfx_pdus, negotiated_avc444_egfx, negotiated_egfx_with_policy,
-        negotiated_no_avc_egfx, negotiated_no_avc_session, process_avc444_capabilities,
-        start_gfx_channel, tracked_avc444_session, unnegotiated_egfx_shared,
-        Avc444PresentationOracle, ClearCodecFrameOracle, ExpectedAvc444Encoding, TestQueueDepth,
+        negotiated_no_avc_egfx, negotiated_no_avc_session, process_avc420_capabilities,
+        process_avc444_capabilities, start_gfx_channel, tracked_avc444_session,
+        unnegotiated_egfx_session, unnegotiated_egfx_shared, Avc444PresentationOracle,
+        ClearCodecFrameOracle, ExpectedAvc444Encoding, TestQueueDepth,
     };
     use crate::egfx::{
         EgfxCodecPolicy, H264RateControl, HyprGfxFactory, DEFAULT_MAX_FRAMES_IN_FLIGHT,
@@ -1261,10 +1269,17 @@ mod tests {
             64,
             64,
         );
+        stats.record_send_unavailable(
+            EgfxFrameReadiness::OutputBackpressure { queued: 3, max: 3 },
+            local_flow,
+            64,
+            64,
+        );
 
-        assert_eq!(stats.skipped_backpressure, 2);
+        assert_eq!(stats.skipped_backpressure, 3);
         assert_eq!(stats.skipped_transport_backpressure, 1);
         assert_eq!(stats.skipped_local_backpressure, 1);
+        assert_eq!(stats.skipped_output_backpressure, 1);
         assert_eq!(stats.last_frame_id, 11);
         assert_eq!(stats.last_acked_frame_id, 8);
         assert_eq!(stats.frames_in_flight, 3);
@@ -1491,44 +1506,46 @@ mod tests {
 
     #[test]
     fn frame_processor_falls_back_after_egfx_activation_timeout() {
-        let width = 16;
-        let height = 16;
-        let stride = width * 4;
-        let shared = unnegotiated_egfx_shared(width as u16, height as u16, EgfxCodecPolicy::Auto);
+        for policy in [EgfxCodecPolicy::Auto, EgfxCodecPolicy::ClearCodec] {
+            let width = 16;
+            let height = 16;
+            let stride = width * 4;
+            let shared = unnegotiated_egfx_shared(width as u16, height as u16, policy);
 
-        let (display_tx, mut display_rx) = mpsc::channel(4);
-        let frame = gradient_bgra_frame(width, height, stride);
-        let mut processor = FrameProcessor::new(
-            Some(shared),
-            width as u32,
-            height as u32,
-            PixelFormat::BgrA32,
-            stride as u32,
-            1_000_000,
-            23,
-            H264RateControl::Vbr,
-            30,
-        );
+            let (display_tx, mut display_rx) = mpsc::channel(4);
+            let frame = gradient_bgra_frame(width, height, stride);
+            let mut processor = FrameProcessor::new(
+                Some(shared),
+                width as u32,
+                height as u32,
+                PixelFormat::BgrA32,
+                stride as u32,
+                1_000_000,
+                23,
+                H264RateControl::Vbr,
+                30,
+            );
 
-        let start = Instant::now();
-        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
-        assert!(processor.process_at(&frame, &display_tx, start));
-        assert!(
-            display_rx.try_recv().is_err(),
-            "the activation sequence is still worth waiting for"
-        );
-        assert!(processor.has_pending_damage());
-        assert!(!processor.sent_first_frame);
+            let start = Instant::now();
+            processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+            assert!(processor.process_at(&frame, &display_tx, start));
+            assert!(
+                display_rx.try_recv().is_err(),
+                "the activation sequence is still worth waiting for"
+            );
+            assert!(processor.has_pending_damage());
+            assert!(!processor.sent_first_frame);
 
-        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
-        assert!(processor.process_at(&frame, &display_tx, start + GFX_READY_GRACE));
+            processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+            assert!(processor.process_at(&frame, &display_tx, start + GFX_READY_GRACE));
 
-        assert!(
-            matches!(display_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
-            "past the grace the client must get pixels, not silence"
-        );
-        assert!(processor.sent_first_frame);
-        assert!(!processor.has_pending_damage());
+            assert!(
+                matches!(display_rx.try_recv(), Ok(DisplayUpdate::Bitmap(_))),
+                "past the grace the client must get pixels, not silence"
+            );
+            assert!(processor.sent_first_frame);
+            assert!(!processor.has_pending_damage());
+        }
     }
 
     #[test]
@@ -1639,6 +1656,106 @@ mod tests {
                 assert_eq!(size.height, height as u16);
             }
             _ => panic!("expected resize update before first EGFX frame"),
+        }
+    }
+
+    #[test]
+    fn frame_processor_clearcodec_policy_sends_decodable_frames_to_avc_clients() {
+        for negotiate in [
+            process_avc420_capabilities as fn(&mut _),
+            process_avc444_capabilities,
+        ] {
+            // Each connection needs a fresh codec sequence, even with the same policy/client.
+            for _connection in 0..2 {
+                let mut session = unnegotiated_egfx_session(160, 80, EgfxCodecPolicy::ClearCodec);
+                start_gfx_channel(&mut session.bridge);
+                let mut processor = clearcodec_processor(Arc::clone(&session.shared), 160, 80, 648);
+                let (display_tx, mut display_rx) = mpsc::channel(4);
+                let mut frame = gradient_bgra_frame(160, 80, 648);
+                let full = [(0, 0, 160, 80)];
+                processor.queue_damage(&full);
+                assert!(processor.process(&frame, &display_tx));
+                drain_gfx_pdus(&mut session.event_rx).assert_empty();
+                assert!(processor.has_pending_damage());
+                assert!(display_rx.try_recv().is_err());
+
+                negotiate(&mut session.bridge);
+                assert!(session.shared.is_ready());
+                assert!(!session.shared.is_avc_enabled());
+                assert!(!session.shared.is_avc444_enabled());
+                assert!(processor.process(&frame, &display_tx));
+                let mut oracle = ClearCodecFrameOracle::new();
+                let sid = processor.egfx_surface_id.unwrap();
+                let mut id = oracle.assert_frame(
+                    &drain_gfx_pdus(&mut session.event_rx),
+                    sid,
+                    &frame,
+                    160,
+                    80,
+                    648,
+                    &full,
+                );
+                assert_eq!(session.shared.frame_flow_snapshot().frames_in_flight, 1);
+                assert!(processor.h264_encoder.is_none());
+
+                let damage = [(1, 2, 4, 5), (130, 20, 5, 5)];
+                for _ in 1..DEFAULT_MAX_FRAMES_IN_FLIGHT {
+                    frame[2 * 648 + 4] ^= 0xff;
+                    frame[20 * 648 + 130 * 4] ^= 0xff;
+                    processor.queue_damage(&damage);
+                    assert!(processor.process(&frame, &display_tx));
+                    id = oracle.assert_frame(
+                        &drain_gfx_pdus(&mut session.event_rx),
+                        sid,
+                        &frame,
+                        160,
+                        80,
+                        648,
+                        &damage,
+                    );
+                }
+                assert_eq!(
+                    session.shared.frame_flow_snapshot().frames_in_flight,
+                    DEFAULT_MAX_FRAMES_IN_FLIGHT
+                );
+                // With the ACK window full, retain changes without advancing the codec sequence.
+                frame[2 * 648 + 4] ^= 0xff;
+                frame[20 * 648 + 130 * 4] ^= 0xff;
+                processor.queue_damage(&damage);
+                assert!(processor.process(&frame, &display_tx));
+                drain_gfx_pdus(&mut session.event_rx).assert_empty();
+                assert!(processor.has_pending_damage());
+                assert_eq!(processor.stats.sent_frames, DEFAULT_MAX_FRAMES_IN_FLIGHT);
+                ack_frame(&mut session.bridge, id, TestQueueDepth::AvailableBytes(0));
+                assert!(processor.process(&frame, &display_tx));
+                let id = oracle.assert_frame(
+                    &drain_gfx_pdus(&mut session.event_rx),
+                    sid,
+                    &frame,
+                    160,
+                    80,
+                    648,
+                    &damage,
+                );
+                assert!(!processor.has_pending_damage());
+                ack_frame(&mut session.bridge, id, TestQueueDepth::AvailableBytes(0));
+
+                // Re-advertise must retain the send policy and the session-wide codec sequence.
+                negotiate(&mut session.bridge);
+                assert!(!session.shared.is_avc_enabled());
+                assert!(processor.process(&frame, &display_tx));
+                oracle.assert_frame(
+                    &drain_gfx_pdus(&mut session.event_rx),
+                    processor.egfx_surface_id.unwrap(),
+                    &frame,
+                    160,
+                    80,
+                    648,
+                    &full,
+                );
+                assert!(processor.h264_encoder.is_none());
+                assert!(display_rx.try_recv().is_err(), "no legacy bitmap updates");
+            }
         }
     }
 
@@ -2488,6 +2605,100 @@ mod tests {
             .expect("AVC444 reference committed after backpressure recovery")
             .to_vec();
         assert_ne!(committed_after_recovery, committed_before);
+        assert!(display_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_refresh_waits_for_output_queue_without_advancing_reference() {
+        let (width, height, stride) = (64, 64, 256);
+        let mut session = tracked_avc444_session(width as u16, height as u16, 3);
+        let shared = Arc::clone(&session.shared);
+        let (display_tx, mut display_rx) = mpsc::channel(4);
+        let first = gradient_bgra_frame(width, height, stride);
+        let mut processor = FrameProcessor::new_with_h264_backend(
+            Some(Arc::clone(&shared)),
+            width as u32,
+            height as u32,
+            PixelFormat::BgrA32,
+            stride as u32,
+            1_000_000,
+            23,
+            H264RateControl::Cqp,
+            30,
+            H264BackendPolicy::Software,
+        );
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&first, &display_tx));
+        let initial = drain_gfx_pdus(&mut session.event_rx);
+        ack_frame(
+            &mut session.bridge,
+            initial.frame_id(),
+            ironrdp_egfx::pdu::QueueDepth::Suspend,
+        );
+
+        for value in [32, 96, 160] {
+            let frame = solid_bgra_frame(width, height, stride, value, value, value);
+            shared.request_full_frame();
+            processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+            assert!(processor.process(&frame, &display_tx));
+            assert!(!shared.full_frame_requested());
+        }
+        assert_eq!(session.event_rx.len(), 3);
+        let before = processor
+            .h264_encoder
+            .as_ref()
+            .unwrap()
+            .avc444_luma_reference_y_for_test()
+            .unwrap()
+            .to_vec();
+        let idr_requests = processor
+            .h264_encoder
+            .as_ref()
+            .unwrap()
+            .force_idr_requests_for_test();
+        let queued = shared.frame_flow_snapshot().total_queued_frames;
+        let pending = solid_bgra_frame(width, height, stride, 240, 240, 240);
+        shared.request_full_frame();
+        processor.queue_damage(&[(0, 0, width as i32, height as i32)]);
+        assert!(processor.process(&pending, &display_tx));
+        assert_eq!(processor.stats.skipped_output_backpressure, 1);
+        assert!(processor.has_pending_damage());
+        assert!(shared.full_frame_requested());
+        assert_eq!(shared.frame_flow_snapshot().total_queued_frames, queued);
+        assert_eq!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .unwrap()
+                .force_idr_requests_for_test(),
+            idr_requests
+        );
+        assert_eq!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .unwrap()
+                .avc444_luma_reference_y_for_test()
+                .unwrap(),
+            before
+        );
+
+        // The transport consumes the queued messages; the client sends no ACK.
+        drain_gfx_pdus(&mut session.event_rx);
+        assert!(processor.process(&pending, &display_tx));
+        assert!(!processor.has_pending_damage());
+        assert!(!shared.full_frame_requested());
+        assert_ne!(
+            processor
+                .h264_encoder
+                .as_ref()
+                .unwrap()
+                .avc444_luma_reference_y_for_test()
+                .unwrap(),
+            before
+        );
+        drain_gfx_pdus(&mut session.event_rx)
+            .assert_sendable_avc444_frame(ExpectedAvc444Encoding::LumaAndChroma);
         assert!(display_rx.try_recv().is_err());
     }
 

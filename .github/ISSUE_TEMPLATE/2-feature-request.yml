@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose an improvement to hypr-rdp.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: What are you trying to accomplish, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: desired-behavior
+    attributes:
+      label: Proposed improvement
+      description: Describe the behavior you would like and how it would help.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Alternatives or additional context

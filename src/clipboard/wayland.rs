@@ -18,8 +18,9 @@ use wayland_protocols_wlr::data_control::v1::client::{
 use super::backend::{announce_local_formats, ClipboardEchoCandidate};
 use super::files::{uri_list_paths, FileSelection};
 use super::formats::{
-    PendingWrite, SelectionKind, FILE_URI_LIST_MIME, GNOME_COPIED_FILES_MIME, IMAGE_PNG_MIME,
-    MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME, UTF8_MIME,
+    decode_wayland_text_offer, PendingWrite, SelectionKind, FILE_URI_LIST_MIME,
+    GNOME_COPIED_FILES_MIME, IMAGE_PNG_MIME, MAX_CLIPBOARD_SIZE, TEXT_MIME, TEXT_PLAIN_MIME,
+    UTF8_MIME,
 };
 use super::inbound::InboundHandle;
 
@@ -395,13 +396,27 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 }
 
                 if let Some(ref mime) = text_mime {
+                    // A failed or empty replacement must not serve the previous text.
+                    if let Ok(mut data) = state.clipboard_data.lock() {
+                        *data = None;
+                    }
                     if let Some(data) = read_offer_data(&offer, mime, conn) {
-                        if !data.is_empty() {
-                            tracing::trace!(len = data.len(), "Clipboard: read text data");
-                            if let Ok(mut g) = state.clipboard_data.lock() {
-                                *g = Some(data);
+                        if let Some(data) =
+                            decode_wayland_text_offer(mime, data, MAX_CLIPBOARD_SIZE)
+                        {
+                            if !data.is_empty() {
+                                tracing::trace!(len = data.len(), "Clipboard: read text data");
+                                if let Ok(mut g) = state.clipboard_data.lock() {
+                                    *g = Some(data);
+                                }
+                                formats
+                                    .push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
                             }
-                            formats.push(ClipboardFormat::new(ClipboardFormatId::CF_UNICODETEXT));
+                        } else {
+                            tracing::warn!(
+                                max = MAX_CLIPBOARD_SIZE,
+                                "Clipboard: decoded text exceeds size limit, ignoring"
+                            );
                         }
                     }
                 }
@@ -453,6 +468,7 @@ impl Dispatch<zwlr_data_control_device_v1::ZwlrDataControlDeviceV1, ()> for Clip
                 if !formats.is_empty() {
                     announce_local_formats(
                         &state.event_sender,
+                        state.file_selection.files(),
                         &state.echo_candidate,
                         &state.clipboard_data,
                         &state.clipboard_image,
@@ -772,6 +788,9 @@ fn write_source_data(fd: &OwnedFd, data: &[u8]) -> bool {
         }
     }
 }
+
+#[cfg(test)]
+pub(super) mod selection_tests;
 
 #[cfg(test)]
 mod tests {

@@ -17,8 +17,9 @@ use ironrdp_server::{CliprdrServerFactory, ServerEvent, ServerEventSender};
 use tokio::sync::mpsc;
 
 use super::files::{
-    clear_selection, file_stream_enabled, set_file_capabilities, FileSelection, FileWorker,
-    FrozenFiles,
+    announce_file_formats, clear_selection, file_format_list_response, file_stream_enabled,
+    lock_selection, send_format_announcement, set_file_capabilities, set_file_lock_capability,
+    unlock_selection, FileSelection, FileWorker, FrozenFiles,
 };
 use super::formats::{
     fix_bitfields_dib, normalize_lf, to_crlf, utf16le_to_utf8, PendingWrite, SelectionKind,
@@ -38,6 +39,7 @@ pub(super) struct ClipboardEchoCandidate {
 /// The snapshot is eligible for the next remote paste request only.
 pub(super) fn announce_local_formats(
     event_sender: &mpsc::UnboundedSender<ServerEvent>,
+    files: &FrozenFiles,
     echo_candidate: &Arc<Mutex<Option<ClipboardEchoCandidate>>>,
     clipboard_data: &Arc<Mutex<Option<Vec<u8>>>>,
     clipboard_image: &Arc<Mutex<Option<Vec<u8>>>>,
@@ -66,12 +68,11 @@ pub(super) fn announce_local_formats(
         *current = Some(candidate);
     }
 
-    if event_sender
-        .send(ServerEvent::Clipboard(ClipboardMessage::SendInitiateCopy(
-            formats,
-        )))
-        .is_err()
-    {
+    if !send_format_announcement(
+        files,
+        event_sender,
+        ClipboardMessage::SendInitiateCopy(formats),
+    ) {
         if let Ok(mut current) = echo_candidate.lock() {
             *current = None;
         }
@@ -221,7 +222,8 @@ impl CliprdrBackend for HyprCliprdrBackend {
         {
             capabilities |= ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED
                 | ClipboardGeneralCapabilityFlags::FILECLIP_NO_FILE_PATHS
-                | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED;
+                | ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED
+                | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA;
         }
         capabilities
     }
@@ -243,6 +245,7 @@ impl CliprdrBackend for HyprCliprdrBackend {
             if let Some(ref sender) = self.event_sender {
                 announce_local_formats(
                     sender,
+                    &self.files,
                     &self.echo_candidate,
                     &self.clipboard_data,
                     &self.clipboard_image,
@@ -250,21 +253,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 );
             }
         }
-        if file_stream_enabled(&self.files) {
-            if let Some(files) = self
-                .files
-                .lock()
-                .ok()
-                .and_then(|files| files.entries.clone())
-            {
-                if let Some(sender) = &self.event_sender {
-                    let descriptors = files.into_iter().map(|file| file.descriptor).collect();
-                    let _ = sender.send(ServerEvent::Clipboard(
-                        ClipboardMessage::SendInitiateFileCopy(descriptors),
-                    ));
-                }
-            }
+        if let Some(sender) = &self.event_sender {
+            announce_file_formats(&self.files, sender);
         }
+    }
+
+    fn on_format_list_response(&mut self, ok: bool) {
+        file_format_list_response(&self.files, ok);
     }
 
     fn on_process_negotiated_capabilities(
@@ -277,10 +272,15 @@ impl CliprdrBackend for HyprCliprdrBackend {
                 && capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
             capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
         );
+        set_file_lock_capability(
+            &self.files,
+            capabilities.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA),
+        );
         if let Some(inbound) = &self.inbound {
             inbound.set_capabilities(
                 capabilities.contains(ClipboardGeneralCapabilityFlags::STREAM_FILECLIP_ENABLED),
                 capabilities.contains(ClipboardGeneralCapabilityFlags::HUGE_FILE_SUPPORT_ENABLED),
+                capabilities.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA),
             );
         }
     }
@@ -435,9 +435,13 @@ impl CliprdrBackend for HyprCliprdrBackend {
         }
     }
 
-    fn on_lock(&mut self, _data_id: LockDataId) {}
+    fn on_lock(&mut self, data_id: LockDataId) {
+        lock_selection(&self.files, data_id.0);
+    }
 
-    fn on_unlock(&mut self, _data_id: LockDataId) {}
+    fn on_unlock(&mut self, data_id: LockDataId) {
+        unlock_selection(&self.files, data_id.0);
+    }
 
     /// The `Unlock` for these locks has gone out, so the client is free to drop
     /// the file data they covered. Whatever we were still serving from them
@@ -832,6 +836,56 @@ mod tests {
         assert_eq!(take_paste(&mut events), ClipboardFormatId::CF_UNICODETEXT);
     }
 
+    // Replay production policy without starting a real compositor connection.
+    #[derive(Debug)]
+    struct ReplayBackend(HyprCliprdrBackend);
+    ironrdp_core::impl_as_any!(ReplayBackend);
+    impl CliprdrBackend for ReplayBackend {
+        fn temporary_directory(&self) -> &str {
+            self.0.temporary_directory()
+        }
+        fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
+            self.0.client_capabilities()
+        }
+        fn on_ready(&mut self) {}
+        fn on_request_format_list(&mut self) {
+            self.0.on_request_format_list();
+        }
+        fn on_format_list_response(&mut self, ok: bool) {
+            self.0.on_format_list_response(ok);
+        }
+        fn on_process_negotiated_capabilities(&mut self, flags: ClipboardGeneralCapabilityFlags) {
+            self.0.on_process_negotiated_capabilities(flags);
+        }
+        fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
+            self.0.on_remote_copy(formats);
+        }
+        fn on_format_data_request(&mut self, request: FormatDataRequest) {
+            self.0.on_format_data_request(request);
+        }
+        fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
+            self.0.on_format_data_response(response);
+        }
+        fn on_remote_file_list(&mut self, files: &[FileDescriptor], data_id: Option<u32>) {
+            self.0.on_remote_file_list(files, data_id);
+        }
+        fn on_file_contents_request(&mut self, request: FileContentsRequest) {
+            self.0.on_file_contents_request(request);
+        }
+        fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
+            self.0.on_file_contents_response(response);
+        }
+        fn on_lock(&mut self, data_id: LockDataId) {
+            self.0.on_lock(data_id);
+        }
+        fn on_outgoing_locks_cleared(&mut self, ids: &[LockDataId]) {
+            self.0.on_outgoing_locks_cleared(ids);
+        }
+        fn on_unlock(&mut self, data_id: LockDataId) {
+            self.0.on_unlock(data_id);
+        }
+    }
+
     #[cfg(feature = "client-to-server")]
     #[tokio::test]
     async fn inbound_public_channel_replay_does_not_publish_superseded_files() {
@@ -841,56 +895,6 @@ mod tests {
         use ironrdp_cliprdr::CliprdrServer;
         use ironrdp_svc::SvcProcessor;
 
-        // Replay production policy without starting a real compositor connection.
-        #[derive(Debug)]
-        struct ReplayBackend(HyprCliprdrBackend);
-        ironrdp_core::impl_as_any!(ReplayBackend);
-        impl CliprdrBackend for ReplayBackend {
-            fn temporary_directory(&self) -> &str {
-                self.0.temporary_directory()
-            }
-            fn client_capabilities(&self) -> ClipboardGeneralCapabilityFlags {
-                self.0.client_capabilities()
-            }
-            fn on_ready(&mut self) {}
-            fn on_request_format_list(&mut self) {
-                self.0.on_request_format_list();
-            }
-            fn on_process_negotiated_capabilities(
-                &mut self,
-                flags: ClipboardGeneralCapabilityFlags,
-            ) {
-                self.0.on_process_negotiated_capabilities(flags);
-            }
-            fn on_remote_copy(&mut self, formats: &[ClipboardFormat]) {
-                self.0.on_remote_copy(formats);
-            }
-            fn on_format_data_request(&mut self, request: FormatDataRequest) {
-                self.0.on_format_data_request(request);
-            }
-            fn on_format_data_response(&mut self, response: FormatDataResponse<'_>) {
-                self.0.on_format_data_response(response);
-            }
-            fn on_remote_file_list(&mut self, files: &[FileDescriptor], data_id: Option<u32>) {
-                self.0.on_remote_file_list(files, data_id);
-            }
-            fn on_file_contents_request(&mut self, request: FileContentsRequest) {
-                self.0.on_file_contents_request(request);
-            }
-            fn on_file_contents_response(&mut self, response: FileContentsResponse<'_>) {
-                self.0.on_file_contents_response(response);
-            }
-            fn on_lock(&mut self, data_id: LockDataId) {
-                self.0.on_lock(data_id);
-            }
-            fn on_outgoing_locks_cleared(&mut self, ids: &[LockDataId]) {
-                self.0.on_outgoing_locks_cleared(ids);
-            }
-            fn on_unlock(&mut self, data_id: LockDataId) {
-                self.0.on_unlock(data_id);
-            }
-        }
-
         fn process(channel: &mut CliprdrServer, pdu: ClipboardPdu<'_>) {
             channel
                 .process(&ironrdp_core::encode_vec(&pdu).unwrap())
@@ -899,7 +903,7 @@ mod tests {
         let (backend, mut events) = inbound_backend();
         let pending = Arc::clone(&backend.pending_write);
         let flags = backend.client_capabilities();
-        assert!(!flags.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA));
+        assert!(flags.contains(ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA));
         let mut channel = CliprdrServer::new(Box::new(ReplayBackend(backend)));
         channel.start().unwrap();
         process(
@@ -1195,7 +1199,8 @@ mod tests {
             path
         })
         .collect();
-        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_paths(paths, 100));
+        backend.files.lock().unwrap().entries =
+            Some(Arc::new(super::super::files::freeze_paths(paths, 100)));
 
         backend.on_request_format_list();
 
@@ -1596,6 +1601,130 @@ mod tests {
     }
 
     #[test]
+    fn string_offer_reaches_unicode_response() {
+        use super::super::formats::{LATIN1_STRING_MIME, UTF8_MIME};
+
+        let (mut backend, mut events) = backend_with_events();
+        let mut wayland = text_offer_harness(&backend);
+        for (offers, selected, expected) in [
+            (
+                vec![(LATIN1_STRING_MIME, b"Gr\xfc\xdfe\t\xe4\nfin".as_slice())],
+                LATIN1_STRING_MIME,
+                "Grüße\tä\r\nfin",
+            ),
+            (
+                vec![
+                    (LATIN1_STRING_MIME, b"wrong".as_slice()),
+                    (UTF8_MIME, "四😀\n".as_bytes()),
+                ],
+                UTF8_MIME,
+                "四😀\r\n",
+            ),
+            (
+                vec![(LATIN1_STRING_MIME, b"\xc3\xa9".as_slice())],
+                LATIN1_STRING_MIME,
+                "Ã©",
+            ),
+        ] {
+            assert_eq!(wayland.publish(&offers), vec![selected]);
+            let ClipboardMessage::SendInitiateCopy(formats) = recv_clipboard_event(&mut events)
+            else {
+                panic!("Wayland text must announce a format");
+            };
+            assert_eq!(formats.len(), 1);
+            assert_eq!(formats[0].id, ClipboardFormatId::CF_UNICODETEXT);
+            backend.on_format_data_request(FormatDataRequest {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+            });
+            let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut events)
+            else {
+                panic!("expected Unicode response");
+            };
+            assert!(!response.is_error());
+            assert_eq!(response.data(), utf16le(expected));
+
+            // An echoed Windows representation must compare against the converted local snapshot.
+            backend.on_remote_copy(&formats);
+            assert!(matches!(
+                recv_clipboard_event(&mut events),
+                ClipboardMessage::SendInitiatePaste(ClipboardFormatId::CF_UNICODETEXT)
+            ));
+            backend.on_format_data_response(response);
+            assert!(backend.pending_write.lock().unwrap().is_none());
+            assert!(events.try_recv().is_err());
+        }
+    }
+
+    fn text_offer_harness(
+        backend: &HyprCliprdrBackend,
+    ) -> super::super::wayland::selection_tests::TextOfferHarness {
+        super::super::wayland::selection_tests::TextOfferHarness::new(ClipboardShared {
+            event_sender: backend.event_sender.as_ref().unwrap().clone(),
+            clipboard_data: Arc::clone(&backend.clipboard_data),
+            clipboard_image: Arc::clone(&backend.clipboard_image),
+            pending_write: Arc::clone(&backend.pending_write),
+            echo_candidate: Arc::clone(&backend.echo_candidate),
+            file_selection: FileSelection::new(Arc::clone(&backend.files), None),
+            inbound: None,
+        })
+    }
+
+    #[test]
+    fn string_offer_failure_clears_stale_text_and_next_copy_recovers() {
+        use super::super::formats::LATIN1_STRING_MIME;
+
+        let (mut backend, mut events) = backend_with_events();
+        let mut wayland = text_offer_harness(&backend);
+        for stalled in [false, true] {
+            assert_eq!(
+                wayland.publish(&[(LATIN1_STRING_MIME, b"previous")]),
+                vec![LATIN1_STRING_MIME]
+            );
+            let _ = recv_clipboard_event(&mut events);
+            if stalled {
+                assert_eq!(
+                    wayland.publish_stalled(LATIN1_STRING_MIME),
+                    vec![LATIN1_STRING_MIME]
+                );
+            } else {
+                assert_eq!(
+                    wayland.publish(&[(LATIN1_STRING_MIME, b"")]),
+                    vec![LATIN1_STRING_MIME]
+                );
+            }
+            assert!(
+                events.try_recv().is_err(),
+                "failed text must not be announced"
+            );
+            assert!(backend.clipboard_data.lock().unwrap().is_none());
+            assert!(backend.echo_candidate.lock().unwrap().is_none());
+            backend.on_format_data_request(FormatDataRequest {
+                format: ClipboardFormatId::CF_UNICODETEXT,
+            });
+            let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut events)
+            else {
+                panic!("expected failure response");
+            };
+            assert!(response.is_error(), "must not serve stale bytes");
+        }
+        wayland.publish(&[(LATIN1_STRING_MIME, b"caf\xe9")]);
+        let _ = recv_clipboard_event(&mut events);
+        backend.on_format_data_request(FormatDataRequest {
+            format: ClipboardFormatId::CF_UNICODETEXT,
+        });
+        let ClipboardMessage::SendFormatData(response) = recv_clipboard_event(&mut events) else {
+            panic!("expected recovered response");
+        };
+        assert_eq!(response.data(), utf16le("café"));
+
+        assert!(wayland
+            .publish(&[("COMPOUND_TEXT", b"unhandled")])
+            .is_empty());
+        assert!(backend.clipboard_data.lock().unwrap().is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
     fn unicode_text_response_ends_every_line_with_crlf() {
         let (mut backend, mut event_rx) = backend_with_events();
         *backend.clipboard_data.lock().unwrap() = Some("\none\rtwo\r\n四".as_bytes().to_vec());
@@ -1815,9 +1944,10 @@ mod tests {
         let path =
             std::env::temp_dir().join(format!("hypr-rdp-review-caps-{}", std::process::id()));
         std::fs::write(&path, b"file").unwrap();
-        backend.files.lock().unwrap().entries = Some(super::super::files::freeze_regular_files(
-            vec![path.clone()],
-        ));
+        backend.files.lock().unwrap().entries =
+            Some(Arc::new(super::super::files::freeze_regular_files(vec![
+                path.clone(),
+            ])));
         backend.on_request_format_list();
         let event = events.try_recv();
         std::fs::remove_file(path).unwrap();
@@ -1830,5 +1960,325 @@ mod tests {
             ),
             "file offer emitted although the peer negotiated text/image only"
         );
+    }
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn review_104_negotiates_lock_for_inbound_file_selection() {
+        use ironrdp_cliprdr::pdu::{
+            Capabilities, ClipboardPdu, ClipboardProtocolVersion, FormatList,
+        };
+        use ironrdp_cliprdr::CliprdrServer;
+        use ironrdp_svc::SvcProcessor;
+
+        let (backend, _events) = inbound_backend();
+        let peer_flags =
+            backend.client_capabilities() | ClipboardGeneralCapabilityFlags::CAN_LOCK_CLIPDATA;
+        let mut channel = CliprdrServer::new(Box::new(ReplayBackend(backend)));
+        channel.start().unwrap();
+        channel
+            .process(
+                &ironrdp_core::encode_vec(&ClipboardPdu::Capabilities(Capabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    peer_flags,
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+        let messages = channel
+            .process(
+                &ironrdp_core::encode_vec(&ClipboardPdu::FormatList(
+                    FormatList::new_unicode(&[incoming_file_format(0xc001)], true).unwrap(),
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let pdus: Vec<_> = messages
+            .iter()
+            .map(|m| m.encode_unframed_pdu().unwrap())
+            .collect();
+        assert!(pdus.iter().any(|bytes| matches!(
+            ironrdp_core::decode::<ClipboardPdu<'_>>(bytes).unwrap(),
+            ClipboardPdu::LockData(_)
+        )), "PR104 must negotiate a real file-data lock before relying on retained selections; got {pdus:?}");
+    }
+
+    #[test]
+    fn review_104_outbound_lock_cannot_resolve_to_replacement_selection() {
+        use ironrdp_cliprdr::pdu::FileContentsFlags;
+        let root =
+            std::env::temp_dir().join(format!("hypr-rdp-review104-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let old = root.join("old");
+        let new = root.join("new");
+        std::fs::write(&old, b"old-A").unwrap();
+        std::fs::write(&new, b"new-B").unwrap();
+        let (mut backend, mut events) = backend_with_events();
+        *backend.files.lock().unwrap() =
+            Some(super::super::files::freeze_regular_files(vec![old])).into();
+        backend.file_worker = Some(FileWorker::start(
+            Arc::clone(&backend.files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            8,
+            100,
+        ));
+        backend.on_lock(LockDataId(77));
+        backend.files.lock().unwrap().entries =
+            Some(Arc::new(super::super::files::freeze_regular_files(vec![
+                new,
+            ])));
+        backend.on_file_contents_request(FileContentsRequest {
+            stream_id: 1,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 5,
+            data_id: Some(77),
+        });
+        let response = recv_file_response(&mut events);
+        drop(backend);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!response.is_error());
+        assert_eq!(
+            response.data(),
+            b"old-A",
+            "a locked request must never read selection B"
+        );
+    }
+
+    #[cfg(feature = "client-to-server")]
+    #[tokio::test]
+    async fn inbound_negotiated_lock_replacement_preserves_bytes_and_unlock_cancels() {
+        use ironrdp_cliprdr::pdu::{
+            Capabilities, ClipboardPdu, ClipboardProtocolVersion, FormatList,
+        };
+        use ironrdp_cliprdr::CliprdrServer;
+        use ironrdp_svc::SvcProcessor;
+
+        // Different and equal descriptor counts must both keep A's identity.
+        for new_count in [1, 2] {
+            let (backend, mut events) = inbound_backend();
+            let handle = backend.inbound.as_ref().unwrap().handle();
+            let flags = backend.client_capabilities();
+            let mut channel = CliprdrServer::with_lock_timeouts(
+                Box::new(ReplayBackend(backend)),
+                std::time::Duration::ZERO,
+                std::time::Duration::ZERO,
+            );
+            channel.start().unwrap();
+            channel
+                .process(
+                    &ironrdp_core::encode_vec(&ClipboardPdu::Capabilities(Capabilities::new(
+                        ClipboardProtocolVersion::V2,
+                        flags,
+                    )))
+                    .unwrap(),
+                )
+                .unwrap();
+            let mut ids = Vec::new();
+            let mut old_read = None;
+            let mut old_request = None;
+            for count in [2, new_count] {
+                let messages = channel
+                    .process(
+                        &ironrdp_core::encode_vec(&ClipboardPdu::FormatList(
+                            FormatList::new_unicode(&[incoming_file_format(0xc001)], true).unwrap(),
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                let id = messages
+                    .iter()
+                    .find_map(|message| {
+                        let bytes = message.encode_unframed_pdu().unwrap();
+                        match ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap() {
+                            ClipboardPdu::LockData(id) => Some(id.0),
+                            _ => None,
+                        }
+                    })
+                    .expect("real channel must emit LockData");
+                ids.push(id);
+                channel.initiate_paste(take_paste(&mut events)).unwrap();
+                let files = (0..count)
+                    .map(|index| FileDescriptor::new(format!("file{index}")).with_file_size(5))
+                    .collect();
+                channel
+                    .process(
+                        &ironrdp_core::encode_vec(&ClipboardPdu::FormatDataResponse(
+                            FormatDataResponse::new_file_list(&PackedFileList { files }).unwrap(),
+                        ))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                if ids.len() == 1 {
+                    old_read = Some(handle.read_first_file(5));
+                    let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(
+                        request,
+                    ))) = events.recv().await
+                    else {
+                        panic!("expected A request")
+                    };
+                    assert_eq!(request.data_id, Some(id));
+                    // Hold the real application event until after B's list is installed.
+                    old_request = Some(request);
+                }
+            }
+            assert_ne!(ids[0], ids[1]);
+            let request = old_request.unwrap();
+            let stream = request.stream_id;
+            let messages: Vec<ironrdp_svc::SvcMessage> =
+                channel.request_file_contents(request).unwrap().into();
+            let bytes = messages.first().unwrap().encode_unframed_pdu().unwrap();
+            assert!(
+                matches!(ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap(),
+                ClipboardPdu::FileContentsRequest(request) if request.data_id == Some(ids[0]))
+            );
+            channel
+                .process(
+                    &ironrdp_core::encode_vec(&ClipboardPdu::FileContentsResponse(
+                        FileContentsResponse::new_data_response(stream, b"old-A".to_vec()),
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(old_read.unwrap().await.unwrap().unwrap(), b"old-A");
+
+            let new_read = handle.read_first_file(5);
+            let Some(ServerEvent::Clipboard(ClipboardMessage::SendFileContentsRequest(request))) =
+                events.recv().await
+            else {
+                panic!("expected B request")
+            };
+            assert_eq!(request.data_id, Some(ids[1]));
+            let stream = request.stream_id;
+            channel.request_file_contents(request).unwrap();
+            channel
+                .process(
+                    &ironrdp_core::encode_vec(&ClipboardPdu::FileContentsResponse(
+                        FileContentsResponse::new_data_response(stream, b"new-B".to_vec()),
+                    ))
+                    .unwrap(),
+                )
+                .unwrap();
+            assert_eq!(new_read.await.unwrap().unwrap(), b"new-B");
+
+            let messages: Vec<ironrdp_svc::SvcMessage> = channel.drive_timeouts().unwrap().into();
+            assert!(messages.iter().any(|message| {
+                let bytes = message.encode_unframed_pdu().unwrap();
+                matches!(ironrdp_core::decode::<ClipboardPdu<'_>>(&bytes).unwrap(),
+                    ClipboardPdu::UnlockData(id) if id.0 == ids[0])
+            }));
+            // Clipboard remains usable after retiring A.
+            assert!(!handle.read_first_file(0).await.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn outbound_public_channel_lock_keeps_original_bytes_and_rejects_released_ids() {
+        use ironrdp_cliprdr::pdu::{
+            Capabilities, ClipboardPdu, ClipboardProtocolVersion, FileContentsFlags, FormatList,
+            FormatListResponse,
+        };
+        use ironrdp_cliprdr::CliprdrServer;
+        use ironrdp_svc::SvcProcessor;
+        let root =
+            std::env::temp_dir().join(format!("hypr-rdp-97-outbound-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let a = root.join("a");
+        let b = root.join("b");
+        std::fs::write(&a, b"old-A").unwrap();
+        std::fs::write(&b, b"new-B").unwrap();
+        let (mut backend, mut events) = backend_with_events();
+        let files = Arc::clone(&backend.files);
+        backend.file_worker = Some(FileWorker::start(
+            Arc::clone(&files),
+            backend.event_sender.as_ref().unwrap().clone(),
+            8,
+            100,
+        ));
+        let sender = backend.event_sender.as_ref().unwrap().clone();
+        let flags = backend.client_capabilities();
+        let mut channel = CliprdrServer::new(Box::new(ReplayBackend(backend)));
+        channel.start().unwrap();
+        channel
+            .process(
+                &ironrdp_core::encode_vec(&ClipboardPdu::Capabilities(Capabilities::new(
+                    ClipboardProtocolVersion::V2,
+                    flags,
+                )))
+                .unwrap(),
+            )
+            .unwrap();
+        fn process(channel: &mut CliprdrServer, pdu: ClipboardPdu<'_>) {
+            channel
+                .process(&ironrdp_core::encode_vec(&pdu).unwrap())
+                .unwrap();
+        }
+        process(
+            &mut channel,
+            ClipboardPdu::FormatList(FormatList::new_unicode(&[], true).unwrap()),
+        );
+        // Snapshot A when the peer really sends its Lock PDU.
+        files.lock().unwrap().entries =
+            Some(Arc::new(super::super::files::freeze_regular_files(vec![a])));
+        announce_file_formats(&files, &sender);
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected file advertisement")
+        };
+        channel.initiate_file_copy(descriptors).unwrap();
+        process(
+            &mut channel,
+            ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+        );
+        process(&mut channel, ClipboardPdu::LockData(LockDataId(77)));
+        files.lock().unwrap().entries =
+            Some(Arc::new(super::super::files::freeze_regular_files(vec![b])));
+        announce_file_formats(&files, &sender);
+        let Some(ServerEvent::Clipboard(ClipboardMessage::SendInitiateFileCopy(descriptors))) =
+            events.blocking_recv()
+        else {
+            panic!("expected file advertisement")
+        };
+        channel.initiate_file_copy(descriptors).unwrap();
+        process(
+            &mut channel,
+            ClipboardPdu::FormatListResponse(FormatListResponse::Ok),
+        );
+        process(&mut channel, ClipboardPdu::LockData(LockDataId(88)));
+        // A repeated ID must not silently bind A's lock to B.
+        process(&mut channel, ClipboardPdu::LockData(LockDataId(77)));
+        let request = |stream_id, data_id| FileContentsRequest {
+            stream_id,
+            index: 0,
+            flags: FileContentsFlags::RANGE,
+            position: 0,
+            requested_size: 5,
+            data_id,
+        };
+        for (id, expected) in [(Some(77), b"old-A"), (Some(88), b"new-B"), (None, b"new-B")] {
+            process(
+                &mut channel,
+                ClipboardPdu::FileContentsRequest(request(1, id)),
+            );
+            let response = recv_file_response(&mut events);
+            assert!(!response.is_error());
+            assert_eq!(response.data(), expected);
+        }
+        process(&mut channel, ClipboardPdu::UnlockData(LockDataId(77)));
+        for id in [77, 999] {
+            process(
+                &mut channel,
+                ClipboardPdu::FileContentsRequest(request(2, Some(id))),
+            );
+            assert!(recv_file_response(&mut events).is_error());
+        }
+        process(
+            &mut channel,
+            ClipboardPdu::FileContentsRequest(request(3, Some(88))),
+        );
+        assert_eq!(recv_file_response(&mut events).data(), b"new-B");
+        drop(channel);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -5,7 +5,9 @@ use anyhow::{bail, Context, Result};
 use ironrdp_server::{DesktopSize, DisplayUpdate};
 use wayland_client::protocol::wl_buffer;
 use wayland_client::{Connection, QueueHandle};
-use wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1;
+use wayland_protocols::ext::image_copy_capture::v1::client::{
+    ext_image_copy_capture_frame_v1, ext_image_copy_capture_session_v1,
+};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
 };
@@ -148,11 +150,49 @@ fn dmabuf_frame_wait_decision(
     }
 }
 
+/// DMA-BUF capture owns the protocol object, not just a cloneable proxy handle.
+struct DmaBufWaylandBuffer(wl_buffer::WlBuffer);
+
+impl Drop for DmaBufWaylandBuffer {
+    fn drop(&mut self) {
+        self.0.destroy();
+    }
+}
+
+/// Keep terminal-event destruction explicit and cover every early loop exit.
+struct DmaBufCaptureFrame(Option<ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1>);
+
+impl DmaBufCaptureFrame {
+    fn new(frame: ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1) -> Self {
+        Self(Some(frame))
+    }
+
+    fn destroy(&mut self) {
+        if let Some(frame) = self.0.take() {
+            frame.destroy();
+        }
+    }
+}
+
+impl std::ops::Deref for DmaBufCaptureFrame {
+    type Target = ext_image_copy_capture_frame_v1::ExtImageCopyCaptureFrameV1;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("capture frame already destroyed")
+    }
+}
+
+impl Drop for DmaBufCaptureFrame {
+    fn drop(&mut self) {
+        self.destroy();
+    }
+}
+
 /// Context for DMA-BUF capture (created during setup, passed to capture loop).
 #[cfg(feature = "vaapi")]
 pub(super) struct DmaBufCaptureContext {
     // Fields drop top-to-bottom; protocol/VA objects must release before GBM owners.
-    wl_buffers: Vec<wl_buffer::WlBuffer>,
+    wl_buffers: Vec<DmaBufWaylandBuffer>,
     vpp: crate::egfx::VppConverter,
     nv12_info: crate::egfx::VppDmaBufInfo,
     drm_device_path: std::path::PathBuf,
@@ -229,15 +269,37 @@ fn setup_dmabuf_inner(
     format: u32,
     modifiers: &[u64],
 ) -> Result<DmaBufCaptureContext> {
-    use crate::capture::dmabuf::{drm_device_from_devt, open_drm_device, GbmBo, GbmDevice};
+    use crate::capture::dmabuf::drm_device_from_devt;
 
     // Find DRM device path from dev_t
     let drm_device_path =
         drm_device_from_devt(dev).context("failed to find DRM device from dev_t")?;
     tracing::trace!(device = %drm_device_path.display(), "DMA-BUF: found DRM device");
 
+    setup_dmabuf_on_device(
+        &drm_device_path,
+        linux_dmabuf,
+        qh,
+        width,
+        height,
+        format,
+        modifiers,
+    )
+}
+
+fn setup_dmabuf_on_device(
+    drm_device_path: &std::path::Path,
+    linux_dmabuf: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+    qh: &QueueHandle<AppState>,
+    width: u32,
+    height: u32,
+    format: u32,
+    modifiers: &[u64],
+) -> Result<DmaBufCaptureContext> {
+    use crate::capture::dmabuf::{open_drm_device, GbmBo, GbmDevice};
+
     // Open DRM device and create GBM device
-    let drm_fd = open_drm_device(&drm_device_path)?;
+    let drm_fd = open_drm_device(drm_device_path)?;
     let gbm_device = GbmDevice::new(drm_fd)?;
 
     // Allocate 2 GBM buffer objects (double-buffered capture)
@@ -289,7 +351,6 @@ fn setup_dmabuf_inner(
             .with_context(|| format!("failed to get DMA-BUF info for buffer {}", i))?;
 
         // Create wl_buffer via linux-dmabuf
-        let params = linux_dmabuf.create_params(qh, ());
         let fd = bo
             .fd()
             .with_context(|| format!("failed to get fd for buffer {}", i))?;
@@ -298,6 +359,7 @@ fn setup_dmabuf_inner(
         let modifier = bo.modifier();
         let modifier_hi = (modifier >> 32) as u32;
         let modifier_lo = (modifier & 0xFFFFFFFF) as u32;
+        let params = linux_dmabuf.create_params(qh, ());
 
         // Add the plane to params.
         // SAFETY: `context.gbm_bos` owns the GBM BOs for the lifetime of these buffers.
@@ -319,6 +381,9 @@ fn setup_dmabuf_inner(
             (),
         );
 
+        params.destroy();
+        let wl_buf = DmaBufWaylandBuffer(wl_buf);
+
         tracing::trace!(
             idx = i,
             fd,
@@ -334,7 +399,7 @@ fn setup_dmabuf_inner(
     }
 
     // Create VPP converter
-    let mut vpp = crate::egfx::VppConverter::new(&drm_device_path, width, height)?;
+    let mut vpp = crate::egfx::VppConverter::new(drm_device_path, width, height)?;
 
     // Import the two XRGB DMA-BUFs as VPP input surfaces
     for (i, info) in dmabuf_infos.iter().enumerate() {
@@ -354,7 +419,7 @@ fn setup_dmabuf_inner(
         wl_buffers,
         vpp,
         nv12_info,
-        drm_device_path,
+        drm_device_path: drm_device_path.to_path_buf(),
         dmabuf_infos,
         gbm_bos,
         gbm_device,
@@ -405,11 +470,11 @@ pub(super) fn capture_loop_ext_dmabuf(
     };
 
     // Start initial capture
-    let mut frame = session.create_frame(qh, ());
+    let mut frame = DmaBufCaptureFrame::new(session.create_frame(qh, ()));
     state.frame_ready = false;
     state.frame_failed = false;
     state.damage_regions.clear();
-    frame.attach_buffer(&dmabuf_ctx.wl_buffers[cap_idx]);
+    frame.attach_buffer(&dmabuf_ctx.wl_buffers[cap_idx].0);
     frame.damage_buffer(0, 0, width as i32, height as i32);
     frame.capture();
     conn.flush().context("Wayland flush failed")?;
@@ -460,8 +525,8 @@ pub(super) fn capture_loop_ext_dmabuf(
         state.frame_ready = false;
         state.frame_failed = false;
         state.damage_regions.clear();
-        frame = session.create_frame(qh, ());
-        frame.attach_buffer(&dmabuf_ctx.wl_buffers[cap_idx]);
+        frame = DmaBufCaptureFrame::new(session.create_frame(qh, ()));
+        frame.attach_buffer(&dmabuf_ctx.wl_buffers[cap_idx].0);
         frame.damage_buffer(0, 0, width as i32, height as i32);
         frame.capture();
         conn.flush().context("Wayland flush failed")?;
@@ -908,3 +973,6 @@ mod tests {
         assert_eq!(tracker.failures(), 0);
     }
 }
+
+#[cfg(test)]
+mod lifecycle_tests;

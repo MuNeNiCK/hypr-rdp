@@ -48,10 +48,12 @@ fn ext_frame_failure_action(failure: ExtFrameFailure) -> ExtFrameFailureAction {
 #[cfg(feature = "vaapi")]
 fn dmabuf_setup_allowed(
     h264_backend: H264BackendPolicy,
-    egfx_available: bool,
+    egfx_shared: Option<&EgfxShared>,
     snapshot: Option<&OutputLayoutSnapshot>,
 ) -> bool {
-    h264_backend.allows_vaapi() && egfx_available && snapshot.is_some_and(dmabuf_zero_copy_allowed)
+    h264_backend.allows_vaapi()
+        && egfx_shared.is_some_and(|shared| shared.codec_policy().allows_avc())
+        && snapshot.is_some_and(dmabuf_zero_copy_allowed)
 }
 
 #[cfg(feature = "vaapi")]
@@ -119,7 +121,8 @@ pub(super) fn capture_loop_ext(
     #[cfg(feature = "vaapi")]
     {
         let snapshot = output_layout.snapshot();
-        if dmabuf_setup_allowed(h264_backend, egfx_shared.is_some(), snapshot.as_ref()) {
+        // This DMA-BUF path only feeds VA-API H.264; ClearCodec uses SHM capture.
+        if dmabuf_setup_allowed(h264_backend, egfx_shared.as_deref(), snapshot.as_ref()) {
             if let Some(ref dmabuf_result) =
                 dmabuf_capture::try_setup_dmabuf(state, qh, width, height)
             {
@@ -473,27 +476,66 @@ mod tests {
 
     #[test]
     fn ext_dmabuf_branch_skips_setup_when_presentation_geometry_is_scaled() {
+        let shared = EgfxShared::with_codec_policy(
+            crate::egfx::DEFAULT_MAX_FRAMES_IN_FLIGHT,
+            crate::egfx::EgfxCodecPolicy::Auto,
+        );
         assert!(dmabuf_setup_allowed(
             H264BackendPolicy::Auto,
-            true,
+            Some(&shared),
             Some(&snapshot((1920, 1080), (1920, 1080)))
         ));
         assert!(!dmabuf_setup_allowed(
             H264BackendPolicy::Auto,
-            true,
+            Some(&shared),
             Some(&snapshot((3840, 2160), (1920, 1080)))
         ));
         assert!(!dmabuf_setup_allowed(
             H264BackendPolicy::Auto,
-            false,
+            None,
             Some(&snapshot((1920, 1080), (1920, 1080)))
         ));
-        assert!(!dmabuf_setup_allowed(H264BackendPolicy::Auto, true, None));
+        assert!(!dmabuf_setup_allowed(
+            H264BackendPolicy::Auto,
+            Some(&shared),
+            None
+        ));
         assert!(!dmabuf_setup_allowed(
             H264BackendPolicy::Software,
-            true,
+            Some(&shared),
             Some(&snapshot((1920, 1080), (1920, 1080)))
         ));
+    }
+
+    #[test]
+    fn ext_clearcodec_policy_skips_dmabuf_setup() {
+        use crate::egfx::{EgfxCodecPolicy, DEFAULT_MAX_FRAMES_IN_FLIGHT};
+
+        let unscaled = snapshot((1920, 1080), (1920, 1080));
+        let scaled = snapshot((3840, 2160), (1920, 1080));
+        for backend in [
+            H264BackendPolicy::Auto,
+            H264BackendPolicy::Software,
+            H264BackendPolicy::Vaapi,
+        ] {
+            for policy in [
+                EgfxCodecPolicy::Auto,
+                EgfxCodecPolicy::Avc420,
+                EgfxCodecPolicy::Avc444,
+                EgfxCodecPolicy::ClearCodec,
+            ] {
+                let shared = EgfxShared::with_codec_policy(DEFAULT_MAX_FRAMES_IN_FLIGHT, policy);
+                assert!(!shared.is_ready(), "setup occurs before negotiation");
+                assert_eq!(
+                    dmabuf_setup_allowed(backend, Some(&shared), Some(&unscaled)),
+                    backend != H264BackendPolicy::Software && policy != EgfxCodecPolicy::ClearCodec,
+                    "backend {backend:?}, policy {policy:?}",
+                );
+                assert!(!dmabuf_setup_allowed(backend, Some(&shared), Some(&scaled)));
+                assert!(!dmabuf_setup_allowed(backend, Some(&shared), None));
+                assert!(!dmabuf_setup_allowed(backend, None, Some(&unscaled)));
+            }
+        }
     }
 
     #[test]

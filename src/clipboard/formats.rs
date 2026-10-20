@@ -3,6 +3,8 @@ pub(super) const MAX_CLIPBOARD_SIZE: usize = 100 * 1024 * 1024;
 pub(super) const TEXT_MIME: &str = "text/plain;charset=utf-8";
 pub(super) const UTF8_MIME: &str = "UTF8_STRING";
 pub(super) const TEXT_PLAIN_MIME: &str = "text/plain";
+/// ICCCM `STRING` (ISO-8859-1), also seen in offers from legacy X11 applications.
+pub(super) const LATIN1_STRING_MIME: &str = "STRING";
 pub(super) const IMAGE_PNG_MIME: &str = "image/png";
 pub(super) const FILE_URI_LIST_MIME: &str = "text/uri-list";
 pub(super) const GNOME_COPIED_FILES_MIME: &str = "x-special/gnome-copied-files";
@@ -37,6 +39,13 @@ impl SelectionKind {
         mimes
             .iter()
             .find(|mime| self.accepts_wayland_mime(mime))
+            .or_else(|| {
+                // Text only offered as Latin-1 STRING (e.g. Motif apps under Xwayland):
+                // read it as a fallback when no UTF-8 text target is offered.
+                (self == Self::Text)
+                    .then(|| mimes.iter().find(|mime| *mime == LATIN1_STRING_MIME))
+                    .flatten()
+            })
             .cloned()
     }
 }
@@ -168,10 +177,155 @@ pub(super) fn utf16le_to_utf8(data: &[u8]) -> String {
     String::from_utf16_lossy(&u16s[..end])
 }
 
+/// Convert a STRING text offer to UTF-8, preserving existing UTF-8 MIME bytes.
+/// Check the output bound before allocation; Latin-1 can double in size.
+pub(super) fn decode_wayland_text_offer(
+    mime: &str,
+    bytes: Vec<u8>,
+    limit: usize,
+) -> Option<Vec<u8>> {
+    if bytes.len() > limit {
+        return None;
+    }
+    match mime {
+        TEXT_MIME | UTF8_MIME | TEXT_PLAIN_MIME => Some(bytes),
+        LATIN1_STRING_MIME => {
+            let high_bytes = bytes.iter().filter(|&&byte| byte >= 0x80).count();
+            let output_len = bytes.len().checked_add(high_bytes)?;
+            if output_len > limit {
+                return None;
+            }
+            let mut text = String::with_capacity(output_len);
+            for byte in bytes {
+                text.push(char::from(byte));
+            }
+            Some(text.into_bytes())
+        }
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn latin1_string_is_a_text_fallback_only() {
+        let only_string = vec!["TARGETS".to_string(), "STRING".to_string()];
+        assert_eq!(
+            SelectionKind::Text
+                .offered_wayland_mime(&only_string)
+                .as_deref(),
+            Some(LATIN1_STRING_MIME)
+        );
+        let both = vec!["STRING".to_string(), "UTF8_STRING".to_string()];
+        assert_eq!(
+            SelectionKind::Text.offered_wayland_mime(&both).as_deref(),
+            Some(UTF8_MIME)
+        );
+        assert_eq!(
+            SelectionKind::Image.offered_wayland_mime(&only_string),
+            None
+        );
+        assert!(!SelectionKind::Text.accepts_wayland_mime(LATIN1_STRING_MIME));
+    }
+
+    #[test]
+    fn latin1_converts_to_utf8() {
+        assert_eq!(
+            decode_wayland_text_offer(LATIN1_STRING_MIME, b"Gr\xfc\xdfe \xe4".to_vec(), 32)
+                .unwrap(),
+            "Grüße ä".as_bytes()
+        );
+        assert_eq!(
+            decode_wayland_text_offer(LATIN1_STRING_MIME, b"plain".to_vec(), 5).unwrap(),
+            b"plain"
+        );
+    }
+
+    #[test]
+    fn string_offer_is_a_read_only_text_fallback() {
+        for utf8 in [TEXT_MIME, UTF8_MIME, TEXT_PLAIN_MIME] {
+            for offers in [[LATIN1_STRING_MIME, utf8], [utf8, LATIN1_STRING_MIME]] {
+                let offers: Vec<_> = offers.into_iter().map(str::to_owned).collect();
+                assert_eq!(
+                    SelectionKind::Text.offered_wayland_mime(&offers).as_deref(),
+                    Some(utf8)
+                );
+            }
+        }
+        let offers = vec!["COMPOUND_TEXT".into(), LATIN1_STRING_MIME.into()];
+        assert_eq!(
+            SelectionKind::Text.offered_wayland_mime(&offers).as_deref(),
+            Some(LATIN1_STRING_MIME)
+        );
+        assert!(SelectionKind::Image.offered_wayland_mime(&offers).is_none());
+        assert!(SelectionKind::Files.offered_wayland_mime(&offers).is_none());
+        assert!(PendingWrite::Text("é".as_bytes().to_vec())
+            .data_for_mime(LATIN1_STRING_MIME)
+            .is_none());
+        assert!(SelectionKind::Text
+            .offered_wayland_mime(&["TEXT".into(), "COMPOUND_TEXT".into()])
+            .is_none());
+    }
+
+    #[test]
+    fn string_text_decoding_enforces_expanded_limit() {
+        assert_eq!(
+            decode_wayland_text_offer(LATIN1_STRING_MIME, vec![0xe9], 1),
+            None
+        );
+        assert_eq!(
+            decode_wayland_text_offer(LATIN1_STRING_MIME, vec![0xe9], 2),
+            Some(vec![0xc3, 0xa9])
+        );
+        assert_eq!(
+            decode_wayland_text_offer(LATIN1_STRING_MIME, vec![0xe9, 0xe9], 3),
+            None
+        );
+        assert_eq!(
+            decode_wayland_text_offer(LATIN1_STRING_MIME, vec![], 0),
+            Some(vec![])
+        );
+        assert_eq!(
+            decode_wayland_text_offer(UTF8_MIME, "四".as_bytes().to_vec(), 2),
+            None
+        );
+        assert_eq!(
+            decode_wayland_text_offer(UTF8_MIME, "四".as_bytes().to_vec(), 3).unwrap(),
+            "四".as_bytes()
+        );
+        assert_eq!(
+            decode_wayland_text_offer("COMPOUND_TEXT", vec![b'a'], 10),
+            None
+        );
+        assert_eq!(
+            String::from_utf8(
+                decode_wayland_text_offer(LATIN1_STRING_MIME, vec![0x80, 0xa3, 0xc3, 0xa9], 8)
+                    .unwrap()
+            )
+            .unwrap(),
+            "\u{80}£Ã©"
+        );
+    }
+
     use super::*;
     use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn generated_string_text_decoding_preserves_codepoints_and_bounds(
+            bytes in prop::collection::vec(any::<u8>(), 0..1024),
+            limit in 0usize..2048,
+        ) {
+            let expected_len: usize = bytes.iter().map(|&b| if b < 0x80 { 1 } else { 2 }).sum();
+            let decoded = decode_wayland_text_offer(LATIN1_STRING_MIME, bytes.clone(), limit);
+            prop_assert_eq!(decoded.is_some(), expected_len <= limit);
+            if let Some(decoded) = decoded {
+                prop_assert_eq!(decoded.len(), expected_len);
+                let text = String::from_utf8(decoded).unwrap();
+                prop_assert_eq!(text.chars().map(u32::from).collect::<Vec<_>>(), bytes.iter().map(|&b| u32::from(b)).collect::<Vec<_>>());
+            }
+        }
+    }
 
     fn utf16le(units: &[u16]) -> Vec<u8> {
         units.iter().flat_map(|u| u.to_le_bytes()).collect()

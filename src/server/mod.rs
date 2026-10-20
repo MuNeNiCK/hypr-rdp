@@ -19,6 +19,8 @@ use crate::egfx::{EgfxShared, HyprGfxFactory};
 use crate::input::{HyprInputHandler, RdpInputSessionSink, SharedOutputLayout};
 
 pub(crate) mod auth;
+#[cfg(test)]
+mod session_hook_connection_tests;
 mod session_hooks;
 mod tls;
 #[cfg(test)]
@@ -123,7 +125,7 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_input_handler(input_handler)
         .with_display_handler(display)
         .with_credential_validator(authentication.validator)
-        .with_preempt_existing_session(security_mode.allows_authenticated_replacement())
+        .with_connection_policy(security_mode.connection_policy())
         .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
             input_session_sink,
             session_hooks,
@@ -357,12 +359,18 @@ mod tests {
 
     #[test]
     fn replacement_requires_nla_credentials() {
-        assert!(!security_mode_for_credentials(&None).allows_authenticated_replacement());
+        assert_eq!(
+            security_mode_for_credentials(&None).connection_policy(),
+            ironrdp_server::ConnectionPolicy::Queue
+        );
         let credentials = ironrdp_credentials(Some(ConfigCredentials {
             username: "user".into(),
             password: "pass".into(),
         }));
-        assert!(security_mode_for_credentials(&credentials).allows_authenticated_replacement());
+        assert_eq!(
+            security_mode_for_credentials(&credentials).connection_policy(),
+            ironrdp_server::ConnectionPolicy::Preempt
+        );
     }
 
     #[test]
@@ -412,7 +420,7 @@ mod tests {
             let mut server = builder
                 .with_no_input()
                 .with_no_display()
-                .with_preempt_existing_session(mode.allows_authenticated_replacement())
+                .with_connection_policy(mode.connection_policy())
                 .with_connection_handler(Some(Box::new(Accepted(accepted_tx))))
                 .build();
             if mode == ServerSecurityMode::Hybrid {

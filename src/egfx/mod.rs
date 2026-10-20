@@ -5,6 +5,7 @@ mod clearcodec;
 mod factory;
 mod frame;
 mod h264;
+mod output_queue;
 mod rdpegfx;
 mod shared;
 #[cfg(feature = "vaapi")]
@@ -35,3 +36,6 @@ pub(crate) use vpp::{VppConverter, VppDmaBufInfo};
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod output_queue_tests;

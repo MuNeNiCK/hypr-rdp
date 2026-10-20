@@ -1,0 +1,46 @@
+name: Bug report
+description: Report unexpected behavior in hypr-rdp.
+labels: [bug]
+body:
+  - type: textarea
+    id: actual-behavior
+    attributes:
+      label: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: expected-behavior
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps or circumstances
+      description: Describe what led to the problem, including reproduction steps if known.
+  - type: input
+    id: version
+    attributes:
+      label: hypr-rdp version
+      description: Release version or commit, and installation method, if known.
+  - type: textarea
+    id: server-environment
+    attributes:
+      label: Server environment
+      description: Include the Linux distribution, Hyprland version, and GPU or driver when relevant.
+  - type: textarea
+    id: client-environment
+    attributes:
+      label: RDP client
+      description: Include the client application, version, and operating system.
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Configuration
+      description: Include relevant options such as capture mode, codec, and encoder backend. Omit credentials and private keys.
+      render: text
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Logs or screenshots

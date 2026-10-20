@@ -3,6 +3,7 @@ mod damage;
 pub mod dmabuf;
 mod frame;
 mod scale;
+mod session_memory;
 mod wayland;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -816,7 +817,10 @@ impl RdpServerDisplay for HyprDisplay {
         };
         stop_flag.store(true, Ordering::Release);
         if let Some(handle) = handle {
-            let _ = tokio::task::spawn_blocking(move || handle.join()).await;
+            let _ = tokio::task::spawn_blocking(move || {
+                session_memory::join_previous_capture(handle);
+            })
+            .await;
         }
 
         let mut inner = self.inner.lock().await;

@@ -2,7 +2,7 @@
 mod pam;
 
 use crate::config::{AuthConfig, ConfigCredentials};
-use ironrdp_server::{CredentialValidator, Credentials};
+use ironrdp_server::{ConnectionPolicy, CredentialValidator, Credentials};
 use std::sync::Arc;
 
 pub(crate) use pam::{dispatch_helper, valid_pam_service};
@@ -51,10 +51,13 @@ pub(super) enum ServerSecurityMode {
 }
 
 impl ServerSecurityMode {
-    pub(super) fn allows_authenticated_replacement(self) -> bool {
+    pub(super) fn connection_policy(self) -> ConnectionPolicy {
         // IronRDP authenticates Hybrid candidates through CredSSP before eviction.
         // TLS alone only proves the handshake, so keep its existing queue policy.
-        matches!(self, Self::Hybrid)
+        match self {
+            Self::Hybrid => ConnectionPolicy::Preempt,
+            Self::Tls => ConnectionPolicy::Queue,
+        }
     }
 }
 

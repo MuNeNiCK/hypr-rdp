@@ -56,6 +56,7 @@ struct State {
     closed: bool,
     stream: bool,
     huge: bool,
+    locking: bool,
     current: Selection,
     /// Superseded selections still serving open handles, by their generation.
     retiring: BTreeMap<u64, Selection>,
@@ -199,6 +200,7 @@ impl Transfer {
                 closed: false,
                 stream: false,
                 huge: false,
+                locking: false,
                 current: Selection {
                     tree: RemoteTree::empty(),
                     data_id: None,
@@ -216,17 +218,18 @@ impl Transfer {
         }
     }
 
-    pub(super) fn capabilities(&self, stream: bool, huge: bool) -> Vec<u64> {
+    pub(super) fn capabilities(&self, stream: bool, huge: bool, locking: bool) -> Vec<u64> {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
-        let released = if state.stream != stream || state.huge != huge {
+        let released = if state.stream != stream || state.huge != huge || state.locking != locking {
             state.shutdown()
         } else {
             Vec::new()
         };
         state.stream = stream;
         state.huge = huge;
+        state.locking = locking;
         released
     }
 
@@ -263,7 +266,7 @@ impl Transfer {
         let Ok(mut state) = self.state.lock() else {
             return Vec::new();
         };
-        let released: Vec<u64> = state
+        let mut released: Vec<u64> = state
             .retiring
             .iter()
             .filter(|(_, selection)| {
@@ -273,6 +276,17 @@ impl Transfer {
             })
             .map(|(generation, _)| *generation)
             .collect();
+        if state
+            .current
+            .data_id
+            .is_some_and(|id| data_ids.contains(&id))
+        {
+            let generation = state.generation;
+            state.take_current();
+            state.fail_pending(generation);
+            state.bump();
+            released.push(generation);
+        }
         for generation in &released {
             state.retiring.remove(generation);
             state.fail_pending(*generation);
@@ -316,6 +330,7 @@ impl Transfer {
         let base = state.next_base;
         let tree = RemoteTree::build(files, self.max_entries, base);
         state.next_base = tree.next_base();
+        let data_id = data_id.filter(|_| state.locking);
         state.current = Selection { tree, data_id };
         let roots = state
             .current
@@ -595,7 +610,7 @@ mod tests {
                     assert!(events.try_recv().is_err());
                 }
                 transfer.close();
-                transfer.capabilities(true, true);
+                transfer.capabilities(true, true, true);
                 assert!(!transfer.enabled());
                 assert!(transfer.read(generation, inode, 0, 1).await.is_err());
             });
@@ -608,7 +623,7 @@ mod tests {
     ) -> (Transfer, mpsc::UnboundedReceiver<ServerEvent>, u64, u64) {
         let (sender, receiver) = mpsc::unbounded_channel();
         let transfer = Transfer::new(sender, 100, chunk);
-        transfer.capabilities(true, true);
+        transfer.capabilities(true, true, true);
         let (generation, _) = transfer.accept(files, Some(77)).unwrap();
         let inode = transfer
             .with_tree(generation, |tree| tree.roots()[0])
@@ -754,7 +769,7 @@ mod tests {
     async fn an_unlocked_selection_is_ended_by_its_replacement() {
         let (sender, mut events) = mpsc::unbounded_channel();
         let transfer = Transfer::new(sender, 100, 5);
-        transfer.capabilities(true, true);
+        transfer.capabilities(true, true, true);
         let (generation, _) = transfer
             .accept(&[FileDescriptor::new("old").with_file_size(5)], None)
             .unwrap();
@@ -778,6 +793,44 @@ mod tests {
         );
         assert!(pending.await.unwrap().is_err());
         assert!(transfer.with_tree(generation, |_| ()).is_none());
+    }
+
+    #[tokio::test]
+    async fn released_live_lock_cancels_reads_and_cannot_be_retired() {
+        let (transfer, mut events, generation, inode) =
+            setup(&[FileDescriptor::new("old").with_file_size(5)], 5);
+        let pending = read(&transfer, generation, inode, 0, 5);
+        let old = request(&mut events).await;
+        assert_eq!(transfer.release_locks(&[77]), vec![generation]);
+        assert!(pending.await.unwrap().is_err());
+        assert!(transfer.with_tree(generation, |_| ()).is_none());
+        transfer.retire_generation();
+        assert!(transfer.with_tree(generation, |_| ()).is_none());
+        transfer.on_response(FileContentsResponse::new_data_response(
+            old.stream_id,
+            b"stale".to_vec(),
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn retired_selection_ceiling_and_shutdown_bound_all_generations() {
+        let (transfer, _events, first, _) =
+            setup(&[FileDescriptor::new("old").with_file_size(5)], 5);
+        let mut generations = vec![first];
+        for id in 100..110 {
+            let (generation, _) = transfer
+                .accept(&[FileDescriptor::new("new").with_file_size(5)], Some(id))
+                .unwrap();
+            generations.push(generation);
+            assert!(transfer.state.lock().unwrap().retiring.len() <= MAX_RETIRING);
+        }
+        assert!(transfer.with_tree(first, |_| ()).is_none());
+        transfer.capabilities(true, true, false);
+        for generation in generations {
+            assert!(transfer.with_tree(generation, |_| ()).is_none());
+        }
+        assert!(transfer.state.lock().unwrap().retiring.is_empty());
     }
 
     #[tokio::test]

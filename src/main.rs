@@ -11,6 +11,8 @@ mod server;
 use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
+const DEFAULT_LOG_FILTER: &str = "hypr_rdp=info,ironrdp_server=error";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     if let Some(status) = server::auth::dispatch_helper() {
@@ -20,7 +22,8 @@ async fn main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("hypr_rdp=info")),
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(DEFAULT_LOG_FILTER)),
         )
         .init();
 
@@ -52,4 +55,50 @@ async fn shutdown_signal() -> Result<()> {
         _ = tokio::signal::ctrl_c() => tracing::info!("Received SIGINT"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_logging_reports_rdp_connection_errors() {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(EnvFilter::new(DEFAULT_LOG_FILTER))
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || CapturedLog(writer.clone()))
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "ironrdp_server::server", "connection-error-regression");
+            tracing::info!(target: "hypr_rdp::server", "application-info-regression");
+            tracing::warn!(target: "ironrdp_server::server", "suppressed-slow-writer-warning");
+            tracing::debug!(target: "ironrdp_server::server", "suppressed-protocol-debug");
+            tracing::error!(target: "unrelated_dependency", "suppressed-unrelated-error");
+            tracing::debug!(target: "hypr_rdp::server", "suppressed-application-debug");
+        });
+
+        let output = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("connection-error-regression"), "{output}");
+        assert!(output.contains("application-info-regression"), "{output}");
+        assert!(!output.contains("suppressed-"), "{output}");
+    }
 }

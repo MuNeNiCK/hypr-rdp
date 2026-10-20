@@ -113,6 +113,8 @@ To use the desktop user's Linux password, set `auth_mode = "pam"` and remove
 [PAM service](pkg/pam/) as `/etc/pam.d/hypr-rdp` (included in Arch packages).
 PAM requires a TLS-capable client (FreeRDP: `/sec:tls`, without NLA) and allows
 only the user running the existing desktop, one connection at a time.
+Clients must supply credentials in TLS mode; mstsc may require saved credentials
+in Windows Credential Manager instead of displaying a password prompt.
 
 Common settings are listed below. Config keys use underscores in place of hyphens.
 Run `hypr-rdp --help` for all options.
@@ -122,7 +124,7 @@ Run `hypr-rdp --help` for all options.
 | `--auth-mode` | `configured` credentials or Linux `pam` | `configured` |
 | `--pam-service` | PAM service name | `hypr-rdp` |
 | `--capture-mode` | `wlr` or `ext` capture protocol | `wlr` |
-| `--egfx-codec` | `avc420`, experimental `avc444`, or `auto` | `avc420` |
+| `--egfx-codec` | `avc420`, experimental `avc444`, `auto`, or `clearcodec` (lossless, damage-only ClearCodec instead of H.264 for EGFX clients) | `avc420` |
 | `--h264-backend` | `auto`, `software`, or `vaapi` | `auto` |
 | `--bitrate` | Video bitrate in bits/s | `10000000` |
 | `--quality` | H.264 quality, 0–51 (lower is better) | `23` |
@@ -138,8 +140,11 @@ Run `hypr-rdp --help` for all options.
 Clipboard file transfer copies files or folders in either file manager and
 pastes them into the other; the RDP client must support clipboard file
 streaming. Cut acts as copy and source files are never deleted, so keep them
-unchanged until the transfer finishes. Wait for a transfer to finish before
-copying another selection.
+unchanged until the transfer finishes. When the client negotiates clipboard-data
+locking, an active paste can keep reading its original selection after another
+selection is copied. Up to four replaced inbound selections are retained until
+their locks are released; older selections are cancelled at that limit. Without
+locking, wait for a transfer to finish before copying another selection.
 
 ### Session hooks
 
