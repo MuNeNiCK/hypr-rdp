@@ -424,7 +424,7 @@ pub struct VaapiEncoder {
     coded_buffers: Vec<VaBuffer>,
     dmabuf_input_surface: Option<VaSurface>,
     context: VaContext,
-    _config: VaConfig,
+    config: VaConfig,
     display: Rc<VaDisplay>,
     current_input_surface: usize,
     current_recon_surface: usize,
@@ -627,7 +627,7 @@ impl VaapiEncoder {
             coded_buffers,
             dmabuf_input_surface: None,
             context,
-            _config: config,
+            config,
             display,
             current_input_surface: 0,
             current_recon_surface: 0,
@@ -890,6 +890,19 @@ impl VaapiEncoder {
         Ok(data)
     }
 
+    /// Memory-type mask and import path this encoder uses for the NV12
+    /// DMA-BUF input, for the failure record.
+    pub(crate) fn dmabuf_import_evidence(&self) -> (Option<u32>, &'static str) {
+        let config_id = self.config.id;
+        let memory_types = self.display.surface_memory_types(config_id);
+        let import_path = if self.display.supports_prime2_import(config_id) {
+            "DRM_PRIME_2"
+        } else {
+            "DRM_PRIME (legacy)"
+        };
+        (memory_types, import_path)
+    }
+
     /// Encode from an NV12 DMA-BUF (zero-copy path).
     ///
     /// Imports the NV12 DMA-BUF as an encoder input surface (cached after first call),
@@ -907,6 +920,22 @@ impl VaapiEncoder {
         uv_offset: u32,
     ) -> Result<Vec<u8>> {
         if self.dmabuf_input_surface.is_none() {
+            let config_id = self.config.id;
+            let prime2_import = self.display.supports_prime2_import(config_id);
+            let memory_types = self.display.surface_memory_types(config_id);
+            tracing::info!(
+                width,
+                height,
+                memory_types = memory_types
+                    .map_or_else(|| "query-failed".to_owned(), |mask| format!("0x{mask:08x}")),
+                import_path = if prime2_import {
+                    "DRM_PRIME_2"
+                } else {
+                    "DRM_PRIME (legacy)"
+                },
+                "Encoder DMA-BUF import initialized"
+            );
+
             let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { mem::zeroed() };
             desc.fourcc = sys::fourcc(b"NV12");
             desc.width = width;
@@ -931,7 +960,7 @@ impl VaapiEncoder {
 
             let surface = self
                 .display
-                .import_prime_surface(VA_RT_FORMAT_YUV420, width, height, &mut desc)
+                .import_prime_surface(config_id, VA_RT_FORMAT_YUV420, width, height, &mut desc)
                 .map_err(|e| anyhow::anyhow!("Failed to import NV12 DMA-BUF surface: {}", e))?;
             tracing::trace!(
                 surface_id = surface.id(),
@@ -1021,9 +1050,11 @@ impl VaapiEncoder {
                 .extend(self.create_packed_slice_buffers(is_idr, frame_num, idr_pic_id, poc)?);
         }
 
+        // Keep the source error in the chain: the capture loop downcasts a
+        // surface-sync deadline to record its raw VA status.
         self.context
             .render_picture(dmabuf_surface_id, &picture_buffers)
-            .map_err(|e| anyhow::anyhow!("VA-API render failed (dmabuf): {}", e))?;
+            .map_err(|e| e.context("VA-API render failed (dmabuf)"))?;
 
         self.references.record(
             role,
