@@ -234,9 +234,10 @@ pub fn output_create_headless(name: &str) -> Result<()> {
 
 /// Set a monitor rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").
 ///
-/// Hyprland's new (Lua) config parser rejects `keyword` with
-/// "keyword can't work with non-legacy parsers. Use eval."
-/// In that case, retry as `eval hl.monitor({...})`.
+/// With a Lua config, Hyprland 0.55 and 0.56 reject `keyword` with
+/// "keyword can't work with non-legacy parsers. Use eval.", and Hyprland 0.57
+/// (no legacy config support, no `keyword` command) replies "unknown request".
+/// In either case, retry as `eval hl.monitor({...})`.
 pub fn keyword_monitor(rule: &str) -> Result<()> {
     match send_action(&format!("keyword monitor {}", rule)) {
         Ok(()) => Ok(()),
@@ -248,9 +249,10 @@ pub fn keyword_monitor(rule: &str) -> Result<()> {
 }
 
 fn is_non_legacy_parser_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("non-legacy parsers"))
+    error.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.contains("non-legacy parsers") || msg == "Hyprland IPC error: unknown request"
+    })
 }
 
 fn monitor_rule_to_lua(rule: &str) -> Result<String> {
@@ -605,9 +607,18 @@ mod tests {
     }
 
     #[test]
+    fn non_legacy_parser_error_detection_matches_hyprland_057_unknown_request() {
+        let err = anyhow!("Hyprland IPC error: unknown request");
+
+        assert!(is_non_legacy_parser_error(&err));
+    }
+
+    #[test]
     fn non_legacy_parser_error_detection_ignores_other_errors() {
         let err = anyhow!("Hyprland IPC error: monitor rule failed");
+        assert!(!is_non_legacy_parser_error(&err));
 
+        let err = anyhow!("Hyprland IPC error: unknown request: keyword monitor");
         assert!(!is_non_legacy_parser_error(&err));
     }
 }
