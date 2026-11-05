@@ -183,7 +183,7 @@ impl EgfxShared {
         }
     }
 
-    pub(in crate::egfx) fn max_frames_in_flight(&self) -> u32 {
+    pub(crate) fn max_frames_in_flight(&self) -> u32 {
         self.max_frames_in_flight.load(Ordering::Acquire).max(1)
     }
 

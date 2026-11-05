@@ -32,6 +32,8 @@ pub(crate) use shared::GFX_READY_GRACE;
 pub use shared::{EgfxCodecPolicy, EgfxShared, DEFAULT_MAX_FRAMES_IN_FLIGHT};
 pub(crate) use shared::{EgfxFrameFlowSnapshot, EgfxFrameReadiness};
 #[cfg(feature = "vaapi")]
+pub(crate) use vaapi_sys::SurfaceSyncTimeout;
+#[cfg(feature = "vaapi")]
 pub(crate) use vpp::{VppConverter, VppDmaBufInfo};
 
 #[cfg(test)]

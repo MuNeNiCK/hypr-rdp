@@ -1,5 +1,7 @@
 //! VA-API Video Post-Processing (VPP) for color conversion (XRGB -> NV12).
 //!
+use std::ffi::c_void;
+use std::os::raw::c_ulong;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
 use std::rc::Rc;
@@ -8,18 +10,30 @@ use anyhow::{bail, Context, Result};
 use libva_sys::va_display_drm as va;
 
 use super::vaapi_sys::{
-    self as sys, va_check, VABufferID, VAConfigID, VAContextID, VADRMPRIMESurfaceDescriptor,
-    VASurfaceAttrib, VASurfaceID, VA_FOURCC_BGRA, VA_FOURCC_BGRX,
+    self as sys, integer_surface_attr, pointer_surface_attr, va_check, VABufferID, VAConfigID,
+    VAContextID, VADRMPRIMESurfaceDescriptor, VASurfaceAttrib, VASurfaceAttribExternalBuffers,
+    VASurfaceID, VA_FOURCC_BGRA, VA_FOURCC_BGRX,
 };
 
 // Constants from VA-API headers
 const VA_RT_FORMAT_RGB32: u32 = sys::VA_RT_FORMAT_RGB32;
 const VA_RT_FORMAT_YUV420: u32 = sys::VA_RT_FORMAT_YUV420;
+const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME: u32 = sys::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME;
 const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = sys::VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+const VA_SURFACE_EXTBUF_DESC_ENABLE_TILING: u32 = sys::VA_SURFACE_EXTBUF_DESC_ENABLE_TILING;
 const VA_EXPORT_SURFACE_READ_ONLY: u32 = sys::VA_EXPORT_SURFACE_READ_ONLY;
 const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = sys::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 const DRM_FORMAT_XRGB8888: u32 = 0x34325258;
 const DRM_FORMAT_ARGB8888: u32 = 0x34324152;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+fn input_va_fourcc(drm_format: u32) -> Result<u32> {
+    match drm_format {
+        DRM_FORMAT_XRGB8888 => Ok(VA_FOURCC_BGRX),
+        DRM_FORMAT_ARGB8888 => Ok(VA_FOURCC_BGRA),
+        _ => bail!("unsupported DRM format for VPP input: 0x{:08x}", drm_format),
+    }
+}
 
 fn input_surface_descriptor(
     dmabuf_fd: RawFd,
@@ -29,11 +43,7 @@ fn input_surface_descriptor(
     modifier: u64,
     drm_format: u32,
 ) -> Result<(u32, VADRMPRIMESurfaceDescriptor)> {
-    let va_fourcc = match drm_format {
-        DRM_FORMAT_XRGB8888 => VA_FOURCC_BGRX,
-        DRM_FORMAT_ARGB8888 => VA_FOURCC_BGRA,
-        _ => bail!("unsupported DRM format for VPP input: 0x{:08x}", drm_format),
-    };
+    let va_fourcc = input_va_fourcc(drm_format)?;
 
     let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { std::mem::zeroed() };
     desc.fourcc = va_fourcc;
@@ -51,6 +61,36 @@ fn input_surface_descriptor(
     desc.layers[0].pitch[0] = stride;
 
     Ok((VA_RT_FORMAT_RGB32, desc))
+}
+
+/// Legacy `DRM_PRIME` descriptor for drivers without `PRIME_2` import (i965).
+/// `buffer` must outlive the `vaCreateSurfaces` call that consumes it.
+fn legacy_input_surface_descriptor(
+    buffer: &mut c_ulong,
+    width: u32,
+    height: u32,
+    stride: u32,
+    modifier: u64,
+    drm_format: u32,
+) -> Result<VASurfaceAttribExternalBuffers> {
+    let mut desc: VASurfaceAttribExternalBuffers = unsafe { std::mem::zeroed() };
+    desc.pixel_format = input_va_fourcc(drm_format)?;
+    desc.width = width;
+    desc.height = height;
+    desc.data_size = stride * height;
+    desc.num_planes = 1;
+    desc.pitches[0] = stride;
+    desc.offsets[0] = 0;
+    desc.buffers = buffer as *mut c_ulong as *mut usize;
+    desc.num_buffers = 1;
+    // The tiling flag must follow the real modifier: linear + ENABLE_TILING
+    // is rejected by i965.
+    desc.flags = if modifier == DRM_FORMAT_MOD_LINEAR {
+        0
+    } else {
+        VA_SURFACE_EXTBUF_DESC_ENABLE_TILING.into()
+    };
+    Ok(desc)
 }
 
 #[derive(Debug, Clone)]
@@ -82,6 +122,7 @@ pub struct VppConverter {
     width: u32,
     height: u32,
     nv12_export_fd: Option<OwnedFd>,
+    prime2_import: bool,
 }
 
 impl VppConverter {
@@ -152,10 +193,22 @@ impl VppConverter {
             "vaCreateContext (VPP)",
         )?;
 
+        let prime2_import = va_display.supports_prime2_import(config_id);
+        let memory_types = va_display.surface_memory_types(config_id);
+
         tracing::info!(
             width,
             height,
             device = %drm_device_path.display(),
+            memory_types = memory_types.map_or_else(
+                || "query-failed".to_owned(),
+                |mask| format!("0x{mask:08x}")
+            ),
+            import_path = if prime2_import {
+                "DRM_PRIME_2"
+            } else {
+                "DRM_PRIME (legacy)"
+            },
             "VPP converter initialized"
         );
 
@@ -168,6 +221,7 @@ impl VppConverter {
             width,
             height,
             nv12_export_fd: None,
+            prime2_import,
         })
     }
 
@@ -182,23 +236,99 @@ impl VppConverter {
         modifier: u64,
         format: u32,
     ) -> Result<usize> {
+        let surface_id = if self.prime2_import {
+            self.import_prime2_input_surface(dmabuf_fd, width, height, stride, modifier, format)?
+        } else {
+            self.import_legacy_input_surface(dmabuf_fd, width, height, stride, modifier, format)?
+        };
+
+        let idx = self.input_surfaces.len();
+        self.input_surfaces.push(surface_id);
+        tracing::trace!(
+            idx,
+            surface_id,
+            format = format!("0x{:08x}", format),
+            prime2 = self.prime2_import,
+            "VPP: imported input surface"
+        );
+        Ok(idx)
+    }
+
+    fn import_prime2_input_surface(
+        &self,
+        dmabuf_fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        modifier: u64,
+        format: u32,
+    ) -> Result<VASurfaceID> {
         let (rt_format, mut desc) =
             input_surface_descriptor(dmabuf_fd, width, height, stride, modifier, format)?;
+        let mut attrs = [
+            integer_surface_attr(
+                va::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
+            ),
+            pointer_surface_attr(
+                va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                &mut desc as *mut _ as *mut c_void,
+            ),
+        ];
+        self.create_input_surface(
+            rt_format,
+            width,
+            height,
+            &mut attrs,
+            "vaCreateSurfaces (VPP input import)",
+        )
+    }
 
-        let mut attrs: [VASurfaceAttrib; 2] = unsafe { std::mem::zeroed() };
+    fn import_legacy_input_surface(
+        &self,
+        dmabuf_fd: RawFd,
+        width: u32,
+        height: u32,
+        stride: u32,
+        modifier: u64,
+        format: u32,
+    ) -> Result<VASurfaceID> {
+        let mut buffer_fd = dmabuf_fd as c_ulong;
+        let mut desc = legacy_input_surface_descriptor(
+            &mut buffer_fd,
+            width,
+            height,
+            stride,
+            modifier,
+            format,
+        )?;
+        let mut attrs = [
+            integer_surface_attr(
+                va::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32,
+            ),
+            pointer_surface_attr(
+                va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                &mut desc as *mut _ as *mut c_void,
+            ),
+        ];
+        self.create_input_surface(
+            VA_RT_FORMAT_RGB32,
+            width,
+            height,
+            &mut attrs,
+            "vaCreateSurfaces (VPP legacy input import)",
+        )
+    }
 
-        // Memory type attribute
-        attrs[0].type_ = va::VASurfaceAttribType_VASurfaceAttribMemoryType;
-        attrs[0].flags = va::VA_SURFACE_ATTRIB_SETTABLE;
-        attrs[0].value.type_ = va::VAGenericValueType_VAGenericValueTypeInteger;
-        attrs[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32;
-
-        // External buffer descriptor attribute
-        attrs[1].type_ = va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor;
-        attrs[1].flags = va::VA_SURFACE_ATTRIB_SETTABLE;
-        attrs[1].value.type_ = va::VAGenericValueType_VAGenericValueTypePointer;
-        attrs[1].value.value.p = &mut desc as *mut _ as *mut std::ffi::c_void;
-
+    fn create_input_surface(
+        &self,
+        rt_format: u32,
+        width: u32,
+        height: u32,
+        attrs: &mut [VASurfaceAttrib],
+        op: &str,
+    ) -> Result<VASurfaceID> {
         let mut surface_id: VASurfaceID = 0;
         va_check(
             unsafe {
@@ -210,21 +340,12 @@ impl VppConverter {
                     &mut surface_id,
                     1,
                     attrs.as_mut_ptr(),
-                    2,
+                    attrs.len() as u32,
                 )
             },
-            "vaCreateSurfaces (VPP input import)",
+            op,
         )?;
-
-        let idx = self.input_surfaces.len();
-        self.input_surfaces.push(surface_id);
-        tracing::trace!(
-            idx,
-            surface_id,
-            format = format!("0x{:08x}", format),
-            "VPP: imported input surface"
-        );
-        Ok(idx)
+        Ok(surface_id)
     }
 
     /// Export the NV12 output surface as a DMA-BUF.
@@ -336,8 +457,9 @@ impl VppConverter {
                 unsafe { va::vaEndPicture(self.va_display.raw(), self.context_id) },
                 "vaEndPicture (VPP)",
             )?;
-            va_check(
-                unsafe { va::vaSyncSurface(self.va_display.raw(), self.output_surface) },
+            sys::va_sync_surface(
+                self.va_display.raw(),
+                self.output_surface,
                 "vaSyncSurface (VPP output)",
             )?;
             Ok(())
@@ -348,6 +470,18 @@ impl VppConverter {
         }
 
         result
+    }
+
+    /// Memory-type mask and import path this converter chose, for the failure
+    /// record. Served from the display's per-config cache, never per frame.
+    pub(crate) fn import_evidence(&self) -> (Option<u32>, &'static str) {
+        let memory_types = self.va_display.surface_memory_types(self.config_id);
+        let import_path = if self.prime2_import {
+            "DRM_PRIME_2"
+        } else {
+            "DRM_PRIME (legacy)"
+        };
+        (memory_types, import_path)
     }
 
     /// Get the number of imported input surfaces.
@@ -406,6 +540,56 @@ mod tests {
     #[test]
     fn vpp_import_descriptor_rejects_unsupported_drm_format() {
         let error = input_surface_descriptor(0, 1, 1, 4, 0, 0)
+            .err()
+            .expect("unsupported format must fail");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported DRM format for VPP input"));
+    }
+
+    fn legacy_descriptor(modifier: u64) -> VASurfaceAttribExternalBuffers {
+        let mut buffer = 7;
+        legacy_input_surface_descriptor(
+            &mut buffer,
+            1920,
+            1080,
+            7680,
+            modifier,
+            DRM_FORMAT_XRGB8888,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_import_descriptor_describes_the_xrgb_buffer() {
+        let desc = legacy_descriptor(DRM_FORMAT_MOD_LINEAR);
+
+        assert_eq!(desc.pixel_format, VA_FOURCC_BGRX);
+        assert_eq!(desc.width, 1920);
+        assert_eq!(desc.height, 1080);
+        assert_eq!(desc.data_size, 7680 * 1080);
+        assert_eq!(desc.num_planes, 1);
+        assert_eq!(desc.pitches[0], 7680);
+        assert_eq!(desc.offsets[0], 0);
+        assert_eq!(desc.num_buffers, 1);
+        assert_eq!(unsafe { *desc.buffers }, 7);
+    }
+
+    #[test]
+    fn legacy_import_descriptor_tiles_only_when_the_modifier_is_tiled() {
+        // I915_FORMAT_MOD_X_TILED: the only non-linear layout i965 accepts here.
+        assert_eq!(
+            legacy_descriptor(0x0100_0000_0000_0001).flags as u32,
+            VA_SURFACE_EXTBUF_DESC_ENABLE_TILING
+        );
+        assert_eq!(legacy_descriptor(DRM_FORMAT_MOD_LINEAR).flags, 0);
+    }
+
+    #[test]
+    fn legacy_import_descriptor_rejects_unsupported_drm_format() {
+        let mut buffer = 0;
+        let error = legacy_input_surface_descriptor(&mut buffer, 1, 1, 4, 0, 0)
             .err()
             .expect("unsupported format must fail");
 

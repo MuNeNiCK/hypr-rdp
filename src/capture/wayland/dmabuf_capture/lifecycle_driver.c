@@ -85,6 +85,19 @@ VAStatus vaCreateSurfaces(VADisplay d, unsigned int fmt, unsigned int w, unsigne
     for (unsigned int i = 0; i < n; i++) out[i] = 100 + surfaces++;
     record("surface+"); return VA_STATUS_SUCCESS;
 }
+VAStatus vaQuerySurfaceAttributes(VADisplay d, VAConfigID c, VASurfaceAttrib *a, unsigned int *n)
+{
+    (void)d; (void)c;
+    /* Capacity in, written count out: the i965 convention this shim mirrors. */
+    if (*n > 0) {
+        a[0].type = VASurfaceAttribMemoryType;
+        a[0].flags = VA_SURFACE_ATTRIB_SETTABLE;
+        a[0].value.type = VAGenericValueTypeInteger;
+        a[0].value.value.i = VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+        *n = 1;
+    }
+    return VA_STATUS_SUCCESS;
+}
 VAStatus vaCreateContext(VADisplay d, VAConfigID c, int w, int h, int flags,
                          VASurfaceID *s, int n, VAContextID *out)
 {

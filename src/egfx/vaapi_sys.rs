@@ -1,15 +1,20 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
+use std::fmt;
 use std::mem;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::Path;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use libva_sys::va_display_drm as va;
 
 pub(crate) use va::{
     VABufferID, VAConfigAttrib, VAConfigID, VAContextID, VADisplay, VAEntrypoint, VAImage,
-    VAImageFormat, VAProfile, VAStatus, VASurfaceAttrib, VASurfaceID,
+    VAImageFormat, VAProfile, VAStatus, VASurfaceAttrib, VASurfaceAttribExternalBuffers,
+    VASurfaceID,
 };
 
 #[repr(C)]
@@ -57,7 +62,10 @@ pub(crate) const VA_CONFIG_ATTRIB_RATE_CONTROL: u32 =
 pub(crate) const VA_PICTURE_H264_INVALID: u32 = va::VA_PICTURE_H264_INVALID;
 pub(crate) const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 =
     va::VA_PICTURE_H264_SHORT_TERM_REFERENCE;
+pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME: u32 = 0x2000_0000;
 pub(crate) const VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2: u32 = 0x4000_0000;
+pub(crate) const VA_SURFACE_EXTBUF_DESC_ENABLE_TILING: u32 = 0x0000_0008;
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 pub(crate) const VA_EXPORT_SURFACE_READ_ONLY: u32 = va::VA_EXPORT_SURFACE_READ_ONLY;
 pub(crate) const VA_EXPORT_SURFACE_COMPOSED_LAYERS: u32 = va::VA_EXPORT_SURFACE_COMPOSED_LAYERS;
 
@@ -79,9 +87,150 @@ pub(crate) fn va_check(status: VAStatus, op: &str) -> Result<()> {
     }
 }
 
+/// Deadline for one GPU surface-completion wait.
+///
+/// A healthy 1080p VPP conversion or H.264 encode finishes in single-digit
+/// milliseconds, so 2000 ms is roughly a hundred frames of headroom: a wait
+/// that reaches it is a hung driver, not a slow frame. The blocking
+/// `vaSyncSurface` this replaced had no bound at all and once stalled a live
+/// session for 90 minutes without writing a single log line.
+const GPU_SURFACE_SYNC_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// Pause between `vaQuerySurfaceStatus` polls. Short enough to stay inside a
+/// frame interval, long enough not to burn a core while the GPU works.
+const GPU_SURFACE_SYNC_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+const VA_SURFACE_READY: u32 = va::VASurfaceStatus_VASurfaceReady;
+
+/// A GPU surface that never reported completion before its deadline.
+#[derive(Debug)]
+pub(crate) struct SurfaceSyncTimeout {
+    operation: &'static str,
+    surface: VASurfaceID,
+    status: u32,
+}
+
+impl SurfaceSyncTimeout {
+    pub(crate) fn operation(&self) -> &'static str {
+        self.operation
+    }
+
+    pub(crate) fn surface(&self) -> VASurfaceID {
+        self.surface
+    }
+
+    pub(crate) fn status(&self) -> u32 {
+        self.status
+    }
+}
+
+impl fmt::Display for SurfaceSyncTimeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} on surface {} did not complete within {} ms (last VA status {})",
+            self.operation,
+            self.surface,
+            GPU_SURFACE_SYNC_TIMEOUT.as_millis(),
+            self.status
+        )
+    }
+}
+
+impl std::error::Error for SurfaceSyncTimeout {}
+
+/// Whether `now` has reached `deadline`.
+fn sync_deadline_passed(deadline: Instant, now: Instant) -> bool {
+    now >= deadline
+}
+
+/// Whether a `vaQuerySurfaceStatus` result means the surface is done.
+fn surface_status_complete(status: u32) -> bool {
+    status & VA_SURFACE_READY != 0
+}
+
+/// Wait for `surface` to finish, bounded by [`GPU_SURFACE_SYNC_TIMEOUT`].
+///
+/// `vaSyncSurface` blocks inside the driver, where no timeout can interrupt
+/// it; `vaQuerySurfaceStatus` can be polled. The healthy path returns after a
+/// single query and writes nothing to the log.
+pub(crate) fn va_sync_surface(
+    display: VADisplay,
+    surface: VASurfaceID,
+    operation: &'static str,
+) -> Result<()> {
+    let deadline = Instant::now() + GPU_SURFACE_SYNC_TIMEOUT;
+    loop {
+        let mut status: u32 = 0;
+        va_check(
+            unsafe { va::vaQuerySurfaceStatus(display, surface, &mut status) },
+            "vaQuerySurfaceStatus",
+        )?;
+
+        if surface_status_complete(status) {
+            return Ok(());
+        }
+
+        if sync_deadline_passed(deadline, Instant::now()) {
+            return Err(SurfaceSyncTimeout {
+                operation,
+                surface,
+                status,
+            }
+            .into());
+        }
+
+        std::thread::sleep(GPU_SURFACE_SYNC_POLL_INTERVAL);
+    }
+}
+
+/// Whether a `VASurfaceAttribMemoryType` bitmask advertises `DRM_PRIME_2`
+/// import. Drivers that predate `PRIME_2` (i965) report only the legacy
+/// `DRM_PRIME` bit, and a driver that reports no memory-type attribute at all
+/// yields an empty mask; both mean the caller must use legacy `DRM_PRIME`.
+pub(crate) fn prime2_import_supported(memory_types: u32) -> bool {
+    memory_types & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0
+}
+
+/// Legacy `DRM_PRIME` descriptor for the NV12 encoder input, built from the
+/// same layers as the `PRIME_2` descriptor. The UV offset is passed through
+/// unchanged: i965 needs the driver-reported (tile-padded) value.
+/// `buffer` must outlive the `vaCreateSurfaces` call that consumes it.
+fn legacy_nv12_surface_descriptor(
+    buffer: &mut usize,
+    width: u32,
+    height: u32,
+    desc: &VADRMPRIMESurfaceDescriptor,
+) -> VASurfaceAttribExternalBuffers {
+    let y_stride = desc.layers[0].pitch[0];
+    let y_offset = desc.layers[0].offset[0];
+    let uv_stride = desc.layers[1].pitch[0];
+    let uv_offset = desc.layers[1].offset[0];
+
+    let mut legacy: VASurfaceAttribExternalBuffers = unsafe { mem::zeroed() };
+    legacy.pixel_format = fourcc(b"NV12");
+    legacy.width = width;
+    legacy.height = height;
+    legacy.num_planes = 2;
+    legacy.pitches[0] = y_stride;
+    legacy.pitches[1] = uv_stride;
+    legacy.offsets[0] = y_offset;
+    legacy.offsets[1] = uv_offset;
+    legacy.data_size = (y_offset + height * y_stride).max(uv_offset + (height / 2) * uv_stride);
+    legacy.buffers = buffer as *mut usize;
+    legacy.num_buffers = 1;
+    legacy.flags = if desc.objects[0].drm_format_modifier == DRM_FORMAT_MOD_LINEAR {
+        0
+    } else {
+        VA_SURFACE_EXTBUF_DESC_ENABLE_TILING.into()
+    };
+    legacy
+}
+
 pub(crate) struct VaDisplay {
     raw: VADisplay,
     _fd: OwnedFd,
+    surface_memory_types_cache: RefCell<HashMap<VAConfigID, Option<u32>>>,
 }
 
 struct PendingVaDisplay(VADisplay);
@@ -127,7 +276,66 @@ impl VaDisplay {
         Ok(Rc::new(Self {
             raw: pending.into_raw(),
             _fd: fd,
+            surface_memory_types_cache: RefCell::new(HashMap::new()),
         }))
+    }
+
+    /// Memory-type bitmask that the driver advertises for a config, or `None`
+    /// when it refuses the query. Cached per config id: the capture path asks
+    /// on every start-up, never per frame.
+    pub(crate) fn surface_memory_types(&self, config_id: VAConfigID) -> Option<u32> {
+        if let Some(cached) = self.surface_memory_types_cache.borrow().get(&config_id) {
+            return *cached;
+        }
+        let queried = self.query_surface_memory_types(config_id);
+        self.surface_memory_types_cache
+            .borrow_mut()
+            .insert(config_id, queried);
+        queried
+    }
+
+    /// Whether `DRM_PRIME_2` surfaces can be imported for this config.
+    ///
+    /// A failed query keeps the pre-existing behaviour (`PRIME_2`), while a
+    /// successful query without the `PRIME_2` bit — including one that reports
+    /// no memory-type attribute — selects the legacy `DRM_PRIME` path.
+    pub(crate) fn supports_prime2_import(&self, config_id: VAConfigID) -> bool {
+        self.surface_memory_types(config_id)
+            .is_none_or(prime2_import_supported)
+    }
+
+    /// i965 treats `*num_attribs` as the capacity of the caller's buffer and
+    /// fills in the written count, so a zero capacity fails with
+    /// `MAX_NUM_EXCEEDED` and leaves the list untouched.
+    fn query_surface_memory_types(&self, config_id: VAConfigID) -> Option<u32> {
+        const ATTRIB_CAPACITY: usize = 64;
+
+        let mut attribs: Vec<VASurfaceAttrib> = (0..ATTRIB_CAPACITY)
+            .map(|_| unsafe { mem::zeroed() })
+            .collect();
+        let mut count = ATTRIB_CAPACITY as u32;
+        let status = unsafe {
+            va::vaQuerySurfaceAttributes(
+                self.raw,
+                config_id,
+                attribs.as_mut_ptr(),
+                &mut count,
+            )
+        };
+        if let Err(error) = va_check(status, "vaQuerySurfaceAttributes") {
+            tracing::debug!(
+                config_id,
+                %error,
+                "Surface attribute query failed; assuming PRIME_2 import"
+            );
+            return None;
+        }
+
+        attribs
+            .iter()
+            .take((count as usize).min(ATTRIB_CAPACITY))
+            .find(|attrib| attrib.type_ == va::VASurfaceAttribType_VASurfaceAttribMemoryType)
+            .map(|attrib| unsafe { attrib.value.value.i as u32 })
     }
 
     pub(super) fn raw(&self) -> VADisplay {
@@ -296,38 +504,71 @@ impl VaDisplay {
 
     pub(crate) fn import_prime_surface(
         self: &Rc<Self>,
+        config_id: VAConfigID,
         rt_format: u32,
         width: u32,
         height: u32,
         desc: &mut VADRMPRIMESurfaceDescriptor,
     ) -> Result<VaSurface> {
-        let mut attrs = [
-            integer_surface_attr(
-                va::VASurfaceAttribType_VASurfaceAttribMemoryType,
-                VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
-            ),
-            pointer_surface_attr(
-                va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
-                desc as *mut _ as *mut c_void,
-            ),
-        ];
-
         let mut id = 0 as VASurfaceID;
-        va_check(
-            unsafe {
-                va::vaCreateSurfaces(
-                    self.raw,
-                    rt_format,
-                    width,
-                    height,
-                    &mut id,
-                    1,
-                    attrs.as_mut_ptr(),
-                    attrs.len() as u32,
-                )
-            },
-            "vaCreateSurfaces (DMA-BUF import)",
-        )?;
+
+        if self.supports_prime2_import(config_id) {
+            let mut attrs = [
+                integer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 as i32,
+                ),
+                pointer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                    desc as *mut _ as *mut c_void,
+                ),
+            ];
+
+            va_check(
+                unsafe {
+                    va::vaCreateSurfaces(
+                        self.raw,
+                        rt_format,
+                        width,
+                        height,
+                        &mut id,
+                        1,
+                        attrs.as_mut_ptr(),
+                        attrs.len() as u32,
+                    )
+                },
+                "vaCreateSurfaces (DMA-BUF import)",
+            )?;
+        } else {
+            let mut buffer = desc.objects[0].fd as usize;
+            let mut legacy = legacy_nv12_surface_descriptor(&mut buffer, width, height, desc);
+            let mut attrs = [
+                integer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribMemoryType,
+                    VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME as i32,
+                ),
+                pointer_surface_attr(
+                    va::VASurfaceAttribType_VASurfaceAttribExternalBufferDescriptor,
+                    &mut legacy as *mut _ as *mut c_void,
+                ),
+            ];
+
+            va_check(
+                unsafe {
+                    va::vaCreateSurfaces(
+                        self.raw,
+                        rt_format,
+                        width,
+                        height,
+                        &mut id,
+                        1,
+                        attrs.as_mut_ptr(),
+                        attrs.len() as u32,
+                    )
+                },
+                "vaCreateSurfaces (legacy DMA-BUF import)",
+            )?;
+        }
 
         Ok(VaSurface {
             display: Rc::clone(self),
@@ -382,7 +623,7 @@ impl Drop for VaDisplay {
 
 pub(crate) struct VaConfig {
     display: Rc<VaDisplay>,
-    id: u32,
+    pub(crate) id: u32,
 }
 
 impl Drop for VaConfig {
@@ -496,10 +737,7 @@ impl VaContext {
         );
         render_result?;
         end_result?;
-        va_check(
-            unsafe { va::vaSyncSurface(self.display.raw, surface) },
-            "vaSyncSurface",
-        )
+        va_sync_surface(self.display.raw, surface, "vaSyncSurface (encoder)")
     }
 }
 
@@ -717,7 +955,7 @@ struct MiscEncParamBuffer<T> {
     value: T,
 }
 
-fn integer_surface_attr(type_: u32, value: i32) -> VASurfaceAttrib {
+pub(crate) fn integer_surface_attr(type_: u32, value: i32) -> VASurfaceAttrib {
     let mut attr: VASurfaceAttrib = unsafe { mem::zeroed() };
     attr.type_ = type_;
     attr.flags = va::VA_SURFACE_ATTRIB_SETTABLE;
@@ -726,7 +964,7 @@ fn integer_surface_attr(type_: u32, value: i32) -> VASurfaceAttrib {
     attr
 }
 
-fn pointer_surface_attr(type_: u32, value: *mut c_void) -> VASurfaceAttrib {
+pub(crate) fn pointer_surface_attr(type_: u32, value: *mut c_void) -> VASurfaceAttrib {
     let mut attr: VASurfaceAttrib = unsafe { mem::zeroed() };
     attr.type_ = type_;
     attr.flags = va::VA_SURFACE_ATTRIB_SETTABLE;
@@ -744,6 +982,125 @@ mod tests {
         segment.buf = bytes.as_mut_ptr().cast();
         segment.size = bytes.len() as u32;
         segment
+    }
+
+    #[test]
+    fn prime2_import_is_detected_from_the_memory_type_mask() {
+        // VA | DRM_PRIME_2, as a modern driver advertises.
+        assert!(prime2_import_supported(0x4000_0001));
+    }
+
+    #[test]
+    fn legacy_prime_mask_selects_the_legacy_path() {
+        // Measured i965 2.4.5: VA | KERNEL_DRM | DRM_PRIME, no PRIME_2 bit.
+        assert!(!prime2_import_supported(0x3000_0001));
+        assert!(!prime2_import_supported(
+            VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME
+        ));
+    }
+
+    #[test]
+    fn empty_memory_type_mask_selects_the_legacy_path() {
+        assert!(!prime2_import_supported(0));
+    }
+
+    fn nv12_prime_desc(fd: i32, modifier: u64) -> VADRMPRIMESurfaceDescriptor {
+        let mut desc: VADRMPRIMESurfaceDescriptor = unsafe { mem::zeroed() };
+        desc.fourcc = fourcc(b"NV12");
+        desc.width = 1920;
+        desc.height = 1080;
+        desc.num_objects = 1;
+        desc.objects[0].fd = fd;
+        desc.objects[0].drm_format_modifier = modifier;
+        desc.num_layers = 2;
+        desc.layers[0].drm_format = fourcc(b"NV12");
+        desc.layers[0].num_planes = 1;
+        desc.layers[0].pitch[0] = 1920;
+        desc.layers[0].offset[0] = 0;
+        desc.layers[1].drm_format = fourcc(b"NV12");
+        desc.layers[1].num_planes = 1;
+        desc.layers[1].pitch[0] = 1920;
+        // Tile-padded Y plane size as i965 reports it, not stride * height / 2.
+        desc.layers[1].offset[0] = 1920 * 1088;
+        desc
+    }
+
+    #[test]
+    fn legacy_nv12_descriptor_keeps_the_driver_reported_uv_offset() {
+        let prime2 = nv12_prime_desc(7, DRM_FORMAT_MOD_LINEAR);
+        let mut buffer = 7usize;
+        let legacy = legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &prime2);
+
+        assert_eq!(legacy.pixel_format, fourcc(b"NV12"));
+        assert_eq!(legacy.width, 1920);
+        assert_eq!(legacy.height, 1080);
+        assert_eq!(legacy.num_planes, 2);
+        assert_eq!(legacy.pitches[0], 1920);
+        assert_eq!(legacy.pitches[1], 1920);
+        assert_eq!(legacy.offsets[0], 0);
+        assert_eq!(legacy.offsets[1], 1920 * 1088);
+        assert_eq!(legacy.num_buffers, 1);
+        assert_eq!(unsafe { *legacy.buffers }, 7);
+    }
+
+    #[test]
+    fn legacy_nv12_descriptor_data_size_covers_both_planes() {
+        let mut prime2 = nv12_prime_desc(3, DRM_FORMAT_MOD_LINEAR);
+        let mut buffer = 3usize;
+
+        prime2.layers[1].offset[0] = 0;
+        let legacy = legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &prime2);
+        assert_eq!(legacy.data_size, 1080 * 1920);
+
+        prime2.layers[1].offset[0] = 1920 * 1088;
+        let legacy = legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &prime2);
+        assert_eq!(legacy.data_size, 1920 * 1088 + 540 * 1920);
+    }
+
+    #[test]
+    fn legacy_nv12_descriptor_tiles_only_for_tiled_modifiers() {
+        let linear = nv12_prime_desc(3, DRM_FORMAT_MOD_LINEAR);
+        let mut buffer = 3usize;
+        assert_eq!(
+            legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &linear).flags,
+            0
+        );
+
+        let tiled = nv12_prime_desc(3, 0x0100_0000_0000_0001);
+        assert_eq!(
+            legacy_nv12_surface_descriptor(&mut buffer, 1920, 1080, &tiled).flags as u32,
+            VA_SURFACE_EXTBUF_DESC_ENABLE_TILING
+        );
+    }
+
+    #[test]
+    fn sync_deadline_is_not_expired_before_its_instant() {
+        let deadline = Instant::now() + GPU_SURFACE_SYNC_TIMEOUT;
+
+        assert!(!sync_deadline_passed(deadline, Instant::now()));
+    }
+
+    #[test]
+    fn sync_deadline_is_expired_at_and_after_its_instant() {
+        let deadline = Instant::now() + GPU_SURFACE_SYNC_TIMEOUT;
+
+        assert!(sync_deadline_passed(deadline, deadline));
+        assert!(sync_deadline_passed(
+            deadline,
+            deadline + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn surface_status_ready_completes_the_wait() {
+        assert!(surface_status_complete(va::VASurfaceStatus_VASurfaceReady));
+        assert!(surface_status_complete(
+            va::VASurfaceStatus_VASurfaceReady | va::VASurfaceStatus_VASurfaceDisplaying
+        ));
+        assert!(!surface_status_complete(
+            va::VASurfaceStatus_VASurfaceRendering
+        ));
+        assert!(!surface_status_complete(0));
     }
 
     #[test]
