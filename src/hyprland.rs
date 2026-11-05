@@ -226,31 +226,36 @@ fn option_string_from_response(response: &str) -> Result<Option<String>> {
         .map(str::to_owned))
 }
 
-/// Create a headless output with a custom name prefix.
-/// Hyprland will name it `{name}-1`, `{name}-2`, etc.
+/// Create a headless output with the requested name.
 pub fn output_create_headless(name: &str) -> Result<()> {
     send_action(&format!("output create headless {}", name))
 }
 
 /// Set a monitor rule (e.g. "HEADLESS-1,1920x1080@60,-9999x0,1").
 ///
-/// Hyprland's new (Lua) config parser rejects `keyword` with
-/// "keyword can't work with non-legacy parsers. Use eval."
-/// In that case, retry as `eval hl.monitor({...})`.
+/// Prefer Lua because Hyprland 0.57 removed `keyword`. A delivered non-`ok`
+/// response falls back to the legacy command for older config managers. Do not
+/// retry transport failures: the first command's outcome is unknown.
+///
+/// Acceptance does not imply the mode is applied yet; callers must read it back.
+/// A rejected Lua rule can also have applied some fields, so fallback is not a
+/// rollback.
 pub fn keyword_monitor(rule: &str) -> Result<()> {
-    match send_action(&format!("keyword monitor {}", rule)) {
-        Ok(()) => Ok(()),
-        Err(e) if is_non_legacy_parser_error(&e) => {
-            send_action(&format!("eval {}", monitor_rule_to_lua(rule)?))
-        }
-        Err(e) => Err(e),
+    let response = send_command(&format!("eval {}", monitor_rule_to_lua(rule)?))?;
+    if response.trim() == "ok" {
+        return Ok(());
     }
-}
 
-fn is_non_legacy_parser_error(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| cause.to_string().contains("non-legacy parsers"))
+    let legacy_response = send_command(&format!("keyword monitor {}", rule))?;
+    if legacy_response.trim() == "ok" {
+        Ok(())
+    } else {
+        bail!(
+            "Hyprland monitor rule rejected (eval: {}; keyword: {})",
+            response.trim(),
+            legacy_response.trim()
+        )
+    }
 }
 
 fn monitor_rule_to_lua(rule: &str) -> Result<String> {
@@ -425,13 +430,13 @@ impl EventStream {
 }
 
 #[cfg(test)]
-mod tests {
-    use anyhow::anyhow;
+mod monitor_ipc_tests;
 
+#[cfg(test)]
+mod tests {
     use super::{
-        is_non_legacy_parser_error, monitor_rule_to_lua, option_string_from_response,
-        parse_instance_lock, resolve_instance, select_instance, socket_path_in, InstanceCandidate,
-        COMMAND_SOCKET, EVENT_SOCKET,
+        monitor_rule_to_lua, option_string_from_response, parse_instance_lock, resolve_instance,
+        select_instance, socket_path_in, InstanceCandidate, COMMAND_SOCKET, EVENT_SOCKET,
     };
 
     fn candidate(signature: &str, pid: libc::pid_t, display: &str) -> InstanceCandidate {
@@ -594,20 +599,5 @@ mod tests {
             .expect_err("malformed rule is rejected");
 
         assert!(err.to_string().contains("expected 4 fields"));
-    }
-
-    #[test]
-    fn non_legacy_parser_error_detection_matches_hyprland_message() {
-        let err =
-            anyhow!("Hyprland IPC error: keyword can't work with non-legacy parsers. Use eval.");
-
-        assert!(is_non_legacy_parser_error(&err));
-    }
-
-    #[test]
-    fn non_legacy_parser_error_detection_ignores_other_errors() {
-        let err = anyhow!("Hyprland IPC error: monitor rule failed");
-
-        assert!(!is_non_legacy_parser_error(&err));
     }
 }
