@@ -10,7 +10,7 @@ use ironrdp_server::{
 };
 
 use crate::audio::{AudioMode, HyprSoundFactory};
-use crate::capture::{HyprDisplay, HyprDisplayHandle};
+use crate::capture::{HyprDisplay, HyprDisplayHandle, HyprDisplaySessionSink};
 use crate::clipboard::HyprCliprdrFactory;
 #[cfg(test)]
 use crate::config::ConfigCredentials;
@@ -126,10 +126,10 @@ pub async fn setup(config: RuntimeConfig) -> Result<ServerContext> {
         .with_display_handler(display)
         .with_credential_validator(authentication.validator)
         .with_connection_policy(security_mode.connection_policy())
-        .with_connection_handler(Some(Box::new(ClientConnectionHandler::new(
-            input_session_sink,
-            session_hooks,
-        ))))
+        .with_connection_handler(Some(Box::new(
+            ClientConnectionHandler::new(input_session_sink, session_hooks)
+                .with_display_session(Box::new(display_handle.session_sink())),
+        )))
         .with_gfx_factory(Some(Box::new(gfx_factory)))
         .with_cliprdr_factory(Some(Box::new(cliprdr_factory)))
         .with_sound_factory(sound_factory)
@@ -162,10 +162,27 @@ fn server_run_error(error: ServerError) -> anyhow::Error {
     anyhow::Error::new(error)
 }
 
+/// Display lifecycle policy driven by IronRDP session boundaries.
+trait DisplaySessionSink: Send {
+    fn session_started(&mut self);
+    fn session_ended(&mut self);
+}
+
+impl DisplaySessionSink for HyprDisplaySessionSink {
+    fn session_started(&mut self) {
+        HyprDisplaySessionSink::session_started(self);
+    }
+
+    fn session_ended(&mut self) {
+        HyprDisplaySessionSink::session_ended(self);
+    }
+}
+
 /// Adapts IronRDP connection boundaries to application-owned policies.
 struct ClientConnectionHandler {
     input_session_sink: Box<dyn RdpInputSessionSink>,
     session_hooks: Option<SessionHooks>,
+    display_session: Option<Box<dyn DisplaySessionSink>>,
 }
 
 impl ClientConnectionHandler {
@@ -176,7 +193,13 @@ impl ClientConnectionHandler {
         Self {
             input_session_sink,
             session_hooks,
+            display_session: None,
         }
+    }
+
+    fn with_display_session(mut self, display_session: Box<dyn DisplaySessionSink>) -> Self {
+        self.display_session = Some(display_session);
+        self
     }
 }
 
@@ -184,6 +207,9 @@ impl ConnectionHandler for ClientConnectionHandler {
     fn on_connection_info(&mut self, info: &ConnectionInfo) {
         self.input_session_sink
             .set_keyboard_layout(info.keyboard_layout);
+        if let Some(display) = &mut self.display_session {
+            display.session_started();
+        }
         if let Some(hooks) = &mut self.session_hooks {
             hooks.session_started();
         }
@@ -201,6 +227,9 @@ impl ConnectionHandler for ClientConnectionHandler {
         self.input_session_sink.session_ended();
         if let Some(hooks) = &mut self.session_hooks {
             hooks.session_ended();
+        }
+        if let Some(display) = &mut self.display_session {
+            display.session_ended();
         }
         PostConnectionAction::Continue
     }
@@ -273,6 +302,37 @@ mod tests {
             "start\nend\n"
         );
         std::fs::remove_file(&log).expect("remove hook log");
+    }
+
+    #[test]
+    fn connection_boundaries_drive_the_display_session() {
+        use std::sync::{Arc, Mutex};
+
+        struct NoopSink;
+        impl RdpInputSessionSink for NoopSink {
+            fn set_keyboard_layout(&self, _keyboard_layout: u32) {}
+            fn session_ended(&self) {}
+        }
+
+        struct RecordingDisplay(Arc<Mutex<Vec<&'static str>>>);
+        impl DisplaySessionSink for RecordingDisplay {
+            fn session_started(&mut self) {
+                self.0.lock().unwrap().push("start");
+            }
+            fn session_ended(&mut self) {
+                self.0.lock().unwrap().push("end");
+            }
+        }
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut handler = ClientConnectionHandler::new(Box::new(NoopSink), None)
+            .with_display_session(Box::new(RecordingDisplay(Arc::clone(&events))));
+
+        handler.on_connection_info(&test_connection_info());
+        let action = handler.on_disconnected(test_peer(), Duration::from_secs(1), None);
+
+        assert_eq!(action, PostConnectionAction::Continue);
+        assert_eq!(*events.lock().unwrap(), vec!["start", "end"]);
     }
 
     #[test]
