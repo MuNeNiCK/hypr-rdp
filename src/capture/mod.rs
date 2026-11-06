@@ -6,7 +6,7 @@ mod scale;
 mod session_memory;
 mod wayland;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -63,6 +63,9 @@ struct HyprDisplayInner {
     resize_gate: Arc<Mutex<()>>,
     closed: bool,
     output_size_unconfirmed: bool,
+    /// Startup geometry a managed headless output returns to once its session
+    /// ends. `None` for a physical output, which hypr-rdp never resizes.
+    idle_resolution: Option<(u32, u32)>,
 }
 
 impl HyprDisplayInner {
@@ -89,9 +92,126 @@ impl Drop for HyprDisplayInner {
 #[derive(Clone)]
 pub struct HyprDisplayHandle {
     inner: Arc<Mutex<HyprDisplayInner>>,
+    /// Bumped when an authenticated session starts. A restore scheduled at a
+    /// session end applies only while no newer session has started.
+    session_epoch: Arc<AtomicU64>,
+}
+
+/// Receives IronRDP session boundaries for the managed-output lifecycle.
+///
+/// IronRDP calls `on_connection_info` once per connection (not on
+/// reactivation) and `on_disconnected` before it serves any successor, so a
+/// start/end pair brackets exactly one client session.
+pub struct HyprDisplaySessionSink {
+    handle: HyprDisplayHandle,
+    active: bool,
+}
+
+impl HyprDisplaySessionSink {
+    pub fn session_started(&mut self) {
+        self.handle.session_epoch.fetch_add(1, Ordering::AcqRel);
+        self.active = true;
+    }
+
+    /// Schedules restoring the managed output for the session that just ended.
+    pub fn session_ended(&mut self) {
+        let Some(epoch) = self.end_session() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!("No async runtime at session end; managed output not restored");
+            return;
+        };
+        let handle = self.handle.clone();
+        runtime.spawn(async move { handle.restore_after_session(epoch).await });
+    }
+
+    /// The epoch to restore for, or `None` when no session had started (a
+    /// connection that failed before setup cannot have resized anything).
+    fn end_session(&mut self) -> Option<u64> {
+        std::mem::take(&mut self.active).then(|| self.handle.session_epoch.load(Ordering::Acquire))
+    }
 }
 
 impl HyprDisplayHandle {
+    pub fn session_sink(&self) -> HyprDisplaySessionSink {
+        HyprDisplaySessionSink {
+            handle: self.clone(),
+            active: false,
+        }
+    }
+
+    async fn restore_after_session(&self, epoch: u64) {
+        self.restore_after_session_with(
+            epoch,
+            resize_headless_output,
+            SharedOutputLayout::update_from_output_with_presentation,
+        )
+        .await;
+    }
+
+    /// Returns a managed headless output to its startup geometry after the
+    /// session identified by `epoch` ended, unless a newer session started or
+    /// the display closed meanwhile. Serialized with every other resize.
+    async fn restore_after_session_with(
+        &self,
+        epoch: u64,
+        resize_headless: impl FnMut(&str, u32, u32, f64) -> Result<()> + Send + 'static,
+        refresh_layout: impl FnMut(&SharedOutputLayout, &str, (u32, u32)) -> Result<()> + Send + 'static,
+    ) {
+        let gate = Arc::clone(&self.inner.lock().await.resize_gate);
+        let permit = gate.lock_owned().await;
+        let lease = Arc::clone(&self.inner);
+        let session_epoch = Arc::clone(&self.session_epoch);
+        // The IPC resize blocks; the permit keeps it ordered against a
+        // reconnect's initial resize, which waits on the same gate.
+        let worker = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut inner = lease.blocking_lock();
+            if inner.closed || session_epoch.load(Ordering::Acquire) != epoch {
+                return;
+            }
+            let Some((width, height)) = inner.idle_resolution else {
+                return;
+            };
+            if inner.resolution == (width, height) && !inner.output_size_unconfirmed {
+                return;
+            }
+            let decision = ResizeDecision {
+                target: ResizeTarget::ManagedHeadlessOutput,
+                width,
+                height,
+            };
+            let mut resize_headless = resize_headless;
+            let mut refresh_layout = refresh_layout;
+            if apply_resize_decision_with(
+                &mut inner,
+                decision,
+                &mut resize_headless,
+                &mut refresh_layout,
+            )
+            .is_some()
+            {
+                inner.pending_initial_resize = None;
+                tracing::info!(
+                    width,
+                    height,
+                    scale = inner.headless_scale,
+                    "Restored managed headless output after the session ended"
+                );
+            } else {
+                tracing::warn!(
+                    width,
+                    height,
+                    "Could not restore managed headless output after the session ended"
+                );
+            }
+        });
+        if let Err(error) = worker.await {
+            tracing::warn!(%error, "Managed output restore worker failed");
+        }
+    }
+
     pub async fn shutdown(&self) {
         let gate = {
             let mut inner = self.inner.lock().await;
@@ -509,6 +629,9 @@ impl HyprDisplay {
             protocol_name
         );
 
+        // A managed headless output starts at the configured presentation; a
+        // physical output is never resized by hypr-rdp.
+        let idle_resolution = output.is_none().then_some(presentation_resolution);
         let inner = Arc::new(Mutex::new(HyprDisplayInner {
             width: presentation_resolution.0 as u16,
             height: presentation_resolution.1 as u16,
@@ -534,6 +657,7 @@ impl HyprDisplay {
             resize_gate: Arc::new(Mutex::new(())),
             closed: false,
             output_size_unconfirmed: false,
+            idle_resolution,
         }));
 
         let dims = (
@@ -542,6 +666,7 @@ impl HyprDisplay {
         );
         let handle = HyprDisplayHandle {
             inner: Arc::clone(&inner),
+            session_epoch: Arc::new(AtomicU64::new(0)),
         };
         Ok((Self { inner }, handle, dims))
     }
@@ -1068,6 +1193,7 @@ mod output_downscaling {
             resize_gate: Arc::new(Mutex::new(())),
             closed: false,
             output_size_unconfirmed: false,
+            idle_resolution: None,
         };
 
         (
@@ -1651,6 +1777,7 @@ mod managed_headless_resize {
             resize_gate: Arc::new(Mutex::new(())),
             closed: false,
             output_size_unconfirmed: false,
+            idle_resolution: Some(resolution),
         }
     }
 
@@ -1704,6 +1831,270 @@ mod managed_headless_resize {
             0,
             presentation,
         )
+    }
+
+    /// A managed headless display that a session moved from `baseline` to
+    /// `current`, with the handle production uses for session-end restore.
+    fn headless_handle_after_session(
+        baseline: (u32, u32),
+        current: (u32, u32),
+        scale: f64,
+    ) -> (HyprDisplayHandle, mpsc::Receiver<DisplayUpdate>) {
+        let (tx, rx) = mpsc::channel(4);
+        let mut inner = headless_inner_for_resize_test_with_tx(current, tx);
+        inner.headless_scale = scale;
+        inner.idle_resolution = Some(baseline);
+        inner.pending_initial_resize = Some(DesktopSize {
+            width: current.0 as u16,
+            height: current.1 as u16,
+        });
+        (
+            HyprDisplayHandle {
+                inner: Arc::new(Mutex::new(inner)),
+                session_epoch: Arc::new(AtomicU64::new(0)),
+            },
+            rx,
+        )
+    }
+
+    type ResizeLog = Arc<std::sync::Mutex<Vec<(String, u32, u32, f64)>>>;
+
+    fn recording_resize(
+        log: &ResizeLog,
+    ) -> impl FnMut(&str, u32, u32, f64) -> Result<()> + Send + 'static {
+        let log = Arc::clone(log);
+        move |name, width, height, scale| {
+            log.lock()
+                .unwrap()
+                .push((name.to_owned(), width, height, scale));
+            Ok(())
+        }
+    }
+
+    /// Runs one start/end pair through the production sink.
+    fn ended_session(handle: &HyprDisplayHandle) -> u64 {
+        let mut sink = handle.session_sink();
+        sink.session_started();
+        sink.end_session()
+            .expect("a started session ends with its epoch")
+    }
+
+    async fn presentation_of(handle: &HyprDisplayHandle) -> (u32, u32) {
+        let inner = handle.inner.lock().await;
+        let presentation = inner
+            .output_layout
+            .snapshot()
+            .expect("layout snapshot")
+            .presentation_geometry
+            .presentation();
+        (presentation.width, presentation.height)
+    }
+
+    #[tokio::test]
+    async fn managed_headless_restores_startup_geometry_and_scale_after_session_end() {
+        let (handle, mut rx) = headless_handle_after_session((1920, 1080), (976, 1822), 2.0);
+        let epoch = ended_session(&handle);
+        let log = ResizeLog::default();
+
+        handle
+            .restore_after_session_with(
+                epoch,
+                recording_resize(&log),
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![("HEADLESS-1".to_owned(), 1920, 1080, 2.0)]
+        );
+        {
+            let inner = handle.inner.lock().await;
+            assert_eq!(inner.resolution, (1920, 1080));
+            assert_eq!((inner.width, inner.height), (1920, 1080));
+            assert_eq!(inner.pending_initial_resize, None);
+            assert!(!inner.output_size_unconfirmed);
+        }
+        assert_eq!(presentation_of(&handle).await, (1920, 1080));
+        assert!(
+            rx.try_recv().is_err(),
+            "no session consumes a resize update after disconnect"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_end_restore_is_a_noop_at_the_startup_geometry() {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (1920, 1080), 1.0);
+        let epoch = ended_session(&handle);
+        let log = ResizeLog::default();
+
+        handle
+            .restore_after_session_with(
+                epoch,
+                recording_resize(&log),
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn physical_output_is_never_resized_at_session_end() {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (1280, 720), 1.0);
+        {
+            let mut inner = handle.inner.lock().await;
+            inner.output = Some("DP-1".into());
+            inner.idle_resolution = None;
+        }
+        let epoch = ended_session(&handle);
+        let log = ResizeLog::default();
+
+        handle
+            .restore_after_session_with(
+                epoch,
+                recording_resize(&log),
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(handle.inner.lock().await.resolution, (1280, 720));
+    }
+
+    #[tokio::test]
+    async fn closed_display_is_not_restored_at_session_end() {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (976, 1822), 1.0);
+        handle.inner.lock().await.closed = true;
+        let epoch = ended_session(&handle);
+        let log = ResizeLog::default();
+
+        handle
+            .restore_after_session_with(
+                epoch,
+                recording_resize(&log),
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert!(log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_restore_does_not_overwrite_a_newer_session() {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (976, 1822), 1.0);
+        let epoch = ended_session(&handle);
+        // The next client connected before the restore ran.
+        handle.session_sink().session_started();
+        let log = ResizeLog::default();
+
+        handle
+            .restore_after_session_with(
+                epoch,
+                recording_resize(&log),
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(handle.inner.lock().await.resolution, (976, 1822));
+    }
+
+    async fn restore_waiting_behind_resize_gate(
+        new_session_meanwhile: bool,
+    ) -> (HyprDisplayHandle, ResizeLog) {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (976, 1822), 1.0);
+        let epoch = ended_session(&handle);
+        let gate = Arc::clone(&handle.inner.lock().await.resize_gate);
+        let permit = gate.lock_owned().await;
+        let log = ResizeLog::default();
+        let restoring = handle.clone();
+        let resize = recording_resize(&log);
+        let restore = tokio::spawn(async move {
+            restoring
+                .restore_after_session_with(epoch, resize, refresh_headless_layout_for_test)
+                .await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            log.lock().unwrap().is_empty(),
+            "restore must wait for the resize gate"
+        );
+        if new_session_meanwhile {
+            handle.session_sink().session_started();
+        }
+        drop(permit);
+        restore.await.expect("restore task");
+        (handle, log)
+    }
+
+    #[tokio::test]
+    async fn restore_waiting_behind_a_resize_yields_to_a_session_that_started_meanwhile() {
+        let (handle, log) = restore_waiting_behind_resize_gate(true).await;
+
+        assert!(log.lock().unwrap().is_empty());
+        assert_eq!(handle.inner.lock().await.resolution, (976, 1822));
+    }
+
+    #[tokio::test]
+    async fn restore_waiting_behind_a_resize_applies_when_no_session_started() {
+        let (handle, log) = restore_waiting_behind_resize_gate(false).await;
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![("HEADLESS-1".to_owned(), 1920, 1080, 1.0)]
+        );
+        assert_eq!(handle.inner.lock().await.resolution, (1920, 1080));
+    }
+
+    #[tokio::test]
+    async fn failed_restore_keeps_state_and_a_later_session_end_recovers() {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (976, 1822), 1.0);
+        let epoch = ended_session(&handle);
+
+        handle
+            .restore_after_session_with(
+                epoch,
+                |_name, _width, _height, _scale| anyhow::bail!("Hyprland IPC unavailable"),
+                |_layout, _name, _presentation| {
+                    panic!("layout must not refresh after a failed headless resize")
+                },
+            )
+            .await;
+        {
+            let inner = handle.inner.lock().await;
+            assert_eq!(inner.resolution, (976, 1822));
+            assert!(inner.output_size_unconfirmed);
+        }
+
+        let epoch = ended_session(&handle);
+        let log = ResizeLog::default();
+        handle
+            .restore_after_session_with(
+                epoch,
+                recording_resize(&log),
+                refresh_headless_layout_for_test,
+            )
+            .await;
+
+        assert_eq!(
+            *log.lock().unwrap(),
+            vec![("HEADLESS-1".to_owned(), 1920, 1080, 1.0)]
+        );
+        let inner = handle.inner.lock().await;
+        assert_eq!(inner.resolution, (1920, 1080));
+        assert!(!inner.output_size_unconfirmed);
+    }
+
+    #[test]
+    fn session_end_without_a_started_session_restores_nothing() {
+        let (handle, _rx) = headless_handle_after_session((1920, 1080), (976, 1822), 1.0);
+        let mut sink = handle.session_sink();
+
+        assert_eq!(sink.end_session(), None, "pre-setup failure");
+        sink.session_started();
+        assert!(sink.end_session().is_some());
+        assert_eq!(sink.end_session(), None, "duplicate end");
     }
 
     #[test]
@@ -2052,6 +2443,7 @@ mod managed_headless_resize {
         let inner = Arc::clone(&display.inner);
         let handle = HyprDisplayHandle {
             inner: Arc::clone(&inner),
+            session_epoch: Arc::new(AtomicU64::new(0)),
         };
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -2224,7 +2616,12 @@ mod managed_headless_resize {
         let shutdown = tokio::spawn({
             let inner = Arc::clone(&inner);
             async move {
-                HyprDisplayHandle { inner }.shutdown().await;
+                HyprDisplayHandle {
+                    inner,
+                    session_epoch: Arc::new(AtomicU64::new(0)),
+                }
+                .shutdown()
+                .await;
             }
         });
         tokio::time::timeout(Duration::from_secs(1), async {
