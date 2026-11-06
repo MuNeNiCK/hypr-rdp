@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.1.8] - 2026-11-06
+
+### Added
+
+- Added a `domain` setting (`--domain`) for configured credentials, so Windows clients that send their workstation name as the NTLM domain can authenticate.
+
+### Changed
+
+- Updated IronRDP to an upstream revision that passes the configured domain through authentication.
+
+### Fixed
+
+- Fixed startup on Hyprland 0.57, which removed the `keyword` IPC command: monitor rules are now sent with `eval hl.monitor(...)` first, falling back to `keyword monitor` for older config managers.
+- Restored the managed headless output to its startup resolution and scale after a client disconnects.
+
 ## [0.1.7] - 2026-10-20
 
 ### Added
@@ -127,6 +142,8 @@
 
 - Initial public release.
 
+[0.1.8]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.7...v0.1.8
+[0.1.7]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.6...v0.1.7
 [0.1.6]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.5...v0.1.6
 [0.1.5]: https://github.com/MuNeNiCK/hypr-rdp/compare/v0.1.4...v0.1.5
 [0.1.4]: https://github.com/MuNeNICK/hypr-rdp/compare/v0.1.3...v0.1.4
