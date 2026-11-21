@@ -224,7 +224,7 @@ fn find_vaapi_device() -> Result<PathBuf> {
             Err(_) => continue,
         };
 
-        if entrypoints.contains(&sys::VA_ENTRYPOINT_ENC_SLICE) {
+        if sys::h264_encode_entrypoint(&entrypoints).is_some() {
             let vendor = display
                 .query_vendor_string()
                 .unwrap_or_else(|_| "unknown".into());
@@ -377,6 +377,28 @@ fn vaapi_rate_control_policy(
     }
 }
 
+/// Use CQP when the driver does not offer the requested rate control mode.
+/// Intel low-power (VDEnc) encoding offers only CQP unless HuC firmware is
+/// loaded. An unknown mask keeps the requested mode.
+fn supported_h264_rate_control(requested: H264RateControl, supported: u32) -> H264RateControl {
+    let va_mode = |rate_control| match rate_control {
+        H264RateControl::Vbr => sys::VA_RC_VBR,
+        H264RateControl::Cqp => sys::VA_RC_CQP,
+    };
+    if supported == va::VA_ATTRIB_NOT_SUPPORTED
+        || supported & va_mode(requested) != 0
+        || supported & sys::VA_RC_CQP == 0
+    {
+        return requested;
+    }
+    tracing::warn!(
+        requested = ?requested,
+        supported = format_args!("{supported:#x}"),
+        "VA-API driver does not support the requested rate control; using CQP"
+    );
+    H264RateControl::Cqp
+}
+
 struct VaapiRateControlParameters {
     rate_control: va::VAEncMiscParameterRateControl,
     hrd: Option<va::VAEncMiscParameterHRD>,
@@ -516,20 +538,24 @@ impl VaapiEncoder {
             .query_config_entrypoints(h264_profile)
             .map_err(|e| anyhow::anyhow!("Failed to query entrypoints: {}", e))?;
 
-        if !entrypoints.contains(&sys::VA_ENTRYPOINT_ENC_SLICE) {
+        let Some(entrypoint) = sys::h264_encode_entrypoint(&entrypoints) else {
             bail!("H.264 encode entrypoint not supported");
-        }
+        };
 
         let supported_packed_headers = display
             .get_config_attrib(
                 h264_profile,
-                sys::VA_ENTRYPOINT_ENC_SLICE,
+                entrypoint,
                 va::VAConfigAttribType_VAConfigAttribEncPackedHeaders,
             )
             .context("Failed to query VA-API packed-header support")?;
         let packed_header_attrib = packed_header_config_attrib(supported_packed_headers);
         let packed_headers = packed_header_attrib.map_or(0, |attrib| attrib.value);
 
+        let supported_rate_control = display
+            .get_config_attrib(h264_profile, entrypoint, sys::VA_CONFIG_ATTRIB_RATE_CONTROL)
+            .unwrap_or(va::VA_ATTRIB_NOT_SUPPORTED);
+        let rate_control = supported_h264_rate_control(rate_control, supported_rate_control);
         let rc_policy = vaapi_rate_control_policy(bitrate, quality, rate_control);
         let level_idc = h264_level(
             h264_profile,
@@ -563,7 +589,7 @@ impl VaapiEncoder {
             config_attribs.push(attrib);
         }
         let config = display
-            .create_config(h264_profile, sys::VA_ENTRYPOINT_ENC_SLICE, &config_attribs)
+            .create_config(h264_profile, entrypoint, &config_attribs)
             .map_err(|e| anyhow::anyhow!("Failed to create config: {}", e))?;
 
         let input_surfaces = display
@@ -614,6 +640,7 @@ impl VaapiEncoder {
 
         tracing::info!(
             profile = ?h264_profile,
+            low_power = entrypoint == sys::VA_ENTRYPOINT_ENC_SLICE_LP,
             rate_control = ?rate_control,
             quality = quality,
             packed_headers,
@@ -2152,6 +2179,37 @@ mod tests {
         );
         assert_eq!(parameters.rate_control.bits_per_second, 0);
         assert_eq!(parameters.frame_rate.framerate, 30);
+    }
+
+    #[test]
+    fn h264_encode_entrypoint_prefers_enc_slice_then_low_power() {
+        use sys::{VA_ENTRYPOINT_ENC_SLICE as SLICE, VA_ENTRYPOINT_ENC_SLICE_LP as SLICE_LP};
+        let vld = va::VAEntrypoint_VAEntrypointVLD;
+        assert_eq!(
+            sys::h264_encode_entrypoint(&[vld, SLICE_LP, SLICE]),
+            Some(SLICE)
+        );
+        assert_eq!(
+            sys::h264_encode_entrypoint(&[vld, SLICE_LP]),
+            Some(SLICE_LP)
+        );
+        assert_eq!(sys::h264_encode_entrypoint(&[vld]), None);
+    }
+
+    #[test]
+    fn rate_control_uses_cqp_only_when_requested_mode_is_unsupported() {
+        let (vbr, cqp) = (H264RateControl::Vbr, H264RateControl::Cqp);
+        assert_eq!(supported_h264_rate_control(vbr, sys::VA_RC_CQP), cqp);
+        assert_eq!(
+            supported_h264_rate_control(vbr, sys::VA_RC_CQP | sys::VA_RC_VBR),
+            vbr
+        );
+        assert_eq!(
+            supported_h264_rate_control(vbr, va::VA_ATTRIB_NOT_SUPPORTED),
+            vbr
+        );
+        assert_eq!(supported_h264_rate_control(vbr, va::VA_RC_CBR), vbr);
+        assert_eq!(supported_h264_rate_control(cqp, sys::VA_RC_CQP), cqp);
     }
 
     #[test]

@@ -65,7 +65,17 @@ pub(crate) const VA_PROFILE_NONE: VAProfile = va::VAProfile_VAProfileNone;
 pub(crate) const VA_PROFILE_H264_MAIN: VAProfile = va::VAProfile_VAProfileH264Main;
 pub(crate) const VA_PROFILE_H264_HIGH: VAProfile = va::VAProfile_VAProfileH264High;
 pub(crate) const VA_ENTRYPOINT_ENC_SLICE: VAEntrypoint = va::VAEntrypoint_VAEntrypointEncSlice;
+pub(crate) const VA_ENTRYPOINT_ENC_SLICE_LP: VAEntrypoint = va::VAEntrypoint_VAEntrypointEncSliceLP;
 pub(crate) const VA_ENTRYPOINT_VIDEO_PROC: VAEntrypoint = va::VAEntrypoint_VAEntrypointVideoProc;
+
+/// H.264 encode entrypoint to use: `EncSlice` when available, otherwise the
+/// low-power `EncSliceLP`, which is the only H.264 encode entrypoint Intel iHD
+/// exposes on some GPUs (e.g. Jasper Lake).
+pub(crate) fn h264_encode_entrypoint(entrypoints: &[VAEntrypoint]) -> Option<VAEntrypoint> {
+    [VA_ENTRYPOINT_ENC_SLICE, VA_ENTRYPOINT_ENC_SLICE_LP]
+        .into_iter()
+        .find(|entrypoint| entrypoints.contains(entrypoint))
+}
 
 pub(crate) fn fourcc(tag: &[u8; 4]) -> u32 {
     u32::from_ne_bytes(*tag)
