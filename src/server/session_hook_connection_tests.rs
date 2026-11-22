@@ -102,11 +102,11 @@ impl HookServer {
         );
         let disconnects = Arc::new(AtomicUsize::new(0));
         let authentication = PreparedAuthentication::new(crate::config::AuthConfig::Configured(
-            Some(crate::config::ConfigCredentials {
+            crate::config::ConfigCredentials {
                 username: USER.into(),
                 domain: None,
                 password: PASSWORD.into(),
-            }),
+            },
         ))
         .unwrap();
         assert_eq!(authentication.security, ServerSecurityMode::Hybrid);
