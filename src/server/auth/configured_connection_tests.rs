@@ -107,11 +107,11 @@ impl ConfiguredAuthServer {
         let activated = Arc::new(Semaphore::new(0));
         let disconnected = Arc::new(Semaphore::new(0));
         let authentication =
-            PreparedAuthentication::new(AuthConfig::Configured(Some(ConfigCredentials {
+            PreparedAuthentication::new(AuthConfig::Configured(ConfigCredentials {
                 username: username.into(),
                 password: PASSWORD.into(),
                 domain: domain.map(str::to_owned),
-            })))
+            }))
             .unwrap();
         assert_eq!(authentication.security, ServerSecurityMode::Hybrid);
         assert!(authentication.validator.is_none());

@@ -9,7 +9,7 @@
     { self, nixpkgs }:
     let
       lib = nixpkgs.lib;
-      supportedSystems = [ "x86_64-linux" ];
+      supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
       forAllSystems = lib.genAttrs supportedSystems;
       pkgsFor = system: import nixpkgs { inherit system; };
     in

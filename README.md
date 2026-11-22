@@ -86,8 +86,7 @@ session, set `WAYLAND_DISPLAY`; set `HYPRLAND_INSTANCE_SIGNATURE` too if instanc
 discovery is ambiguous.
 
 With configured username/password credentials, a new authenticated connection
-replaces the current one. In the default authentication mode, omitting credentials
-allows unauthenticated connections, served one at a time.
+replaces the current one.
 
 ## Configuration
 
@@ -122,7 +121,7 @@ Run `hypr-rdp --help` for all options.
 
 | Option | Values / purpose | Default |
 | --- | --- | --- |
-| `--auth-mode` | `configured` credentials or Linux `pam` | `configured` |
+| `--auth-mode` | `configured` credentials, Linux `pam`, or `none` | `configured` |
 | `-d`, `--domain` | Separate NTLM domain for configured credentials | unset |
 | `--pam-service` | PAM service name | `hypr-rdp` |
 | `--capture-mode` | `wlr` or `ext` capture protocol | `wlr` |
