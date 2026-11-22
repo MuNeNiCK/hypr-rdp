@@ -1,9 +1,9 @@
 use super::factory::{capability_avc_support, preferred_capabilities_for_policy};
 use super::test_support::{
-    ack_frame, assert_wire_to_surface_frame, decode_avc444_wire_to_surface, decode_gfx_output,
-    drain_gfx_pdus, negotiated_avc420_session, ready_avc420_session, ready_avc444_handle,
-    ready_tracked_avc420_session, tracked_avc444_session, unnegotiated_egfx_session,
-    TEST_CHANNEL_ID,
+    ack_frame, assert_presentation_monitor, assert_wire_to_surface_frame,
+    decode_avc444_wire_to_surface, decode_gfx_output, drain_gfx_pdus, negotiated_avc420_session,
+    ready_avc420_session, ready_avc444_handle, ready_tracked_avc420_session,
+    tracked_avc444_session, unnegotiated_egfx_session, TEST_CHANNEL_ID,
 };
 use super::*;
 use ironrdp_core::{encode_vec, Decode, Encode, ReadCursor};
@@ -28,11 +28,13 @@ fn full_frame_region_uses_rdpegfx_exclusive_bounds() {
 }
 
 #[test]
-fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
-    let (_shared, _bridge, handle, event_tx, mut event_rx) =
+fn surface_init_emits_reset_create_map_in_order_with_presentation_monitor() {
+    let (shared, _bridge, handle, event_tx, mut event_rx) =
         negotiated_avc420_session(1280, 720, DEFAULT_MAX_FRAMES_IN_FLIGHT);
 
-    let surface_id = EgfxShared::init_surface(&handle, &event_tx, 1280, 720).expect("surface init");
+    let surface_id = shared
+        .init_surface(&handle, &event_tx, 1280, 720)
+        .expect("surface init");
     let pdus = drain_gfx_pdus(&mut event_rx);
 
     assert_eq!(pdus.len(), 3);
@@ -40,7 +42,7 @@ fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
         GfxPdu::ResetGraphics(reset) => {
             assert_eq!(reset.width, 1280);
             assert_eq!(reset.height, 720);
-            assert!(reset.monitors.is_empty());
+            assert_presentation_monitor(reset, 1280, 720);
         }
         other => panic!("expected ResetGraphics first, got {other:?}"),
     }
@@ -65,11 +67,12 @@ fn surface_init_emits_reset_create_map_in_order_without_monitor_layout() {
 
 #[test]
 fn egfx_output_downscaling_surface_lifecycle_uses_presentation_dimensions() {
-    let (_shared, _bridge, handle, event_tx, mut event_rx) =
+    let (shared, _bridge, handle, event_tx, mut event_rx) =
         negotiated_avc420_session(1920, 1080, DEFAULT_MAX_FRAMES_IN_FLIGHT);
 
-    let surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, 1920, 1080).expect("surface init");
+    let surface_id = shared
+        .init_surface(&handle, &event_tx, 1920, 1080)
+        .expect("surface init");
     let pdus = drain_gfx_pdus(&mut event_rx);
 
     assert_eq!(pdus.len(), 3);
@@ -77,7 +80,7 @@ fn egfx_output_downscaling_surface_lifecycle_uses_presentation_dimensions() {
         GfxPdu::ResetGraphics(reset) => {
             assert_eq!(reset.width, 1920);
             assert_eq!(reset.height, 1080);
-            assert!(reset.monitors.is_empty());
+            assert_presentation_monitor(reset, 1920, 1080);
         }
         other => panic!("expected ResetGraphics first, got {other:?}"),
     }
@@ -167,7 +170,7 @@ fn frame_send_before_surface_init_is_rejected_without_queueing() {
 }
 
 #[test]
-fn resize_deletes_old_surface_then_resets_without_monitor_layout() {
+fn resize_deletes_old_surface_then_resets_with_presentation_monitor() {
     let (shared, _bridge, handle, surface_id, _event_tx, mut event_rx) =
         ready_tracked_avc420_session(640, 480, DEFAULT_MAX_FRAMES_IN_FLIGHT);
     let _ = drain_gfx_pdus(&mut event_rx);
@@ -184,7 +187,7 @@ fn resize_deletes_old_surface_then_resets_without_monitor_layout() {
         GfxPdu::ResetGraphics(reset) => {
             assert_eq!(reset.width, 800);
             assert_eq!(reset.height, 600);
-            assert!(reset.monitors.is_empty());
+            assert_presentation_monitor(reset, 800, 600);
         }
         other => panic!("expected ResetGraphics second, got {other:?}"),
     }
@@ -201,8 +204,9 @@ fn surface_reinit_after_resize_emits_create_map_without_second_reset() {
 
     shared.prepare_for_resize(800, 600);
     let _ = drain_gfx_pdus(&mut event_rx);
-    let new_surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, 800, 600).expect("surface reinit");
+    let new_surface_id = shared
+        .init_surface(&handle, &event_tx, 800, 600)
+        .expect("surface reinit");
     let pdus = drain_gfx_pdus(&mut event_rx);
 
     assert_ne!(new_surface_id, old_surface_id);
@@ -594,8 +598,9 @@ fn resize_generation_ignores_stale_frame_ack() {
     shared.prepare_for_resize(64, 64);
     let _ = drain_gfx_pdus(&mut event_rx);
     assert_eq!(shared.frames_in_flight(), 0);
-    let new_surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, 64, 64).expect("surface reinit");
+    let new_surface_id = shared
+        .init_surface(&handle, &event_tx, 64, 64)
+        .expect("surface reinit");
     let _ = drain_gfx_pdus(&mut event_rx);
 
     assert!(shared.send_tracked_avc420_rdpegfx_frame(
@@ -975,8 +980,10 @@ fn avc444_rdpegfx_shape_rejects_lc0_without_stream2() {
 #[test]
 fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
     let session = tracked_avc444_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
-    let surface_id =
-        EgfxShared::init_surface(&session.handle, &session.event_tx, 64, 64).expect("surface init");
+    let surface_id = session
+        .shared
+        .init_surface(&session.handle, &session.event_tx, 64, 64)
+        .expect("surface init");
     drop(session.event_rx);
     let regions = [Avc420Region::new(0, 0, 32, 32, 21, 79)];
 
@@ -998,8 +1005,10 @@ fn avc444_send_with_closed_event_channel_does_not_queue_frame() {
 #[test]
 fn resize_does_not_bump_generation_when_reset_cannot_be_sent() {
     let session = tracked_avc444_session(64, 64, DEFAULT_MAX_FRAMES_IN_FLIGHT);
-    let _ =
-        EgfxShared::init_surface(&session.handle, &session.event_tx, 64, 64).expect("surface init");
+    let _ = session
+        .shared
+        .init_surface(&session.handle, &session.event_tx, 64, 64)
+        .expect("surface init");
     let generation = session.shared.generation();
 
     drop(session.event_rx);
@@ -1098,6 +1107,9 @@ fn new_gfx_server_requires_fresh_capabilities_and_surface_setup() {
         &pdus.as_slice()[0],
         GfxPdu::ResetGraphics(reset) if reset.width == 64 && reset.height == 64
     ));
+    if let GfxPdu::ResetGraphics(reset) = &pdus.as_slice()[0] {
+        assert_presentation_monitor(reset, 64, 64);
+    }
     assert!(matches!(
         &pdus.as_slice()[1],
         GfxPdu::CreateSurface(create)
@@ -1161,6 +1173,9 @@ fn repeated_compatible_capabilities_reinitialize_surface_generation() {
         &reset_pdus.as_slice()[0],
         GfxPdu::ResetGraphics(reset) if reset.width == 64 && reset.height == 64
     ));
+    if let GfxPdu::ResetGraphics(reset) = &reset_pdus.as_slice()[0] {
+        assert_presentation_monitor(reset, 64, 64);
+    }
     assert!(matches!(
         &reset_pdus.as_slice()[1],
         GfxPdu::CreateSurface(create) if create.surface_id == reset_surface_id
@@ -1168,6 +1183,63 @@ fn repeated_compatible_capabilities_reinitialize_surface_generation() {
     assert!(matches!(
         &reset_pdus.as_slice()[2],
         GfxPdu::MapSurfaceToOutput(map) if map.surface_id == reset_surface_id
+    ));
+}
+
+#[test]
+fn capability_reset_after_prepared_resize_emits_fresh_presentation_reset() {
+    let mut session = unnegotiated_egfx_session(64, 64, EgfxCodecPolicy::Auto);
+    session
+        .bridge
+        .start(TEST_CHANNEL_ID)
+        .expect("channel starts");
+    let caps =
+        GfxPdu::CapabilitiesAdvertise(ironrdp_egfx::pdu::CapabilitiesAdvertisePdu::from_typed(&[
+            ironrdp_egfx::pdu::CapabilitySet::V10_7 {
+                flags: ironrdp_egfx::pdu::CapabilitiesV107Flags::empty(),
+            },
+        ]));
+    let caps = encode_vec(&caps).expect("capabilities encode");
+    let _ = session
+        .bridge
+        .process(TEST_CHANNEL_ID, &caps)
+        .expect("initial capabilities process");
+    session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 64, 64)
+        .expect("initial surface setup");
+    let _ = drain_gfx_pdus(&mut session.event_rx);
+
+    // The resize emits its reset; the client then re-advertises before the
+    // capture thread re-creates the surface, clearing IronRDP's reset state.
+    session.shared.prepare_for_resize(32, 32);
+    let _ = drain_gfx_pdus(&mut session.event_rx);
+    let _ = session
+        .bridge
+        .process(TEST_CHANNEL_ID, &caps)
+        .expect("repeated capabilities process");
+
+    let surface_id = session
+        .shared
+        .init_or_reuse_surface(&session.handle, &session.event_tx, 32, 32)
+        .expect("surface setup after protocol reset");
+    let pdus = drain_gfx_pdus(&mut session.event_rx);
+
+    assert_eq!(pdus.len(), 3, "{pdus:?}");
+    match &pdus.as_slice()[0] {
+        GfxPdu::ResetGraphics(reset) => {
+            assert_eq!((reset.width, reset.height), (32, 32));
+            assert_presentation_monitor(reset, 32, 32);
+        }
+        other => panic!("expected a fresh ResetGraphics first, got {other:?}"),
+    }
+    assert!(matches!(
+        &pdus.as_slice()[1],
+        GfxPdu::CreateSurface(create) if create.surface_id == surface_id
+    ));
+    assert!(matches!(
+        &pdus.as_slice()[2],
+        GfxPdu::MapSurfaceToOutput(map) if map.surface_id == surface_id
     ));
 }
 
