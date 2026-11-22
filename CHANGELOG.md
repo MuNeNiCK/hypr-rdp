@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Updated Rustls to 0.23.46 to fix TLS secret exposure in session `Debug` output (GHSA-c8m5-c952-6cm4), unbounded Brotli certificate decompression (GHSA-h2v8-394m-p7vv), key-exchange record poisoning by an unauthenticated ServerHello (GHSA-w44r-93j7-qv28), and buffered data exposure on ECH rejection (GHSA-vp88-798v-h67f).
+
 ### Changed
 
 - **Breaking:** the server no longer starts without authentication when credentials are missing. Configured mode now requires both a username and a password, and startup fails otherwise. To keep accepting unauthenticated connections, set `auth_mode = "none"` (`--auth-mode none`).
