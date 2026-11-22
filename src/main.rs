@@ -4,6 +4,7 @@ mod clipboard;
 mod config;
 mod display;
 mod egfx;
+mod failure_evidence;
 mod hyprland;
 mod input;
 mod server;

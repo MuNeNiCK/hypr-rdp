@@ -193,6 +193,18 @@ impl FrameEncoder {
         }
     }
 
+    /// Memory-type mask and import path behind `encode_dmabuf`, or `None`
+    /// when this backend never imports a DMA-BUF.
+    #[cfg(feature = "vaapi")]
+    pub(crate) fn dmabuf_import_evidence(&self) -> Option<(Option<u32>, &'static str)> {
+        match self {
+            Self::Vaapi(enc) => Some(enc.dmabuf_import_evidence()),
+            #[cfg(test)]
+            Self::FailingVaapiForTest { .. } => None,
+            Self::Software(_) | Self::SoftwareAvc444(_) => None,
+        }
+    }
+
     pub fn backend_name(&self) -> &'static str {
         match self {
             #[cfg(feature = "vaapi")]

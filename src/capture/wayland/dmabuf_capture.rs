@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{fmt, sync::Arc};
 
 use anyhow::{bail, Context, Result};
@@ -21,9 +21,20 @@ use crate::egfx::{
     EgfxFrameSession, EgfxShared, EncodedEgfxFrame, EncodedFrameState, H264BackendPolicy,
     H264RateControl,
 };
+use crate::failure_evidence;
 use crate::input::{OutputLayoutSnapshot, SharedOutputLayout};
 
 const MAX_ENCODE_FAILURES: u32 = 5;
+
+/// How long the DMA-BUF loop may go without handing a frame to the transport
+/// before it is treated as stalled.
+///
+/// 10 s is about 300 frames at 30 fps — three orders of magnitude above a
+/// healthy encode (single-digit milliseconds) and several times the 2 s GPU
+/// sync deadline and the 2 s EGFX activation grace. A shorter bound would
+/// misfire on a transient compositor hiccup; a longer one would leave a dead
+/// session silent for minutes, which is the failure this guards against.
+const TRANSPORT_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DmaBufEncodeFailureAction {
@@ -128,6 +139,134 @@ fn dmabuf_capture_decision_result(decision: DmaBufCaptureDecision) -> Result<()>
 
 fn dmabuf_egfx_activation_timed_out(shared: &EgfxShared, ready: bool, now: Instant) -> bool {
     !ready && shared.bitmap_fallback_due(now)
+}
+
+/// True when the transport would take a frame right now, so a frame missing
+/// from it means the pipeline stalled rather than the client holding back.
+fn dmabuf_transport_accepts_frames(shared: &EgfxShared, session: &EgfxFrameSession) -> bool {
+    shared.is_ready() && session.frame_readiness(shared).is_ready()
+}
+
+/// True when no frame has reached the transport for longer than
+/// [`TRANSPORT_SEND_STALL_TIMEOUT`] while it was expected to accept one.
+fn dmabuf_transport_stalled(last_send: Instant, now: Instant, accepts_frames: bool) -> bool {
+    accepts_frames && now.saturating_duration_since(last_send) > TRANSPORT_SEND_STALL_TIMEOUT
+}
+
+/// Per-window progress counters, written into the failure record.
+#[derive(Clone, Copy, Default)]
+struct DmaBufFrameCounters {
+    captured: u64,
+    converted: u64,
+    encoded: u64,
+    sent: u64,
+    skipped: u64,
+}
+
+/// Loop arguments that change behaviour and therefore belong in the record.
+#[derive(Clone, Copy)]
+struct DmaBufBehaviour {
+    fps: u32,
+    width: u32,
+    height: u32,
+    bitrate: u32,
+    quality: u8,
+}
+
+fn dmabuf_codec_name(policy: crate::egfx::EgfxCodecPolicy) -> &'static str {
+    use crate::egfx::EgfxCodecPolicy;
+    match policy {
+        EgfxCodecPolicy::Auto => "auto",
+        EgfxCodecPolicy::Avc420 => "avc420",
+        EgfxCodecPolicy::Avc444 => "avc444",
+        EgfxCodecPolicy::ClearCodec => "clearcodec",
+    }
+}
+
+/// Write one durable failure record. A failure to write it is itself logged:
+/// a missing record must not pass silently.
+#[allow(clippy::too_many_arguments)]
+fn record_dmabuf_failure(
+    attempt: &str,
+    va_status: Option<failure_evidence::VaStatusEvidence>,
+    dmabuf_ctx: &DmaBufCaptureContext,
+    shared: Option<&EgfxShared>,
+    encoder: Option<&crate::egfx::FrameEncoder>,
+    counters: DmaBufFrameCounters,
+    failures_in_window: u32,
+    behaviour: DmaBufBehaviour,
+) {
+    let (vpp_memory_types, vpp_import_path) = dmabuf_ctx.vpp.import_evidence();
+    let (encoder_memory_types, encoder_import_path) = encoder
+        .and_then(crate::egfx::FrameEncoder::dmabuf_import_evidence)
+        .unzip();
+    let flow = shared.map(EgfxShared::frame_flow_snapshot);
+
+    let evidence = failure_evidence::FailureEvidence {
+        attempt: attempt.to_owned(),
+        va_status,
+        vpp_input: failure_evidence::ImportEvidence {
+            memory_types: vpp_memory_types,
+            import_path: vpp_import_path,
+        },
+        encoder_input: failure_evidence::ImportEvidence {
+            memory_types: encoder_memory_types.flatten(),
+            import_path: encoder_import_path.unwrap_or("not initialized"),
+        },
+        capture_buffers: dmabuf_ctx
+            .dmabuf_infos
+            .iter()
+            .map(|info| failure_evidence::CaptureBufferEvidence {
+                fd: info.fd,
+                stride: info.stride,
+                offset: info.offset,
+                modifier: info.modifier,
+                format: info.format,
+            })
+            .collect(),
+        nv12_export: failure_evidence::Nv12ExportEvidence {
+            stride: dmabuf_ctx.nv12_info.stride,
+            offset: dmabuf_ctx.nv12_info.offset,
+            uv_stride: dmabuf_ctx.nv12_info.uv_stride,
+            uv_offset: dmabuf_ctx.nv12_info.uv_offset,
+            modifier: dmabuf_ctx.nv12_info.modifier,
+        },
+        counters: failure_evidence::FrameCounters {
+            captured: counters.captured,
+            converted: counters.converted,
+            encoded: counters.encoded,
+            sent: counters.sent,
+            skipped: counters.skipped,
+            failures: failures_in_window,
+        },
+        transport: failure_evidence::TransportEvidence {
+            in_flight: flow.map_or(0, |flow| flow.frames_in_flight),
+            client_queue_depth: flow.map_or(0, |flow| flow.client_queue_depth),
+            ack_suspended: flow.is_some_and(|flow| flow.frame_ack_suspended),
+        },
+        config: failure_evidence::BehaviourConfig {
+            fps: behaviour.fps,
+            resolution: (behaviour.width, behaviour.height),
+            bitrate: behaviour.bitrate,
+            quality: behaviour.quality,
+            max_frames_in_flight: shared.map_or(0, EgfxShared::max_frames_in_flight),
+            capture_mode: "ext",
+            codec: shared.map_or("unknown", |shared| dmabuf_codec_name(shared.codec_policy())),
+        },
+    };
+
+    match failure_evidence::record(&evidence) {
+        Ok(path) => tracing::error!(
+            path = %path.display(),
+            attempt,
+            "Failure evidence written"
+        ),
+        Err(error) => tracing::error!(
+            %error,
+            attempt,
+            "Failed to write failure evidence"
+        ),
+    }
 }
 
 fn dmabuf_frame_wait_decision(
@@ -459,6 +598,16 @@ pub(super) fn capture_loop_ext_dmabuf(
     let mut frame_pacer = FramePacer::new(fps, Instant::now());
     let mut cap_idx: usize = 0;
     let mut sent_first_frame = false;
+    let mut counters = DmaBufFrameCounters::default();
+    // The watchdog's clock: the last frame that actually reached the transport.
+    let mut last_transport_send = Instant::now();
+    let behaviour = DmaBufBehaviour {
+        fps,
+        width,
+        height,
+        bitrate,
+        quality,
+    };
 
     // EGFX transport and surface state live behind the EGFX session helper.
     let mut egfx_session = EgfxFrameSession::new();
@@ -487,6 +636,50 @@ pub(super) fn capture_loop_ext_dmabuf(
         // Wait for current frame to complete (poll-based for responsive shutdown)
         while !state.frame_ready && !state.frame_failed {
             poll_dispatch(event_queue, state, POLL_TIMEOUT_MS)?;
+
+            // The wait is where the loop is otherwise idle, so it is the only
+            // place a stall in the producer can be noticed; and it is not
+            // unbounded either.
+            if let Some(shared) = &egfx_shared {
+                let now = Instant::now();
+                if dmabuf_transport_stalled(
+                    last_transport_send,
+                    now,
+                    dmabuf_transport_accepts_frames(shared, &egfx_session),
+                ) {
+                    let stalled = now.saturating_duration_since(last_transport_send);
+                    let flow = shared.frame_flow_snapshot();
+                    tracing::error!(
+                        stalled_ms = stalled.as_millis() as u64,
+                        timeout_ms = TRANSPORT_SEND_STALL_TIMEOUT.as_millis() as u64,
+                        frames_in_flight = flow.frames_in_flight,
+                        client_queue_depth = flow.client_queue_depth,
+                        ack_suspended = flow.frame_ack_suspended,
+                        captured = counters.captured,
+                        sent = counters.sent,
+                        "DMA-BUF capture stopped reaching the transport; falling back to SHM"
+                    );
+                    record_dmabuf_failure(
+                        &format!(
+                            "no frame handed to the transport for {} ms",
+                            stalled.as_millis()
+                        ),
+                        None,
+                        dmabuf_ctx,
+                        Some(shared.as_ref()),
+                        h264_encoder.as_ref(),
+                        counters,
+                        encode_failures.failures(),
+                        behaviour,
+                    );
+                    frame.destroy();
+                    bail!(
+                        "no frame reached the transport for {} ms in DMA-BUF mode; falling back to SHM",
+                        stalled.as_millis()
+                    );
+                }
+            }
+
             match dmabuf_frame_wait_decision(
                 state.frame_ready,
                 state.frame_failed,
@@ -499,6 +692,18 @@ pub(super) fn capture_loop_ext_dmabuf(
                     break;
                 }
                 DmaBufFrameWaitDecision::Exit(decision) => {
+                    if decision == DmaBufCaptureDecision::FallBackToShm {
+                        record_dmabuf_failure(
+                            "DMA-BUF capture decision during the frame wait",
+                            None,
+                            dmabuf_ctx,
+                            egfx_shared.as_deref(),
+                            h264_encoder.as_ref(),
+                            counters,
+                            encode_failures.failures(),
+                            behaviour,
+                        );
+                    }
                     frame.destroy();
                     return dmabuf_capture_decision_result(decision);
                 }
@@ -511,10 +716,20 @@ pub(super) fn capture_loop_ext_dmabuf(
             break;
         }
 
-        dmabuf_capture_decision_result(dmabuf_capture_decision(
-            output_layout.snapshot().as_ref(),
-            (width, height),
-        ))?;
+        let decision = dmabuf_capture_decision(output_layout.snapshot().as_ref(), (width, height));
+        if decision == DmaBufCaptureDecision::FallBackToShm {
+            record_dmabuf_failure(
+                "DMA-BUF capture decision after a completed frame",
+                None,
+                dmabuf_ctx,
+                egfx_shared.as_deref(),
+                h264_encoder.as_ref(),
+                counters,
+                encode_failures.failures(),
+                behaviour,
+            );
+        }
+        dmabuf_capture_decision_result(decision)?;
 
         let completed_failed = state.frame_failed;
         let completed_idx = cap_idx;
@@ -534,6 +749,7 @@ pub(super) fn capture_loop_ext_dmabuf(
         if completed_failed {
             continue;
         }
+        counters.captured += 1;
 
         // Rate limit
         let pacing_fps = egfx_shared
@@ -586,6 +802,16 @@ pub(super) fn capture_loop_ext_dmabuf(
                         }
                         Err(e) => {
                             // DMA-BUF path requires a working encoder; bail to SHM fallback
+                            record_dmabuf_failure(
+                                "H.264 encoder initialization in DMA-BUF mode",
+                                None,
+                                dmabuf_ctx,
+                                Some(shared.as_ref()),
+                                h264_encoder.as_ref(),
+                                counters,
+                                encode_failures.failures(),
+                                behaviour,
+                            );
                             frame.destroy();
                             bail!("H.264 encoder init failed in DMA-BUF mode, falling back to SHM: {:#}", e);
                         }
@@ -593,6 +819,16 @@ pub(super) fn capture_loop_ext_dmabuf(
                 }
 
                 if dmabuf_egfx_activation_timed_out(shared, session_refresh.ready, Instant::now()) {
+                    record_dmabuf_failure(
+                        "EGFX activation wait in DMA-BUF mode",
+                        None,
+                        dmabuf_ctx,
+                        Some(shared.as_ref()),
+                        h264_encoder.as_ref(),
+                        counters,
+                        encode_failures.failures(),
+                        behaviour,
+                    );
                     frame.destroy();
                     bail!("EGFX activation timed out in DMA-BUF mode; falling back to SHM");
                 }
@@ -604,6 +840,7 @@ pub(super) fn capture_loop_ext_dmabuf(
 
                     let readiness = egfx_session.frame_readiness(shared);
                     if !readiness.is_ready() {
+                        counters.skipped += 1;
                         tracing::trace!(
                             ?readiness,
                             reason = readiness.reason(),
@@ -618,6 +855,7 @@ pub(super) fn capture_loop_ext_dmabuf(
                     let vpp_result = dmabuf_ctx.vpp.convert(completed_idx);
                     let encode_result = match vpp_result {
                         Ok(()) => {
+                            counters.converted += 1;
                             let nv12 = &dmabuf_ctx.nv12_info;
                             h264_encoder.as_mut().map(|enc| {
                                 enc.encode_dmabuf(
@@ -637,6 +875,7 @@ pub(super) fn capture_loop_ext_dmabuf(
 
                     match encode_result {
                         Some(Ok(h264_data)) => {
+                            counters.encoded += 1;
                             let encoded = EncodedEgfxFrame::avc420(h264_data);
                             match encoded.state() {
                                 EncodedFrameState::Sendable => {
@@ -657,11 +896,14 @@ pub(super) fn capture_loop_ext_dmabuf(
                                     );
                                     if sent {
                                         sent_first_frame = true;
+                                        counters.sent += 1;
+                                        last_transport_send = Instant::now();
                                     } else if let Some(enc) = &mut h264_encoder {
                                         enc.force_idr();
                                     }
                                 }
                                 EncodedFrameState::Skipped | EncodedFrameState::Invalid => {
+                                    counters.skipped += 1;
                                     let action = encode_failures.record_no_progress();
                                     tracing::trace!(
                                         failures = encode_failures.failures(),
@@ -673,6 +915,16 @@ pub(super) fn capture_loop_ext_dmabuf(
                                         enc.force_idr();
                                     }
                                     if action == DmaBufEncodeFailureAction::FallBackToShm {
+                                        record_dmabuf_failure(
+                                            "VA-API encode produced no sendable H.264 output",
+                                            None,
+                                            dmabuf_ctx,
+                                            Some(shared.as_ref()),
+                                            h264_encoder.as_ref(),
+                                            counters,
+                                            encode_failures.failures(),
+                                            behaviour,
+                                        );
                                         frame.destroy();
                                         bail!(
                                             "VA-API encode produced no sendable H.264 output \
@@ -685,6 +937,43 @@ pub(super) fn capture_loop_ext_dmabuf(
                             }
                         }
                         Some(Err(e)) => {
+                            // A GPU surface that missed its deadline is a stuck
+                            // driver, not a transient encode error: record it
+                            // and fall back now instead of retrying five times.
+                            if let Some(timeout) = e.downcast_ref::<crate::egfx::SurfaceSyncTimeout>()
+                            {
+                                tracing::error!(
+                                    operation = timeout.operation(),
+                                    surface = timeout.surface(),
+                                    status = timeout.status(),
+                                    "VA-API surface sync deadline expired; falling back to SHM"
+                                );
+                                record_dmabuf_failure(
+                                    &format!(
+                                        "{} wait expired on surface {}",
+                                        timeout.operation(),
+                                        timeout.surface()
+                                    ),
+                                    Some(failure_evidence::VaStatusEvidence {
+                                        status: timeout.status(),
+                                        operation: timeout.operation(),
+                                        surface: timeout.surface(),
+                                    }),
+                                    dmabuf_ctx,
+                                    Some(shared.as_ref()),
+                                    h264_encoder.as_ref(),
+                                    counters,
+                                    encode_failures.failures(),
+                                    behaviour,
+                                );
+                                frame.destroy();
+                                bail!(
+                                    "VA-API surface sync deadline expired in DMA-BUF mode; \
+                                     falling back to SHM: {:#}",
+                                    e
+                                );
+                            }
+
                             let action = encode_failures.record_no_progress();
                             tracing::warn!(
                                 failures = encode_failures.failures(),
@@ -696,6 +985,16 @@ pub(super) fn capture_loop_ext_dmabuf(
                                 enc.force_idr();
                             }
                             if action == DmaBufEncodeFailureAction::FallBackToShm {
+                                record_dmabuf_failure(
+                                    "VA-API DMA-BUF encode pipeline",
+                                    None,
+                                    dmabuf_ctx,
+                                    Some(shared.as_ref()),
+                                    h264_encoder.as_ref(),
+                                    counters,
+                                    encode_failures.failures(),
+                                    behaviour,
+                                );
                                 // Destroy the in-flight frame before dropping DMA-BUF resources
                                 frame.destroy();
                                 bail!(
@@ -915,6 +1214,34 @@ mod tests {
             &session.shared,
             refresh.ready,
             Instant::now()
+        ));
+    }
+
+    #[test]
+    fn dmabuf_transport_watchdog_stays_quiet_until_the_timeout_passes() {
+        let start = Instant::now();
+
+        assert!(!dmabuf_transport_stalled(start, start, true));
+        assert!(!dmabuf_transport_stalled(
+            start,
+            start + TRANSPORT_SEND_STALL_TIMEOUT,
+            true
+        ));
+        assert!(dmabuf_transport_stalled(
+            start,
+            start + TRANSPORT_SEND_STALL_TIMEOUT + Duration::from_millis(1),
+            true
+        ));
+    }
+
+    #[test]
+    fn dmabuf_transport_watchdog_ignores_a_transport_that_refuses_frames() {
+        let start = Instant::now();
+
+        assert!(!dmabuf_transport_stalled(
+            start,
+            start + TRANSPORT_SEND_STALL_TIMEOUT + Duration::from_secs(1),
+            false
         ));
     }
 
