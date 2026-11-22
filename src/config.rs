@@ -83,7 +83,8 @@ struct Args {
     #[arg(long)]
     key: Option<String>,
 
-    /// Authentication mode: configured credentials or Linux PAM
+    /// Authentication mode: configured credentials (default), Linux PAM, or
+    /// none (explicitly allow unauthenticated connections)
     #[arg(long)]
     auth_mode: Option<String>,
 
@@ -293,8 +294,13 @@ pub struct RuntimeConfig {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AuthConfig {
-    Configured(Option<ConfigCredentials>),
-    Pam { service: String },
+    /// Fixed username/password checked through NLA; both halves are nonempty.
+    Configured(ConfigCredentials),
+    /// Explicitly requested unauthenticated access (`auth_mode = "none"`).
+    None,
+    Pam {
+        service: String,
+    },
 }
 
 fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::Result<AuthConfig> {
@@ -304,6 +310,16 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
         .or(config.auth_mode.take())
         .unwrap_or_else(|| "configured".into());
     let service = args.pam_service.take().or(config.pam_service.take());
+    let configured_inputs_absent = || {
+        args.username.is_none()
+            && config.username.is_none()
+            && args.domain.is_none()
+            && config.domain.is_none()
+            && args.password.is_none()
+            && config.password.is_none()
+            && args.password_file.is_none()
+            && config.password_file.is_none()
+    };
     match mode.as_str() {
         "configured" => {
             anyhow::ensure!(service.is_none(), "pam-service requires auth-mode pam");
@@ -321,18 +337,18 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
             )?;
             Ok(AuthConfig::Configured(ConfigCredentials::from_parts(
                 username, domain, password,
-            )))
+            )?))
+        }
+        "none" => {
+            anyhow::ensure!(
+                configured_inputs_absent() && service.is_none(),
+                "auth-mode none cannot be combined with username, domain, password, password-file or pam-service"
+            );
+            Ok(AuthConfig::None)
         }
         "pam" => {
             anyhow::ensure!(
-                args.username.is_none()
-                    && config.username.is_none()
-                    && args.domain.is_none()
-                    && config.domain.is_none()
-                    && args.password.is_none()
-                    && config.password.is_none()
-                    && args.password_file.is_none()
-                    && config.password_file.is_none(),
+                configured_inputs_absent(),
                 "auth-mode pam cannot be combined with username, domain, password or password-file"
             );
             let service = service.unwrap_or_else(|| "hypr-rdp".into());
@@ -342,7 +358,7 @@ fn resolve_authentication(args: &mut Args, config: &mut ConfigFile) -> anyhow::R
             );
             Ok(AuthConfig::Pam { service })
         }
-        _ => anyhow::bail!("unknown auth-mode; expected configured or pam"),
+        _ => anyhow::bail!("unknown auth-mode; expected configured, pam or none"),
     }
 }
 
@@ -354,15 +370,25 @@ pub(crate) struct ConfigCredentials {
 }
 
 impl ConfigCredentials {
-    fn from_parts(username: String, domain: Option<String>, password: String) -> Option<Self> {
-        if username.is_empty() && password.is_empty() {
-            None
-        } else {
-            Some(Self {
+    /// Requires both halves; missing credentials never fall back to no-auth.
+    fn from_parts(
+        username: String,
+        domain: Option<String>,
+        password: String,
+    ) -> anyhow::Result<Self> {
+        match (username.is_empty(), password.is_empty()) {
+            (false, false) => Ok(Self {
                 username,
                 domain: domain.filter(|domain| !domain.is_empty()),
                 password,
-            })
+            }),
+            (true, true) => anyhow::bail!(
+                "no credentials configured; set username and password (or password_file), \
+                 use auth_mode = \"pam\", or set auth_mode = \"none\" to explicitly allow \
+                 unauthenticated connections"
+            ),
+            (true, false) => anyhow::bail!("a password is configured but the username is empty"),
+            (false, true) => anyhow::bail!("a username is configured but the password is empty"),
         }
     }
 }
@@ -371,28 +397,16 @@ impl ConfigCredentials {
 enum StartupWarning {
     AuthenticationOff,
     ReachableBeyondLoopback,
-    HalfCredentials,
 }
 
-fn startup_warnings(
-    credentials: Option<&ConfigCredentials>,
-    bind: SocketAddr,
-) -> Vec<StartupWarning> {
+fn startup_warnings(authentication: &AuthConfig, bind: SocketAddr) -> Vec<StartupWarning> {
     let mut warnings = Vec::new();
-
-    if credentials.is_none() {
+    if *authentication == AuthConfig::None {
         warnings.push(StartupWarning::AuthenticationOff);
-    } else if credentials
-        .is_some_and(|value| value.username.is_empty() || value.password.is_empty())
-    {
-        warnings.push(StartupWarning::HalfCredentials);
+        if !bind.ip().to_canonical().is_loopback() {
+            warnings.push(StartupWarning::ReachableBeyondLoopback);
+        }
     }
-
-    let password_is_empty = credentials.is_none_or(|value| value.password.is_empty());
-    if password_is_empty && !bind.ip().to_canonical().is_loopback() {
-        warnings.push(StartupWarning::ReachableBeyondLoopback);
-    }
-
     warnings
 }
 
@@ -417,21 +431,14 @@ impl RuntimeConfig {
                 "Client-to-server file transfer is not compiled in; disabling the unavailable direction");
         }
 
-        let warnings = match &authentication {
-            AuthConfig::Configured(credentials) => startup_warnings(credentials.as_ref(), bind),
-            AuthConfig::Pam { .. } => Vec::new(),
-        };
-        for warning in warnings {
+        for warning in startup_warnings(&authentication, bind) {
             match warning {
                 StartupWarning::AuthenticationOff => tracing::warn!(
-                    "No credentials set (-u/-p). Use -u <user> -p <pass> to require authentication."
+                    "auth_mode = \"none\": connections are accepted without authentication."
                 ),
                 StartupWarning::ReachableBeyondLoopback => tracing::warn!(
                     bind = %bind,
-                    "RDP is reachable beyond loopback without a password."
-                ),
-                StartupWarning::HalfCredentials => tracing::warn!(
-                    "Only one half of the credentials is set; the other one is matched as empty."
+                    "RDP is reachable beyond loopback without authentication."
                 ),
             }
         }
@@ -778,23 +785,36 @@ mod tests {
         assert_eq!(args.scale, Some(1.5));
     }
 
-    fn warnings(username: &str, password: &str, bind: &str) -> Vec<StartupWarning> {
-        let credentials =
-            ConfigCredentials::from_parts(username.to_owned(), None, password.to_owned());
-        startup_warnings(credentials.as_ref(), parse_bind_addr(bind).unwrap())
+    fn warnings(authentication: &AuthConfig, bind: &str) -> Vec<StartupWarning> {
+        startup_warnings(authentication, parse_bind_addr(bind).unwrap())
     }
 
     #[test]
-    fn credential_classification_preserves_every_configured_shape() {
-        assert!(ConfigCredentials::from_parts(String::new(), None, String::new()).is_none());
-
-        for (username, password) in [("user", "secret"), ("user", ""), ("", "secret")] {
+    fn credential_classification_requires_both_halves() {
+        for (username, password) in [("user", "secret"), (" ", " "), ("DOMAIN\\User", "secret")] {
             let credentials =
                 ConfigCredentials::from_parts(username.to_owned(), None, password.to_owned())
                     .unwrap();
             assert_eq!(credentials.username, username);
             assert_eq!(credentials.password, password);
             assert_eq!(credentials.domain, None);
+        }
+
+        for (username, password, reason) in [
+            ("", "", "auth_mode = \"none\""),
+            ("user", "", "password is empty"),
+            ("", "secret", "username is empty"),
+        ] {
+            let error = ConfigCredentials::from_parts(
+                username.to_owned(),
+                Some("D".into()),
+                password.to_owned(),
+            )
+            .expect_err("incomplete credentials must not start");
+            assert!(
+                format!("{error:#}").contains(reason),
+                "{username:?}/{password:?}: {error:#}"
+            );
         }
     }
 
@@ -819,7 +839,7 @@ mod tests {
     }
 
     #[test]
-    fn no_password_warns_only_beyond_canonical_loopback() {
+    fn explicit_no_auth_warns_and_flags_reach_beyond_canonical_loopback() {
         for bind in [
             "0.0.0.0:3389",
             "[::]:3389",
@@ -827,32 +847,35 @@ mod tests {
             "192.168.1.5:3389",
         ] {
             assert_eq!(
-                warnings("", "", bind),
+                warnings(&AuthConfig::None, bind),
                 vec![AuthenticationOff, ReachableBeyondLoopback],
                 "{bind}"
             );
         }
 
         for bind in ["127.0.0.1:3389", "[::1]:3389", "[::ffff:127.0.0.1]:3389"] {
-            assert_eq!(warnings("", "", bind), vec![AuthenticationOff], "{bind}");
+            assert_eq!(
+                warnings(&AuthConfig::None, bind),
+                vec![AuthenticationOff],
+                "{bind}"
+            );
         }
     }
 
     #[test]
-    fn half_credentials_follow_the_actual_empty_secret() {
-        assert_eq!(
-            warnings("user", "", "0.0.0.0:3389"),
-            vec![HalfCredentials, ReachableBeyondLoopback]
-        );
-        assert_eq!(
-            warnings("", "secret", "0.0.0.0:3389"),
-            vec![HalfCredentials]
-        );
-        assert_eq!(
-            warnings("user", "", "127.0.0.1:3389"),
-            vec![HalfCredentials]
-        );
-        assert!(warnings("user", "secret", "0.0.0.0:3389").is_empty());
+    fn authenticated_modes_have_no_startup_warnings() {
+        let configured = AuthConfig::Configured(ConfigCredentials {
+            username: "user".into(),
+            domain: None,
+            password: "secret".into(),
+        });
+        let pam = AuthConfig::Pam {
+            service: "hypr-rdp".into(),
+        };
+        for bind in ["0.0.0.0:3389", "127.0.0.1:3389"] {
+            assert!(warnings(&configured, bind).is_empty());
+            assert!(warnings(&pam, bind).is_empty());
+        }
     }
 
     #[test]
@@ -1451,12 +1474,94 @@ mod pam_config_tests {
     }
 
     #[test]
-    fn cli_domain_does_not_enable_authentication_by_itself() {
+    fn cli_domain_alone_is_a_startup_error_not_no_auth() {
         for option in ["--domain", "-d"] {
-            assert_eq!(
-                resolve(&["hypr-rdp", option, "WORKGROUP"], "").unwrap(),
-                AuthConfig::Configured(None)
-            );
+            let error = resolve(&["hypr-rdp", option, "WORKGROUP"], "")
+                .expect_err("a domain alone must not start the server");
+            assert!(format!("{error:#}").contains("no credentials configured"));
+        }
+    }
+
+    #[test]
+    fn missing_or_half_credentials_never_start_without_authentication() {
+        for (cli, file) in [
+            (&["hypr-rdp"][..], ""),
+            (&["hypr-rdp", "--auth-mode", "configured"][..], ""),
+            (&["hypr-rdp"][..], "auth_mode = 'configured'"),
+            (&["hypr-rdp"][..], "domain = 'WORKGROUP'"),
+            (&["hypr-rdp", "-u", "", "-p", ""][..], ""),
+            (&["hypr-rdp", "-u", "alice"][..], ""),
+            (&["hypr-rdp"][..], "username = 'alice'"),
+            (&["hypr-rdp", "-p", "secret"][..], ""),
+            (&["hypr-rdp"][..], "password = 'secret'"),
+            (
+                &["hypr-rdp", "-p", ""][..],
+                "username = 'alice'\npassword = 'config'",
+            ),
+            (
+                &["hypr-rdp", "-u", ""][..],
+                "username = 'alice'\npassword = 'config'",
+            ),
+        ] {
+            assert!(resolve(cli, file).is_err(), "{cli:?}, {file:?}");
+        }
+    }
+
+    #[test]
+    fn explicit_none_is_the_only_unauthenticated_mode() {
+        assert_eq!(
+            resolve(&["hypr-rdp", "--auth-mode", "none"], "").unwrap(),
+            AuthConfig::None
+        );
+        assert_eq!(
+            resolve(&["hypr-rdp"], "auth_mode = 'none'").unwrap(),
+            AuthConfig::None
+        );
+        // An explicit CLI mode overrides the file mode in both directions.
+        assert!(matches!(
+            resolve(
+                &[
+                    "hypr-rdp",
+                    "--auth-mode",
+                    "configured",
+                    "-u",
+                    "a",
+                    "-p",
+                    "b"
+                ],
+                "auth_mode = 'none'"
+            )
+            .unwrap(),
+            AuthConfig::Configured(_)
+        ));
+        assert_eq!(
+            resolve(&["hypr-rdp", "--auth-mode", "none"], "auth_mode = 'pam'").unwrap(),
+            AuthConfig::None
+        );
+    }
+
+    #[test]
+    fn none_rejects_every_credential_or_pam_input_from_either_source() {
+        for field in [
+            "username",
+            "domain",
+            "password",
+            "password_file",
+            "pam_service",
+        ] {
+            for value in ["", "x"] {
+                let file = format!("auth_mode = 'none'\n{field} = '{value}'");
+                let error = resolve(&["hypr-rdp"], &file)
+                    .expect_err("none must not silently ignore configured inputs");
+                assert!(format!("{error:#}").contains("auth-mode none"), "{file}");
+            }
+        }
+        for option in ["-u", "-d", "-p", "--password-file", "--pam-service"] {
+            for value in ["", "x"] {
+                let cli = ["hypr-rdp", "--auth-mode", "none", option, value];
+                let error = resolve(&cli, "").expect_err("none must reject CLI inputs");
+                assert!(format!("{error:#}").contains("auth-mode none"), "{cli:?}");
+            }
         }
     }
 
@@ -1486,11 +1591,11 @@ mod pam_config_tests {
         ] {
             assert_eq!(
                 resolve(cli, file).unwrap(),
-                AuthConfig::Configured(Some(ConfigCredentials {
+                AuthConfig::Configured(ConfigCredentials {
                     username: " Alice ".into(),
                     domain: expected_domain.map(str::to_owned),
                     password: " secret ".into(),
-                })),
+                }),
                 "{cli:?}, {file:?}"
             );
         }
@@ -1521,26 +1626,23 @@ mod pam_config_tests {
             let file = format!("username = 'alice'\npassword = 'secret'\n{domain_config}");
             assert_eq!(
                 resolve(cli, &file).unwrap(),
-                AuthConfig::Configured(Some(ConfigCredentials {
+                AuthConfig::Configured(ConfigCredentials {
                     username: "alice".into(),
                     domain: expected_domain.map(str::to_owned),
                     password: "secret".into(),
-                })),
+                }),
                 "{cli:?}, {file:?}"
             );
         }
     }
 
     #[test]
-    fn configured_domain_preserves_existing_credential_classification() {
-        assert_eq!(
-            resolve(&["hypr-rdp"], "domain = 'WORKGROUP'").unwrap(),
-            AuthConfig::Configured(None)
-        );
+    fn configured_domain_preserves_credential_classification() {
+        assert!(resolve(&["hypr-rdp"], "domain = 'WORKGROUP'").is_err());
         for (username, password, enabled) in [
             ("", "", false),
-            ("user", "", true),
-            ("", "secret", true),
+            ("user", "", false),
+            ("", "secret", false),
             (" User ", " secret ", true),
             ("DOMAIN\\User", "secret", true),
             ("User@example.org", "secret", true),
@@ -1562,26 +1664,24 @@ mod pam_config_tests {
             ] {
                 let mut cli = cli_domain.to_vec();
                 cli.extend(["-u", username, "-p", password]);
-                let expected = if enabled {
-                    AuthConfig::Configured(Some(ConfigCredentials {
+                let actual = resolve(&cli, file);
+                if enabled {
+                    let expected = AuthConfig::Configured(ConfigCredentials {
                         username: username.into(),
                         domain: expected_domain.map(str::to_owned),
                         password: password.into(),
-                    }))
+                    });
+                    assert_eq!(actual.unwrap(), expected, "{cli:?}, {file:?}");
                 } else {
-                    AuthConfig::Configured(None)
-                };
-                assert_eq!(resolve(&cli, file).unwrap(), expected, "{cli:?}, {file:?}");
+                    assert!(actual.is_err(), "{cli:?}, {file:?}");
+                }
             }
         }
     }
 
     #[test]
     fn pam_is_explicit_and_configured_credentials_remain_the_default() {
-        assert_eq!(
-            resolve(&["hypr-rdp"], "").unwrap(),
-            AuthConfig::Configured(None)
-        );
+        assert!(resolve(&["hypr-rdp"], "").is_err());
         assert_eq!(
             resolve(&["hypr-rdp", "--auth-mode", "pam"], "").unwrap(),
             AuthConfig::Pam {
@@ -1590,7 +1690,7 @@ mod pam_config_tests {
         );
         assert!(matches!(
             resolve(&["hypr-rdp", "-u", "alice", "-p", "secret"], "").unwrap(),
-            AuthConfig::Configured(Some(_))
+            AuthConfig::Configured(_)
         ));
         assert_eq!(
             resolve(
@@ -1708,20 +1808,14 @@ mod pam_config_tests {
                 "Cli",
                 " file Secret ",
             ),
-            (
-                vec!["hypr-rdp", "-p", ""],
-                "username = 'alice'\ndomain = 'File'\npassword = 'config'".into(),
-                "File",
-                "",
-            ),
         ] {
             assert_eq!(
                 resolve(&cli, &file).unwrap(),
-                AuthConfig::Configured(Some(ConfigCredentials {
+                AuthConfig::Configured(ConfigCredentials {
                     username: "alice".into(),
                     domain: Some(expected_domain.into()),
                     password: expected_password.into(),
-                })),
+                }),
                 "{cli:?}, {file:?}"
             );
         }
@@ -1730,6 +1824,14 @@ mod pam_config_tests {
             &format!("username = 'alice'\npassword = 'config'\n{config_password_file}")
         )
         .is_err());
+        // An empty CLI password still overrides the file one, which now refuses
+        // startup instead of matching an empty secret.
+        let error = resolve(
+            &["hypr-rdp", "-p", ""],
+            "username = 'alice'\ndomain = 'File'\npassword = 'config'",
+        )
+        .expect_err("an empty password override must not start");
+        assert!(format!("{error:#}").contains("password is empty"));
         std::fs::remove_file(&path).unwrap();
     }
 
@@ -1742,15 +1844,44 @@ mod pam_config_tests {
         .unwrap();
         assert_eq!(
             actual,
-            AuthConfig::Configured(Some(ConfigCredentials {
+            AuthConfig::Configured(ConfigCredentials {
                 username: "alice".into(),
                 domain: None,
                 password: "cli".into()
-            }))
+            })
         );
     }
 
     proptest! {
+        #[test]
+        fn generated_auth_mode_tokens_never_downgrade_authentication(
+            token in prop_oneof![
+                Just("none".to_owned()),
+                Just("pam".to_owned()),
+                Just("configured".to_owned()),
+                "[A-Za-z0-9_-]{0,16}",
+            ],
+            with_credentials in any::<bool>(),
+        ) {
+            let mut cli = vec!["hypr-rdp", "--auth-mode", token.as_str()];
+            if with_credentials {
+                cli.extend(["-u", "alice", "-p", "secret"]);
+            }
+            let result = resolve(&cli, "");
+            match (token.as_str(), with_credentials) {
+                ("none", false) => prop_assert_eq!(result.unwrap(), AuthConfig::None),
+                ("pam", false) => {
+                    let is_pam = matches!(result.unwrap(), AuthConfig::Pam { .. });
+                    prop_assert!(is_pam)
+                },
+                ("configured", true) => {
+                    let is_configured = matches!(result.unwrap(), AuthConfig::Configured(_));
+                    prop_assert!(is_configured)
+                },
+                _ => prop_assert!(result.is_err(), "{:?}", cli),
+            }
+        }
+
         #[test]
         fn generated_configured_domain_precedence_preserves_optional_sources(
             nonempty_domain in "[A-Za-z0-9éΩ _@.-]{1,32}",
@@ -1763,19 +1894,19 @@ mod pam_config_tests {
             let cli_option = format!("--domain={nonempty_domain}");
             prop_assert_eq!(
                 resolve(&["hypr-rdp", &cli_option], &file).unwrap(),
-                AuthConfig::Configured(Some(ConfigCredentials {
+                AuthConfig::Configured(ConfigCredentials {
                     username: "alice".into(),
                     domain: Some(nonempty_domain.clone()),
                     password: "secret".into(),
-                }))
+                })
             );
             prop_assert_eq!(
                 resolve(&["hypr-rdp", "--domain="], &file).unwrap(),
-                AuthConfig::Configured(Some(ConfigCredentials {
+                AuthConfig::Configured(ConfigCredentials {
                     username: "alice".into(),
                     domain: None,
                     password: "secret".into(),
-                }))
+                })
             );
             let file = format!(
                 "username = 'alice'\npassword = 'secret'\ndomain = {}",
@@ -1783,11 +1914,11 @@ mod pam_config_tests {
             );
             prop_assert_eq!(
                 resolve(&["hypr-rdp"], &file).unwrap(),
-                AuthConfig::Configured(Some(ConfigCredentials {
+                AuthConfig::Configured(ConfigCredentials {
                     username: "alice".into(),
                     domain: Some(nonempty_domain),
                     password: "secret".into(),
-                }))
+                })
             );
         }
     }

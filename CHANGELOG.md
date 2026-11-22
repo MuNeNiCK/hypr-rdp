@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Breaking:** the server no longer starts without authentication when credentials are missing. Configured mode now requires both a username and a password, and startup fails otherwise. To keep accepting unauthenticated connections, set `auth_mode = "none"` (`--auth-mode none`).
+
 ## [0.1.8] - 2026-11-06
 
 ### Added
