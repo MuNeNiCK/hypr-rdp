@@ -19,13 +19,18 @@ impl PreparedAuthentication {
     pub fn new(config: AuthConfig) -> anyhow::Result<Self> {
         match config {
             AuthConfig::Configured(creds) => {
-                let credentials = ironrdp_credentials(creds);
+                let credentials = ironrdp_credentials(Some(creds));
                 Ok(Self {
                     security: security_mode_for_credentials(&credentials),
                     credentials,
                     validator: None,
                 })
             }
+            AuthConfig::None => Ok(Self {
+                security: security_mode_for_credentials(&None),
+                credentials: None,
+                validator: None,
+            }),
             AuthConfig::Pam { service } => {
                 let validator = pam::PamValidator::new(service)?;
                 Ok(Self {
@@ -79,14 +84,16 @@ mod tests {
 
     #[test]
     fn configured_authentication_keeps_nla_and_no_auth_modes_separate() {
-        let none = PreparedAuthentication::new(AuthConfig::Configured(None)).unwrap();
+        let none = PreparedAuthentication::new(AuthConfig::None).unwrap();
         assert_eq!(none.security, ServerSecurityMode::Tls);
+        assert_eq!(none.security.connection_policy(), ConnectionPolicy::Queue);
+        assert!(none.credentials.is_none());
         assert!(none.validator.is_none());
-        let fixed = PreparedAuthentication::new(AuthConfig::Configured(Some(ConfigCredentials {
+        let fixed = PreparedAuthentication::new(AuthConfig::Configured(ConfigCredentials {
             username: "user".into(),
             domain: None,
             password: "secret".into(),
-        })))
+        }))
         .unwrap();
         assert_eq!(fixed.security, ServerSecurityMode::Hybrid);
         assert!(fixed.credentials.is_some());
@@ -97,11 +104,11 @@ mod tests {
     fn configured_domain_is_passed_through_to_ironrdp() {
         for domain in [Some("WORKGROUP"), None, Some(" MiXeD \t "), Some("")] {
             let authentication =
-                PreparedAuthentication::new(AuthConfig::Configured(Some(ConfigCredentials {
+                PreparedAuthentication::new(AuthConfig::Configured(ConfigCredentials {
                     username: "user".into(),
                     domain: domain.map(str::to_owned),
                     password: "pass".into(),
-                })))
+                }))
                 .unwrap();
             assert_eq!(authentication.security, ServerSecurityMode::Hybrid);
             assert_eq!(
