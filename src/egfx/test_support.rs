@@ -151,7 +151,7 @@ impl GfxPduTrace {
             GfxPdu::ResetGraphics(reset) => {
                 assert_eq!(reset.width, u32::from(width));
                 assert_eq!(reset.height, u32::from(height));
-                assert!(reset.monitors.is_empty());
+                assert_presentation_monitor(reset, width, height);
             }
             other => panic!("expected ResetGraphics first, got {other:?}"),
         }
@@ -979,8 +979,9 @@ pub(crate) fn ready_tracked_avc420_session(
 ) {
     let (shared, bridge, handle, event_tx, event_rx) =
         negotiated_avc420_session(width, height, max_frames_in_flight);
-    let surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, width, height).expect("surface init");
+    let surface_id = shared
+        .init_surface(&handle, &event_tx, width, height)
+        .expect("surface init");
     (shared, bridge, handle, surface_id, event_tx, event_rx)
 }
 
@@ -1000,8 +1001,9 @@ pub(crate) fn ready_avc444_handle(width: u16, height: u16) -> (GfxServerHandle, 
     assert!(shared.is_ready());
     assert!(shared.is_avc444_enabled());
 
-    let surface_id =
-        EgfxShared::init_surface(&handle, &event_tx, width, height).expect("surface init");
+    let surface_id = shared
+        .init_surface(&handle, &event_tx, width, height)
+        .expect("surface init");
     (handle, surface_id)
 }
 
@@ -1133,4 +1135,23 @@ pub(crate) fn ack_frame(
     let ack = encode_vec(&ack).expect("frame ack encodes");
     let _ = ironrdp_dvc::DvcProcessor::process(bridge, TEST_CHANNEL_ID, &ack)
         .expect("frame ack processes");
+}
+
+/// Asserts the single primary monitor covering the whole output buffer.
+pub(crate) fn assert_presentation_monitor(
+    reset: &ironrdp_egfx::pdu::ResetGraphicsPdu,
+    width: u16,
+    height: u16,
+) {
+    use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
+    assert_eq!(
+        reset.monitors,
+        vec![Monitor {
+            left: 0,
+            top: 0,
+            right: i32::from(width) - 1,
+            bottom: i32::from(height) - 1,
+            flags: MonitorFlags::PRIMARY,
+        }]
+    );
 }

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use ironrdp_dvc::DvcMessage;
 use ironrdp_egfx::pdu::{Avc420Region, Encoding};
 use ironrdp_egfx::server::GraphicsPipelineServer;
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{EgfxServerMessage, GfxServerHandle, ServerEvent};
 use tokio::sync::mpsc;
 
@@ -15,6 +16,19 @@ pub(in crate::egfx) struct QueuedRdpegfxFrame {
     pub(in crate::egfx) frame_id: u32,
     pub(in crate::egfx) dvc_messages: Vec<DvcMessage>,
     pub(in crate::egfx) channel_id: u32,
+}
+
+/// The single presentation monitor advertised in RDPGFX_RESET_GRAPHICS_PDU:
+/// the whole Graphics Output Buffer, primary, at the origin. TS_MONITOR_DEF
+/// right/bottom are inclusive. FreeRDP clients reject a reset without monitors.
+pub(in crate::egfx) fn presentation_monitor(width: u16, height: u16) -> Monitor {
+    Monitor {
+        left: 0,
+        top: 0,
+        right: i32::from(width) - 1,
+        bottom: i32::from(height) - 1,
+        flags: MonitorFlags::PRIMARY,
+    }
 }
 
 #[derive(Default)]
@@ -241,7 +255,7 @@ impl EgfxShared {
                 Some(id) => id,
                 None => return,
             };
-            server.resize(width, height);
+            server.resize_with_monitors(width, height, vec![presentation_monitor(width, height)]);
             dvc_messages = server.drain_output();
         }
         self.clear_current_surface();
@@ -260,7 +274,8 @@ impl EgfxShared {
                         .is_ok()
                     {
                         self.clear_frame_queue();
-                        self.ready_generation.fetch_add(1, Ordering::Release);
+                        let generation = self.ready_generation.fetch_add(1, Ordering::Release) + 1;
+                        self.record_emitted_reset(generation, width, height);
                     }
                 }
                 Err(e) => {
@@ -277,6 +292,7 @@ impl EgfxShared {
     /// Called once when EGFX becomes ready, BEFORE any frames are sent.
     /// Returns the surface_id on success.
     pub fn init_surface(
+        &self,
         handle: &GfxServerHandle,
         sender: &mpsc::UnboundedSender<ServerEvent>,
         width: u16,
@@ -302,11 +318,14 @@ impl EgfxShared {
             }
         };
 
-        // Set desktop dimensions; create_surface will auto-send ResetGraphics
-        // (without monitor layout) on first call. Using resize_with_monitors
-        // sends ResetGraphics WITH monitors, which causes Windows clients to
-        // re-negotiate capabilities and invalidate the surface.
-        server.set_output_dimensions(width, height);
+        // A prepared resize already sent ResetGraphics for this generation and
+        // size; otherwise send it here with the presentation monitor (IronRDP's
+        // create_surface would send one without any monitor).
+        let generation = self.generation();
+        let reset_emitted = self.reset_emitted_for(generation, width, height);
+        if !reset_emitted {
+            server.resize_with_monitors(width, height, vec![presentation_monitor(width, height)]);
+        }
 
         let sid = server.create_surface(width, height)?;
         server.map_surface_to_output(sid, 0, 0);
@@ -341,6 +360,9 @@ impl EgfxShared {
                 }
             }
         }
+        if !reset_emitted {
+            self.record_emitted_reset(generation, width, height);
+        }
 
         tracing::info!(surface_id = sid, width, height, "EGFX surface initialized");
         Some(sid)
@@ -363,7 +385,7 @@ impl EgfxShared {
             self.clear_current_surface();
         }
 
-        let surface_id = Self::init_surface(handle, sender, width, height)?;
+        let surface_id = self.init_surface(handle, sender, width, height)?;
         self.set_current_surface(surface_id, width, height);
         Some(surface_id)
     }

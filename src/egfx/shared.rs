@@ -102,6 +102,10 @@ pub struct EgfxShared {
     /// Surface size for auto-create in EGFX negotiation
     surface_size: Mutex<(u16, u16)>,
     current_surface: Mutex<Option<(u16, u16, u16)>>,
+    /// (ready_generation, width, height) of the last ResetGraphics this server
+    /// emitted. IronRDP exposes no "reset already sent" state, so surface setup
+    /// uses this to avoid a duplicate reset after a prepared resize.
+    emitted_reset: Mutex<Option<(u32, u16, u16)>>,
     /// Flow-control window for latency/throughput tuning.
     max_frames_in_flight: AtomicU32,
     frames_in_flight: AtomicU32,
@@ -135,6 +139,7 @@ impl EgfxShared {
             event_sender: Mutex::new(None),
             surface_size: Mutex::new((0, 0)),
             current_surface: Mutex::new(None),
+            emitted_reset: Mutex::new(None),
             max_frames_in_flight: AtomicU32::new(max_frames_in_flight.max(1)),
             frames_in_flight: AtomicU32::new(0),
             client_queue_depth: AtomicU32::new(0),
@@ -174,6 +179,29 @@ impl EgfxShared {
     pub(in crate::egfx) fn set_current_surface(&self, surface_id: u16, width: u16, height: u16) {
         if let Ok(mut guard) = self.current_surface.lock() {
             *guard = Some((surface_id, width, height));
+        }
+    }
+
+    pub(in crate::egfx) fn record_emitted_reset(&self, generation: u32, width: u16, height: u16) {
+        if let Ok(mut guard) = self.emitted_reset.lock() {
+            *guard = Some((generation, width, height));
+        }
+    }
+
+    pub(in crate::egfx) fn reset_emitted_for(
+        &self,
+        generation: u32,
+        width: u16,
+        height: u16,
+    ) -> bool {
+        self.emitted_reset
+            .lock()
+            .is_ok_and(|guard| *guard == Some((generation, width, height)))
+    }
+
+    pub(in crate::egfx) fn clear_emitted_reset(&self) {
+        if let Ok(mut guard) = self.emitted_reset.lock() {
+            *guard = None;
         }
     }
 
@@ -433,6 +461,7 @@ impl EgfxShared {
         self.avc444_enabled.store(false, Ordering::Release);
         self.force_full_frame.store(false, Ordering::Release);
         self.clear_current_surface();
+        self.clear_emitted_reset();
         self.reset_frame_queue_for_new_client();
         if let Ok(mut encoder) = self.clearcodec.lock() {
             *encoder = Default::default();
