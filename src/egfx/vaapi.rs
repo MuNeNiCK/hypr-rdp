@@ -377,26 +377,28 @@ fn vaapi_rate_control_policy(
     }
 }
 
-/// Use CQP when the driver does not offer the requested rate control mode.
-/// Intel low-power (VDEnc) encoding offers only CQP unless HuC firmware is
-/// loaded. An unknown mask keeps the requested mode.
-fn supported_h264_rate_control(requested: H264RateControl, supported: u32) -> H264RateControl {
-    let va_mode = |rate_control| match rate_control {
+/// Rejects a rate control mode the driver reports as unsupported, so VA-API
+/// setup fails (and `h264_backend = auto` falls back to software) instead of
+/// silently ignoring the configured bitrate. Intel low-power (VDEnc) encoding
+/// offers only CQP unless HuC firmware is loaded. An unknown mask keeps the
+/// requested mode.
+fn ensure_h264_rate_control_supported(requested: H264RateControl, supported: u32) -> Result<()> {
+    let va_mode = match requested {
         H264RateControl::Vbr => sys::VA_RC_VBR,
         H264RateControl::Cqp => sys::VA_RC_CQP,
     };
-    if supported == va::VA_ATTRIB_NOT_SUPPORTED
-        || supported & va_mode(requested) != 0
-        || supported & sys::VA_RC_CQP == 0
-    {
-        return requested;
+    if supported == va::VA_ATTRIB_NOT_SUPPORTED || supported & va_mode != 0 {
+        return Ok(());
     }
-    tracing::warn!(
-        requested = ?requested,
-        supported = format_args!("{supported:#x}"),
-        "VA-API driver does not support the requested rate control; using CQP"
+    if supported & sys::VA_RC_CQP != 0 {
+        bail!(
+            "VA-API driver does not support {requested:?} rate control (supported mask {supported:#x}); \
+             set rate_control = \"cqp\" to use hardware encoding"
+        );
+    }
+    bail!(
+        "VA-API driver does not support {requested:?} rate control (supported mask {supported:#x})"
     );
-    H264RateControl::Cqp
 }
 
 struct VaapiRateControlParameters {
@@ -555,7 +557,7 @@ impl VaapiEncoder {
         let supported_rate_control = display
             .get_config_attrib(h264_profile, entrypoint, sys::VA_CONFIG_ATTRIB_RATE_CONTROL)
             .unwrap_or(va::VA_ATTRIB_NOT_SUPPORTED);
-        let rate_control = supported_h264_rate_control(rate_control, supported_rate_control);
+        ensure_h264_rate_control_supported(rate_control, supported_rate_control)?;
         let rc_policy = vaapi_rate_control_policy(bitrate, quality, rate_control);
         let level_idc = h264_level(
             h264_profile,
@@ -2197,19 +2199,19 @@ mod tests {
     }
 
     #[test]
-    fn rate_control_uses_cqp_only_when_requested_mode_is_unsupported() {
+    fn unsupported_rate_control_is_rejected_instead_of_replaced() {
         let (vbr, cqp) = (H264RateControl::Vbr, H264RateControl::Cqp);
-        assert_eq!(supported_h264_rate_control(vbr, sys::VA_RC_CQP), cqp);
-        assert_eq!(
-            supported_h264_rate_control(vbr, sys::VA_RC_CQP | sys::VA_RC_VBR),
-            vbr
-        );
-        assert_eq!(
-            supported_h264_rate_control(vbr, va::VA_ATTRIB_NOT_SUPPORTED),
-            vbr
-        );
-        assert_eq!(supported_h264_rate_control(vbr, va::VA_RC_CBR), vbr);
-        assert_eq!(supported_h264_rate_control(cqp, sys::VA_RC_CQP), cqp);
+        let error = ensure_h264_rate_control_supported(vbr, sys::VA_RC_CQP)
+            .expect_err("CQP-only drivers must not silently ignore the bitrate");
+        assert!(format!("{error:#}").contains("rate_control = \"cqp\""));
+        let error = ensure_h264_rate_control_supported(vbr, va::VA_RC_CBR)
+            .expect_err("unsupported VBR must fail");
+        assert!(!format!("{error:#}").contains("rate_control"));
+        assert!(ensure_h264_rate_control_supported(cqp, va::VA_RC_CBR).is_err());
+
+        assert!(ensure_h264_rate_control_supported(vbr, sys::VA_RC_CQP | sys::VA_RC_VBR).is_ok());
+        assert!(ensure_h264_rate_control_supported(vbr, va::VA_ATTRIB_NOT_SUPPORTED).is_ok());
+        assert!(ensure_h264_rate_control_supported(cqp, sys::VA_RC_CQP).is_ok());
     }
 
     #[test]
